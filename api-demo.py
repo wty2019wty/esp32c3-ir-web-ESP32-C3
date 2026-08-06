@@ -185,6 +185,16 @@ def ws_send_text(sock, text):
     sock.sendall(bytes(header) + mask + masked)
 
 
+def ws_send_close(sock, code=1000):
+    """发送 CLOSE 帧（标准断开握手，避免服务器端报 recv 错误）。"""
+    payload = struct.pack(">H", code)
+    mask = os.urandom(4)
+    header = bytearray([0x88])  # FIN + CLOSE
+    header.append(0x80 | len(payload))
+    masked = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+    sock.sendall(bytes(header) + mask + masked)
+
+
 def ws_recv_frame(sock):
     """接收一个完整的服务器帧（服务器帧不掩码），返回 (opcode, payload)。"""
     b1, b2 = _recv_exact(sock, 2)
@@ -215,6 +225,9 @@ def ws_demo(host, port, token, listen_secs):
                 opcode, payload = ws_recv_frame(sock)
             except socket.timeout:
                 continue
+            except (ConnectionError, OSError) as e:
+                print(f"[*] 连接已断开: {e}")
+                break
             if opcode == 0x8:  # CLOSE
                 print("[*] 服务端发送 CLOSE")
                 break
@@ -245,6 +258,19 @@ def ws_demo(host, port, token, listen_secs):
     except KeyboardInterrupt:
         print("\n[*] 用户中断")
     finally:
+        try:
+            # 标准断开：先发 CLOSE，等服务端回复后再关 TCP
+            ws_send_close(sock)
+            sock.settimeout(1.0)
+            try:
+                while True:
+                    opcode, _ = ws_recv_frame(sock)
+                    if opcode == 0x8:
+                        break
+            except (socket.timeout, ConnectionError, OSError):
+                pass
+        except OSError:
+            pass
         sock.close()
 
 
