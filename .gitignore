@@ -8,3 +8,7 @@ managed_components
 .vscode/
 .opencode
 .reasonix/
+
+# Python
+__pycache__/
+*.py[cod]
