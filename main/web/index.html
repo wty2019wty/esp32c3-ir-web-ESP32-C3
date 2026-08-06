@@ -1,0 +1,304 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ESP32-C3 红外监视器</title>
+<style>
+  * { box-sizing: border-box; }
+  body { font-family: system-ui, "Microsoft YaHei", "PingFang SC", sans-serif;
+         background: #0f1115; color: #d7dae0; margin: 0; padding: 16px; max-width: 960px; margin: 0 auto; }
+  h1 { font-size: 20px; margin: 8px 0 14px; color: #fff; }
+  h2 { font-size: 15px; margin: 0 0 10px; color: #8ab4ff; }
+  .card { background: #1a1d24; border: 1px solid #2a2f3a; border-radius: 10px; padding: 14px 16px; margin-bottom: 12px; }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin: 6px 0; }
+  input[type=number], input[type=text] { background: #0f1115; color: #e8eaed; border: 1px solid #333a47;
+         border-radius: 6px; padding: 7px 9px; font-size: 14px; }
+  input[type=number] { width: 110px; }
+  input[type=text] { width: 220px; font-family: Consolas, monospace; }
+  button { background: #2f6fed; color: #fff; border: 0; border-radius: 6px; padding: 8px 14px;
+           font-size: 13px; cursor: pointer; }
+  button:hover { background: #3b7dff; }
+  button:disabled { background: #3a3f4a; cursor: default; }
+  textarea { width: 100%; background: #0f1115; color: #e8eaed; border: 1px solid #333a47;
+             border-radius: 6px; padding: 8px; font-family: Consolas, monospace; font-size: 13px; }
+  pre { background: #0f1115; border: 1px solid #2a2f3a; border-radius: 6px; padding: 10px;
+        overflow-x: auto; white-space: pre-wrap; word-break: break-all;
+        font-family: Consolas, monospace; font-size: 12.5px; color: #9fd08e; margin: 8px 0; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid #262b35; }
+  th { color: #8a93a3; font-weight: 500; }
+  tr.sel { background: #1d3a6e; }
+  tr:hover { background: #232936; cursor: pointer; }
+  .mono { font-family: Consolas, monospace; }
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 12px; margin-left: 6px; }
+  .badge.ap { background: #1f5c2e; color: #7ee08a; }
+  .badge.sta { background: #1f4a6e; color: #7ec4e0; }
+  .badge.off { background: #5c1f1f; color: #e07e7e; }
+  .kv { display: grid; grid-template-columns: 130px 1fr; gap: 4px 10px; font-size: 13.5px; }
+  .kv b { color: #8a93a3; font-weight: 500; }
+  #statusText { font-size: 14px; }
+  #toast { position: fixed; top: 14px; right: 14px; background: #2f6fed; color: #fff; padding: 10px 16px;
+           border-radius: 8px; font-size: 13px; opacity: 0; transition: opacity .25s; pointer-events: none; }
+</style>
+</head>
+<body>
+<h1>ESP32-C3 红外信号监视器</h1>
+
+<div class="card">
+  <div id="statusText">加载中...</div>
+</div>
+
+<div class="card">
+  <h2>载波频率</h2>
+  <div class="row">
+    <input type="number" id="carrierInput" value="38000" min="1000" max="1000000" step="1000">
+    <span>Hz</span>
+    <button onclick="setCarrier()">设置载波</button>
+    <span id="carrierStatus"></span>
+  </div>
+  <div style="font-size:12px; color:#8a93a3;">回放时使用此频率调制载波（默认 38000 Hz，重启后保留）。</div>
+</div>
+
+<div class="card">
+  <h2>最新信号</h2>
+  <div id="latest">等待红外信号...</div>
+  <div class="row">
+    <button id="playLatestBtn" onclick="playLatest()" disabled>回放此信号</button>
+    <span id="playingInfo"></span>
+  </div>
+</div>
+
+<div class="card">
+  <h2>原始数据（可直接复制回放）</h2>
+  <pre id="rawText">-</pre>
+</div>
+
+<div class="card">
+  <h2>手动回放</h2>
+  <div class="row">
+    <label>NEC hxd（8 位十六进制，LSB 顺序）：</label>
+    <input type="text" id="hxdInput" placeholder="ED127F80" maxlength="10">
+    <button onclick="playHxd()">回放</button>
+  </div>
+  <div class="row" style="margin-top:10px;">
+    <label>原始数据（可带 Frequency 行 + 逗号分隔微秒序列）：</label>
+  </div>
+  <textarea id="rawInput" rows="6" placeholder="Frequency: 38000 Hz&#10;&#10;9000, 4500, 560, 560, ..."></textarea>
+  <div class="row" style="margin-top:8px;">
+    <button onclick="playRaw()">回放原始数据</button>
+  </div>
+</div>
+
+<div class="card">
+  <h2>历史记录 <span id="histCount" style="color:#8a93a3;font-weight:400;"></span></h2>
+  <table id="histTable">
+    <thead><tr><th>#</th><th>时间</th><th>类型</th><th>NEC hxd</th><th>段数</th></tr></thead>
+    <tbody></tbody>
+  </table>
+</div>
+
+<div id="toast"></div>
+
+<script>
+let lastSeq = 0;
+let frames = [];      // ordered list of frames (oldest -> newest)
+let selectedSeq = null;
+let statusInfo = null;
+let playingTimer = null;
+
+function $(id) { return document.getElementById(id); }
+
+function toast(msg) {
+  const t = $('toast');
+  t.textContent = msg;
+  t.style.opacity = 1;
+  setTimeout(() => { t.style.opacity = 0; }, 1800);
+}
+
+async function postJSON(url, body) {
+  const r = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body)
+  });
+  return r.json();
+}
+
+/* ---------------- status ---------------- */
+
+async function refreshStatus() {
+  try {
+    const s = await (await fetch('/api/status')).json();
+    statusInfo = s;
+    const mode = s.mode;
+    const badgeCls = mode === 'AP' ? 'ap' : (mode === 'STA' ? 'sta' : (mode === 'AP+STA' ? 'sta' : 'off'));
+    let txt = `连接方式：<span class="badge ${badgeCls}">${mode}</span>`;
+    if (s.ap_ip) txt += ` 热点 <b>${s.ap_ssid}</b> → <span class="mono">http://${s.ap_ip}</span>`;
+    if (s.sta_ip) txt += ` ｜ STA <b>${s.sta_ssid}</b> → <span class="mono">${s.sta_ip}</span>`;
+    else if (s.sta_ssid) txt += ` ｜ STA <b>${s.sta_ssid}</b>（未连接）`;
+    txt += ` ｜ 载波 <span class="mono">${s.carrier_hz} Hz</span>`;
+    txt += ` ｜ 回放：${s.playing ? '<b style="color:#ffd479;">播放中</b>' : '空闲'}`;
+    $('statusText').innerHTML = txt;
+
+    const ci = $('carrierInput');
+    if (String(parseInt(ci.value)) !== String(s.carrier_hz)) ci.value = s.carrier_hz;
+
+    if (s.playing) {
+      $('playLatestBtn').disabled = true;
+      $('playingInfo').textContent = '正在回放...';
+      clearTimeout(playingTimer);
+      playingTimer = setTimeout(refreshStatus, 1000);
+    } else {
+      $('playLatestBtn').disabled = (selectedSeq === null);
+      $('playingInfo').textContent = '';
+    }
+  } catch (e) { /* transient */ }
+}
+
+/* ---------------- frames ---------------- */
+
+function necText(f) {
+  const n = f.nec;
+  if (!n.ok) return '非 NEC / 未知';
+  if (n.repeat) return 'NEC 重复码';
+  let t = 'NEC' + (n.ext ? ' 扩展' : '');
+  t += ` 地址 0x${n.addr.toString(16).toUpperCase().padStart(2,'0')}`;
+  t += ` 命令 0x${n.cmd.toString(16).toUpperCase().padStart(2,'0')}`;
+  if (n.chksum) t += ' 校验OK';
+  return t;
+}
+
+function rawFormat(f) {
+  const freq = (f.freq || 38000);
+  return `Frequency: ${freq} Hz\n\n` + f.durs.join(', ');
+}
+
+function renderLatest(f) {
+  selectedSeq = f.seq;
+  const n = f.nec;
+  let html = `<div class="kv">`;
+  html += `<b>类型</b><span>${necText(f)}</span>`;
+  html += `<b>NEC hxd</b><span class="mono">${n.ok ? n.hxd : '-'}</span>`;
+  html += `<b>地址 / 命令</b><span class="mono">0x${n.ok ? n.addr.toString(16).toUpperCase().padStart(2,'0') : '-'} / 0x${n.ok ? n.cmd.toString(16).toUpperCase().padStart(2,'0') : '-'}</span>`;
+  html += `<b>总时长</b><span>${f.feat.total_us} µs</span>`;
+  html += `<b>脉冲数 / 段数</b><span>${f.feat.pulses} / ${f.feat.seg_count}</span>`;
+  html += `<b>最短脉冲 / 最长</b><span>${f.feat.min_pulse} / ${f.feat.max_pulse} µs</span>`;
+  html += `<b>引导码</b><span>${f.feat.leader_pulse} + ${f.feat.leader_space} µs</span>`;
+  html += `<b>序号</b><span>${f.seq}</span>`;
+  html += `</div>`;
+  $('latest').innerHTML = html;
+  $('rawText').textContent = rawFormat(f);
+  $('playLatestBtn').disabled = false;
+  highlightRow(f.seq);
+}
+
+function renderHistory() {
+  $('histCount').textContent = `（共 ${frames.length} 条，RAM 环形缓冲）`;
+  const tb = $('histTable').querySelector('tbody');
+  let html = '';
+  for (let i = frames.length - 1; i >= 0; i--) {
+    const f = frames[i];
+    const n = f.nec;
+    const sel = (f.seq === selectedSeq) ? ' class="sel"' : '';
+    const type = n.repeat ? 'NEC 重复' : (n.ok ? 'NEC' : '未知');
+    const hxd = n.ok ? n.hxd : '-';
+    const t = new Date(f.ts).toISOString().substr(11, 8) + '.' + String(f.ts % 1000).padStart(3, '0');
+    html += `<tr${sel} onclick="selectFrame(${f.seq})">` +
+            `<td>${f.seq}</td><td class="mono">${t}</td><td>${type}</td>` +
+            `<td class="mono">${hxd}</td><td>${f.feat.seg_count}</td></tr>`;
+  }
+  tb.innerHTML = html;
+}
+
+function highlightRow(seq) {
+  const rows = $('histTable').querySelectorAll('tbody tr');
+  rows.forEach(r => {
+    const first = r.cells[0];
+    r.classList.toggle('sel', first && Number(first.textContent) === seq);
+  });
+}
+
+function selectFrame(seq) {
+  const f = frames.find(x => x.seq === seq);
+  if (f) renderLatest(f);
+}
+
+async function pollFrames() {
+  try {
+    const d = await (await fetch('/api/frames?since=' + lastSeq)).json();
+    if (d.frames && d.frames.length) {
+      let newest = null;
+      for (const f of d.frames) {
+        frames.push(f);
+        if (f.seq > lastSeq) lastSeq = f.seq;
+        newest = f;
+      }
+      if (frames.length > 200) frames = frames.slice(-200); // UI guard
+      renderHistory();
+      if (newest) renderLatest(newest);
+    }
+  } catch (e) { /* transient */ }
+}
+
+/* ---------------- actions ---------------- */
+
+function playLatest() {
+  if (selectedSeq === null) return;
+  play({ type: 'frame', seq: selectedSeq });
+}
+
+function playHxd() {
+  const v = $('hxdInput').value.trim();
+  if (!/^[0-9a-fA-F]{1,8}$/.test(v)) { toast('hxd 需为 1-8 位十六进制，如 ED127F80'); return; }
+  play({ type: 'hxd', value: v });
+}
+
+function parseRawText(txt) {
+  let freq = 0;
+  const nums = [];
+  for (const line of txt.split('\n')) {
+    const m = line.match(/Frequency:\s*(\d+)/i);
+    if (m) { freq = parseInt(m[1], 10); continue; }
+    for (const part of line.split(',')) {
+      const v = part.trim();
+      if (/^\d+$/.test(v)) nums.push(parseInt(v, 10));
+    }
+  }
+  return { freq, nums };
+}
+
+function playRaw() {
+  const { freq, nums } = parseRawText($('rawInput').value);
+  if (nums.length === 0) { toast('未解析到任何微秒数据'); return; }
+  play({ type: 'raw', freq: freq || undefined, data: nums });
+}
+
+async function play(body) {
+  try {
+    const d = await postJSON('/api/play', body);
+    if (d.ok) toast('回放已开始');
+    else toast('回放失败：参数错误');
+  } catch (e) { toast('回放请求失败'); }
+  refreshStatus();
+}
+
+async function setCarrier() {
+  const freq = parseInt($('carrierInput').value, 10);
+  if (!(freq >= 1000 && freq <= 1000000)) { toast('载波范围 1000 - 1000000 Hz'); return; }
+  try {
+    const d = await postJSON('/api/carrier', { freq });
+    if (d.ok) { $('carrierStatus').textContent = '已设置 ' + d.freq + ' Hz'; toast('载波已更新'); }
+    else toast('载波设置失败');
+  } catch (e) { toast('载波请求失败'); }
+  refreshStatus();
+}
+
+/* ---------------- init ---------------- */
+refreshStatus();
+pollFrames();
+setInterval(pollFrames, 500);
+setInterval(refreshStatus, 3000);
+</script>
+</body>
+</html>

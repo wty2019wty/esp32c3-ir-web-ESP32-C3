@@ -1,0 +1,92 @@
+menu "IR Web Tool Configuration"
+
+    config IR_TOOL_IR_RX_GPIO
+        int "IR receiver GPIO (VS1838B OUT)"
+        default 4
+        help
+            VS1838B demodulated baseband output, idle high.
+
+    config IR_TOOL_IR_TX_GPIO
+        int "IR transmitter GPIO (needs transistor driver)"
+        default 3
+        help
+            Carrier-modulated output. Drive an IR LED via a transistor.
+
+    config IR_TOOL_CARRIER_FREQ_HZ
+        int "Default IR carrier frequency (Hz)"
+        default 38000
+        help
+            Carrier frequency used for IR transmission. Can be changed at
+            runtime from the web UI (persisted in NVS). Common values:
+            38000 (most consumer electronics), 36000, 40000.
+
+    config IR_TOOL_CARRIER_DUTY
+        int "IR carrier duty cycle (percent)"
+        default 33
+        help
+            Duty cycle of the carrier signal in percent. 25-50%, 33% is common.
+
+    choice IR_TOOL_WIFI_MODE
+        prompt "WiFi operation mode"
+        default IR_TOOL_WIFI_MODE_AP
+
+        config IR_TOOL_WIFI_MODE_AP
+            bool "SoftAP only (device creates a hotspot)"
+            help
+                Device creates a hotspot "ESP32C3-IR", connect to it and open
+                http://192.168.4.1
+
+        config IR_TOOL_WIFI_MODE_STA
+            bool "Station only (join a router network)"
+            help
+                Device joins the router WiFi configured below. If connection
+                times out, it falls back to SoftAP so the web UI stays reachable.
+
+        config IR_TOOL_WIFI_MODE_APSTA
+            bool "AP + Station (both at once)"
+            help
+                Hotspot and station connection are both active. Use the AP IP
+                (192.168.4.1) or the station IP to reach the web UI.
+    endchoice
+
+    config IR_TOOL_WIFI_AP_SSID
+        string "SoftAP SSID"
+        default "ESP32C3-IR"
+
+    config IR_TOOL_WIFI_AP_PASSWORD
+        string "SoftAP password (empty = open network)"
+        default ""
+
+    config IR_TOOL_WIFI_AP_CHANNEL
+        int "SoftAP channel"
+        default 1
+
+    config IR_TOOL_WIFI_AP_MAX_CONN
+        int "SoftAP max connections"
+        default 4
+
+    config IR_TOOL_WIFI_STA_SSID
+        string "Station SSID (empty = skip station)"
+        default ""
+
+    config IR_TOOL_WIFI_STA_PASSWORD
+        string "Station password"
+        default ""
+
+    config IR_TOOL_WIFI_STA_TIMEOUT_MS
+        int "Station connection timeout (ms), then fall back to SoftAP"
+        default 10000
+
+    config IR_TOOL_HTTP_PORT
+        int "HTTP server port"
+        default 80
+
+    config IR_TOOL_HISTORY_DEPTH
+        int "In-memory frame history depth"
+        default 32
+
+    config IR_TOOL_MAX_RAW_SYMBOLS
+        int "Max RMT symbols per transmission (raw data replay)"
+        default 2048
+
+endmenu
