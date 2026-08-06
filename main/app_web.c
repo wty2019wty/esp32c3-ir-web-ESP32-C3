@@ -96,15 +96,17 @@ static bool parse_ipv4(const char *s, uint32_t *out)
     if (idx != 4) {
         return false;
     }
-    *out = ((uint32_t)b[0] << 24) | ((uint32_t)b[1] << 16) | ((uint32_t)b[2] << 8) | b[3];
+    /* esp_ip4_addr_t stores the dotted bytes in memory order (a.b.c.d
+     * as bytes 0..3), i.e. addr = a | b<<8 | c<<16 | d<<24 on little-endian. */
+    *out = (uint32_t)b[0] | ((uint32_t)b[1] << 8) | ((uint32_t)b[2] << 16) | ((uint32_t)b[3] << 24);
     return true;
 }
 
 static void format_ipv4(uint32_t ip, char *buf, size_t len)
 {
     snprintf(buf, len, "%u.%u.%u.%u",
-             (unsigned)(ip >> 24) & 0xFF, (unsigned)(ip >> 16) & 0xFF,
-             (unsigned)(ip >> 8) & 0xFF, (unsigned)ip & 0xFF);
+             (unsigned)ip & 0xFF, (unsigned)(ip >> 8) & 0xFF,
+             (unsigned)(ip >> 16) & 0xFF, (unsigned)(ip >> 24) & 0xFF);
 }
 
 static void restart_cb(void *arg)
