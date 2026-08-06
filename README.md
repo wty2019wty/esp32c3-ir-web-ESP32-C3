@@ -142,6 +142,33 @@ idf.py menuconfig   # → "IR Web Tool Configuration"
 - **断线回退**：连接断开后前端自动切换回 REST 轮询，并每 10 秒尝试重连 WebSocket；
   连接恢复后停止轮询。
 
+### HTTPS 反向代理（nginx）部署注意
+
+如果通过 nginx 反代给设备套 HTTPS（浏览器 → HTTPS → nginx → 明文 HTTP → ESP32），注意以下几点：
+
+- **信任边界**：`nginx → 设备` 这一段是明文 HTTP，`X-Auth-Token` 会被原样转发。能嗅探内网的人
+  可以拿到 token（有效期内等于完整管理员权限）。建议把 nginx 与设备放在同一可信网段
+  （如专用 VLAN、仅允许 nginx 访问设备的 80 端口），或在设备自身启用 HTTPS
+  （`esp_https_server` + mbedTLS）以消除明文段。
+- **nginx 日志**：默认 `access_log` 不记录请求头，token 不会落盘；不要自定义 `log_format`
+  打印 `$http_x_auth_token`，否则 token 会写入日志文件。
+- **强制 HTTPS**：配置 HTTP → HTTPS 跳转，避免用户用 `http://` 直接访问导致 token 走明文。
+- **WebSocket 必须走 wss**：页面推送会连接 `ws://<IP>/api/ws`，反代需要转发 Upgrade 头，
+  示例：
+
+```nginx
+location /api/ws {
+    proxy_pass http://192.168.0.145:80;
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection "upgrade";
+    proxy_set_header Host $host;
+}
+```
+
+HTTPS 页面下浏览器会自动使用 `wss://`；若反代未转发 Upgrade 头，WebSocket 会连接失败，
+前端将回退到 REST 轮询（可用，但不是实时推送）。
+
 ## 工程结构
 
 ```
