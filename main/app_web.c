@@ -75,17 +75,29 @@ static esp_err_t web_auth_save(const web_auth_cfg_t *cfg)
 static bool web_auth_ok(httpd_req_t *req)
 {
     if (s_token[0] == '\0') {
+        ESP_LOGD(TAG, "auth: no token issued (login first)");
         return false;
     }
     size_t len = httpd_req_get_hdr_value_len(req, "X-Auth-Token");
-    if (len != AUTH_TOKEN_LEN) {
+    if (len == 0) {
+        ESP_LOGD(TAG, "auth: request has no X-Auth-Token header");
         return false;
     }
-    char buf[AUTH_TOKEN_LEN + 1];
+    if (len > 64) {
+        ESP_LOGW(TAG, "auth: token header too long (%u)", (unsigned)len);
+        return false;
+    }
+    char buf[65];
     if (httpd_req_get_hdr_value_str(req, "X-Auth-Token", buf, sizeof(buf)) != ESP_OK) {
+        ESP_LOGW(TAG, "auth: header read failed");
         return false;
     }
-    return strcmp(buf, s_token) == 0;
+    if (strcmp(buf, s_token) != 0) {
+        ESP_LOGW(TAG, "auth: token mismatch (got \"%.12s...\" len=%u, expect \"%.8s...\")",
+                 buf, (unsigned)strlen(buf), s_token);
+        return false;
+    }
+    return true;
 }
 
 /* Generate a fresh session token (invalidates any previous one). */
@@ -139,6 +151,7 @@ static esp_err_t login_handler(httpd_req_t *req)
         return ESP_OK;
     }
     token_new();
+    ESP_LOGI(TAG, "login ok, token issued");
     char buf[80];
     snprintf(buf, sizeof(buf), "{\"ok\":true,\"token\":\"%s\"}", s_token);
     respond_json(req, 200, buf);
@@ -393,7 +406,9 @@ static esp_err_t index_handler(httpd_req_t *req)
 {
     httpd_resp_set_type(req, "text/html; charset=utf-8");
     /* always fetch the latest embedded page (browser cache caused stale UIs) */
-    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store, no-cache, must-revalidate");
+    httpd_resp_set_hdr(req, "Pragma", "no-cache");
+    httpd_resp_set_hdr(req, "Expires", "0");
     httpd_resp_send(req, (const char *)index_html_start, index_html_end - index_html_start);
     return ESP_OK;
 }

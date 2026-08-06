@@ -202,7 +202,7 @@ function $(id) { return document.getElementById(id); }
 /* ---- auth (token from /api/login, saved in sessionStorage) ---- */
 let auth = sessionStorage.getItem('auth') || '';
 function authHeaders() { return auth ? { 'X-Auth-Token': auth } : {}; }
-function showLogin() { $('loginOverlay').style.display = 'flex'; }
+function showLogin() { $('loginOverlay').style.display = 'flex'; $('loginUser').focus(); }
 function hideLogin() { $('loginOverlay').style.display = 'none'; }
 
 async function doLogin() {
