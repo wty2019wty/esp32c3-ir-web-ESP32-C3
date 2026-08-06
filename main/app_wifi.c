@@ -263,7 +263,7 @@ esp_err_t wifi_init(void)
 
     ESP_LOGI(TAG, "WiFi ready, actual mode: %s", wifi_mode_str());
     char ip[16];
-    if (wifi_get_ap_ip(ip, sizeof(ip))) {
+    if (wifi_ap_active() && wifi_get_ap_ip(ip, sizeof(ip))) {
         ESP_LOGI(TAG, "SoftAP IP: %s (open http://%s/)", ip, ip);
     }
     return ESP_OK;
@@ -276,6 +276,13 @@ const char *wifi_mode_str(void)
     case WIFI_MODE_STA:    return "STA";
     default:               return "?";
     }
+}
+
+bool wifi_ap_active(void)
+{
+    /* The AP netif is created in STA mode too (SoftAP fallback path), but the
+     * hotspot is only actually running in AP mode. */
+    return s_actual_mode == WIFI_MODE_AP;
 }
 
 bool wifi_is_sta_connected(void)

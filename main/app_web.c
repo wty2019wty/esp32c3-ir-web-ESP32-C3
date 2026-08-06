@@ -522,9 +522,10 @@ static char *status_json(void)
     }
     cJSON_AddStringToObject(root, "mode", wifi_mode_str());
     char ip[16];
-    cJSON_AddStringToObject(root, "ap_ip", wifi_get_ap_ip(ip, sizeof(ip)) ? ip : "");
+    bool ap_active = wifi_ap_active();
+    cJSON_AddStringToObject(root, "ap_ip", ap_active && wifi_get_ap_ip(ip, sizeof(ip)) ? ip : "");
     cJSON_AddStringToObject(root, "sta_ip", wifi_get_sta_ip(ip, sizeof(ip)) ? ip : "");
-    cJSON_AddStringToObject(root, "ap_ssid", wifi_ap_ssid());
+    cJSON_AddStringToObject(root, "ap_ssid", ap_active ? wifi_ap_ssid() : "");
     cJSON_AddStringToObject(root, "sta_ssid", wifi_sta_ssid());
     cJSON_AddStringToObject(root, "sta_ip_mode", wifi_sta_ip_mode());
     cJSON_AddBoolToObject(root, "sta_connected", wifi_is_sta_connected());

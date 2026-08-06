@@ -39,6 +39,7 @@ esp_err_t wifi_web_config_load(wifi_web_config_t *cfg);
 esp_err_t wifi_web_config_save(const wifi_web_config_t *cfg);
 
 const char *wifi_mode_str(void);        /* actual mode: "AP" or "STA" */
+bool wifi_ap_active(void);              /* true only when the SoftAP is running */
 bool wifi_is_sta_connected(void);
 bool wifi_get_ap_ip(char *buf, size_t len);
 bool wifi_get_sta_ip(char *buf, size_t len);
