@@ -532,7 +532,6 @@ static char *status_json(void)
     cJSON_AddNumberToObject(root, "carrier_hz", ir_get_carrier_freq());
     cJSON_AddBoolToObject(root, "rx_pause_on_play", ir_get_rx_pause_enabled());
     cJSON_AddBoolToObject(root, "playing", ir_is_playing());
-    cJSON_AddNumberToObject(root, "history_count", ir_history_count());
 
     char *s = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
@@ -915,7 +914,7 @@ static esp_err_t renew_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
-/* ---------- WebSocket push (status every 1s + new IR frames) ---------- */
+/* ---------- WebSocket push (status on change + new IR frames) ---------- */
 #if CONFIG_HTTPD_WS_SUPPORT
 
 #define WS_MAX_CLIENTS 6
@@ -923,10 +922,13 @@ static esp_err_t renew_handler(httpd_req_t *req)
 typedef struct {
     int fd;
     bool authed;
+    uint32_t acked_id; /* last status id confirmed by this client (0 = none) */
 } ws_client_t;
 
 static ws_client_t s_ws_clients[WS_MAX_CLIENTS];
 static SemaphoreHandle_t s_ws_mutex = NULL;
+static uint32_t s_status_id = 0;    /* bumped on every status change */
+static char *s_status_inner = NULL; /* cached status payload (data part) */
 
 static void ws_client_remove(int fd)
 {
@@ -956,6 +958,7 @@ static void ws_client_add(int fd, bool authed)
     for (int i = 0; i < WS_MAX_CLIENTS; i++) {
         if (s_ws_clients[i].fd == fd) {
             s_ws_clients[i].authed = authed;
+            s_ws_clients[i].acked_id = 0;
             xSemaphoreGive(s_ws_mutex);
             return;
         }
@@ -964,6 +967,24 @@ static void ws_client_add(int fd, bool authed)
         if (s_ws_clients[i].fd < 0) {
             s_ws_clients[i].fd = fd;
             s_ws_clients[i].authed = authed;
+            s_ws_clients[i].acked_id = 0;
+            break;
+        }
+    }
+    xSemaphoreGive(s_ws_mutex);
+}
+
+static void ws_client_ack(int fd, uint32_t id)
+{
+    if (!s_ws_mutex || fd < 0) {
+        return;
+    }
+    if (xSemaphoreTake(s_ws_mutex, portMAX_DELAY) != pdTRUE) {
+        return;
+    }
+    for (int i = 0; i < WS_MAX_CLIENTS; i++) {
+        if (s_ws_clients[i].fd == fd) {
+            s_ws_clients[i].acked_id = id;
             break;
         }
     }
@@ -1034,35 +1055,71 @@ static esp_err_t ws_reply_text(httpd_req_t *req, const char *json)
     return httpd_ws_send_frame(req, &frame);
 }
 
-static char *ws_status_wrapped(void)
-{
-    char *inner = status_json();
-    if (!inner) {
-        return NULL;
-    }
-    size_t cap = strlen(inner) + 64;
-    char *buf = malloc(cap);
-    if (!buf) {
-        free(inner);
-        return NULL;
-    }
-    snprintf(buf, cap, "{\"type\":\"status\",\"data\":%s}", inner);
-    free(inner);
-    return buf;
-}
-
 static void ws_status_timer_cb(void *arg)
 {
     (void)arg;
     if (!ws_has_authed_clients()) {
         return;
     }
-    char *s = ws_status_wrapped();
-    if (!s) {
+
+    char *inner = status_json();
+    if (!inner) {
         return;
     }
-    ws_send_text_all(s);
-    free(s);
+    if (xSemaphoreTake(s_ws_mutex, portMAX_DELAY) != pdTRUE) {
+        free(inner);
+        return;
+    }
+
+    /* only push when the status actually changed */
+    bool changed = !s_status_inner || strcmp(s_status_inner, inner) != 0;
+    if (changed) {
+        free(s_status_inner);
+        s_status_inner = inner;
+        s_status_id++;
+        if (s_status_id == 0) {
+            s_status_id = 1; /* skip 0 so "not acked yet" stays distinguishable */
+        }
+    } else {
+        free(inner);
+    }
+
+    /* send the latest status to clients that have not confirmed receipt yet;
+     * unchanged states are never re-broadcast to clients that already acked */
+    int dead[WS_MAX_CLIENTS];
+    int ndead = 0;
+    if (s_status_inner) {
+        size_t cap = strlen(s_status_inner) + 64;
+        char *wrapped = malloc(cap);
+        if (wrapped) {
+            snprintf(wrapped, cap, "{\"type\":\"status\",\"id\":%lu,\"data\":%s}",
+                     (unsigned long)s_status_id, s_status_inner);
+            httpd_ws_frame_t frame = {
+                .final = true,
+                .fragmented = false,
+                .type = HTTPD_WS_TYPE_TEXT,
+                .payload = (uint8_t *)wrapped,
+                .len = strlen(wrapped),
+            };
+            for (int i = 0; i < WS_MAX_CLIENTS; i++) {
+                if (s_ws_clients[i].fd < 0 || !s_ws_clients[i].authed ||
+                    s_ws_clients[i].acked_id == s_status_id) {
+                    continue;
+                }
+                esp_err_t err = httpd_ws_send_frame_async(s_server, s_ws_clients[i].fd, &frame);
+                if (err != ESP_OK && ndead < WS_MAX_CLIENTS) {
+                    dead[ndead++] = s_ws_clients[i].fd;
+                    ESP_LOGD(TAG, "ws: status send to fd %d failed: %s",
+                             s_ws_clients[i].fd, esp_err_to_name(err));
+                }
+            }
+            free(wrapped);
+        }
+    }
+    xSemaphoreGive(s_ws_mutex);
+    for (int i = 0; i < ndead; i++) {
+        ws_client_remove(dead[i]);
+    }
 }
 
 static void ws_frame_push_cb(const ir_frame_t *fr, void *arg)
@@ -1175,16 +1232,17 @@ static esp_err_t ws_handler(httpd_req_t *req)
             ws_client_add(fd, true);
             ESP_LOGI(TAG, "ws: client fd %d authenticated", fd);
             ws_reply_text(req, "{\"type\":\"auth\",\"ok\":true}");
-            char *s = ws_status_wrapped();
-            if (s) {
-                ws_reply_text(req, s);
-                free(s);
-            }
+            /* the current status is delivered by the 1s push timer */
         } else {
             ESP_LOGW(TAG, "ws: auth failed for fd %d", fd);
             ws_reply_text(req, "{\"type\":\"auth\",\"ok\":false,\"error\":\"unauthorized\"}");
             cJSON_Delete(root);
             return ESP_FAIL; /* close the socket */
+        }
+    } else if (cJSON_IsString(type) && strcmp(type->valuestring, "ack") == 0) {
+        cJSON *id = cJSON_GetObjectItem(root, "id");
+        if (cJSON_IsNumber(id)) {
+            ws_client_ack(fd, (uint32_t)id->valuedouble);
         }
     }
     cJSON_Delete(root);

@@ -413,6 +413,9 @@ function wsConnect() {
       }
     } else if (d.type === 'status' && d.data) {
       applyStatus(d.data);
+      if (d.id != null) {
+        try { s.send(JSON.stringify({ type: 'ack', id: d.id })); } catch (e) { /* ignored */ }
+      }
     } else if (d.type === 'frame' && d.data) {
       applyFrame(d.data);
     }

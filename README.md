@@ -137,7 +137,9 @@ idf.py menuconfig   # → "IR Web Tool Configuration"
 - **认证**：连接后第一条消息发送 `{"type":"auth","token":"<session token>"}`；
   服务端回复 `{"type":"auth","ok":true}`；token 无效或过期则回复 `ok:false` 并断开连接。
 - **推送消息**：
-  - `{"type":"status","data":{...}}` —— 每秒推送一次设备状态（字段同 `/api/status`）
+  - `{"type":"status","id":N,"data":{...}}` —— **状态有变化时才推送**（字段同 `/api/status`），
+    携带递增 `id`；客户端收到后需回复 `{"type":"ack","id":N}` 确认抄收，
+    未确认的客户端会每秒补发，直到确认或状态再次变化
   - `{"type":"frame","data":{...}}` —— 收到新红外信号时立即推送（字段同 `/api/frames` 中的单帧）
 - **断线回退**：连接断开后前端自动切换回 REST 轮询，并每 10 秒尝试重连 WebSocket；
   连接恢复后停止轮询。
