@@ -224,16 +224,19 @@ esp_err_t wifi_init(void)
     ESP_RETURN_ON_ERROR(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
                                                    wifi_event_handler, NULL), TAG, "reg ip events");
 
-    /* configure AP always: in STA role this prepares the SoftAP fallback */
-    wifi_configure_ap();
-    if (role_wants_sta()) {
-        wifi_configure_sta();
-    }
-
     /* STA and SoftAP are mutually exclusive: connect to the configured router
-     * when a station SSID is set, otherwise open the hotspot only. */
+     * when a station SSID is set, otherwise open the hotspot only.
+     * Set the mode FIRST, then configure the matching interface —
+     * esp_wifi_set_config() rejects interfaces not present in the current mode. */
     wifi_mode_t mode = role_wants_sta() ? WIFI_MODE_STA : WIFI_MODE_AP;
     ESP_RETURN_ON_ERROR(esp_wifi_set_mode(mode), TAG, "set mode");
+
+    if (mode == WIFI_MODE_STA) {
+        wifi_configure_sta();
+    } else {
+        wifi_configure_ap();
+    }
+
     ESP_RETURN_ON_ERROR(esp_wifi_start(), TAG, "esp_wifi_start");
     s_actual_mode = mode;
 
@@ -250,6 +253,7 @@ esp_err_t wifi_init(void)
             s_fell_back = true;
             ESP_RETURN_ON_ERROR(esp_wifi_stop(), TAG, "wifi stop for fallback");
             ESP_RETURN_ON_ERROR(esp_wifi_set_mode(WIFI_MODE_AP), TAG, "set AP mode");
+            wifi_configure_ap(); /* configure hotspot for the fallback */
             ESP_RETURN_ON_ERROR(esp_wifi_start(), TAG, "wifi start AP");
             s_actual_mode = WIFI_MODE_AP;
         }
