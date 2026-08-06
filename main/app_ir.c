@@ -67,6 +67,7 @@ static rmt_encoder_handle_t s_copy_enc = NULL;
 static rmt_transmit_config_t s_tx_cfg;
 static QueueHandle_t s_play_queue;
 static volatile bool s_playing = false;
+static volatile bool s_rx_paused = false; /* RX paused while transmitting */
 
 /* global carrier frequency (Hz) */
 static uint32_t s_carrier_freq = CONFIG_IR_TOOL_CARRIER_FREQ_HZ;
@@ -278,7 +279,11 @@ static void ir_task(void *arg)
             xSemaphoreGive(s_mutex);
         }
 
-        rmt_receive(s_rx_ch, s_rx_buf, sizeof(s_rx_buf), &s_rx_cfg);
+        /* While the TX task is transmitting, RX stays paused (avoids
+         * self-loop frames). The playback task resumes the receive loop. */
+        if (!s_rx_paused) {
+            rmt_receive(s_rx_ch, s_rx_buf, sizeof(s_rx_buf), &s_rx_cfg);
+        }
     }
 }
 
@@ -550,6 +555,15 @@ static void ir_playback_task(void *arg)
         }
         s_playing = true;
 
+        /* pause IR reception while transmitting to avoid self-loop frames */
+        if (!s_rx_paused) {
+            if (rmt_disable(s_rx_ch) == ESP_OK) {
+                s_rx_paused = true;
+            } else {
+                ESP_LOGW(TAG, "Failed to pause RX before playback");
+            }
+        }
+
         uint32_t freq = req->freq_hz ? req->freq_hz : s_carrier_freq;
         rmt_carrier_config_t cc = {
             .duty_cycle = IR_CARRIER_DUTY / 100.0f,
@@ -573,6 +587,16 @@ static void ir_playback_task(void *arg)
         free(req->symbols);
         free(req);
         s_playing = false;
+
+        /* resume RX once the queue drains */
+        if (s_rx_paused && uxQueueMessagesWaiting(s_play_queue) == 0) {
+            if (rmt_enable(s_rx_ch) == ESP_OK &&
+                rmt_receive(s_rx_ch, s_rx_buf, sizeof(s_rx_buf), &s_rx_cfg) == ESP_OK) {
+                s_rx_paused = false;
+            } else {
+                ESP_LOGW(TAG, "Failed to resume RX after playback");
+            }
+        }
     }
 }
 
