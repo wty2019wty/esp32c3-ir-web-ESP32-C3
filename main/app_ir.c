@@ -21,7 +21,7 @@
 #define IR_RESOLUTION_HZ    500000U    /* 1 RMT tick = 2 us */
 #define IR_RX_GPIO          CONFIG_IR_TOOL_IR_RX_GPIO
 #define IR_TX_GPIO          CONFIG_IR_TOOL_IR_TX_GPIO
-#define IR_RX_BUF_SYMBOLS   96         /* 2 mem blocks of 48; NEC frame fits */
+#define IR_RX_BUF_SYMBOLS   512        /* ESP32-S3 RMT RX DMA buffer: 512 symbols = up to 1024 segments */
 #define IR_TX_BUF_SYMBOLS   96
 #define IR_RX_MIN_PULSE_NS  1000U      /* glitches < 1 us are ignored */
 #define IR_RX_TIMEOUT_NS    50000000U  /* idle gap > 50 ms ends the frame */
@@ -336,7 +336,7 @@ esp_err_t ir_init(void)
         nvs_close(nh);
     }
 
-    /* Configure RMT RX channel (ESP32-C3: no DMA, multiple mem blocks, ping-pong) */
+    /* Configure RMT RX channel (ESP32-S3: DMA-backed, large capture buffer) */
     rmt_rx_channel_config_t rx_ch_cfg = {
         .gpio_num = IR_RX_GPIO,
         .clk_src = RMT_CLK_SRC_DEFAULT,
@@ -345,7 +345,7 @@ esp_err_t ir_init(void)
         .intr_priority = 0,
         .flags = {
             .invert_in = false,
-            .with_dma = false,
+            .with_dma = true,
             .allow_pd = false,
         },
     };

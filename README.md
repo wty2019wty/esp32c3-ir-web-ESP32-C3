@@ -193,11 +193,12 @@ esp32c3-IR/
 
 ## 实现要点
 
-- **C3 无 RMT DMA**：RX/TX 各用 96 symbols（2×48 内存块），驱动自动 ping-pong；
-  单帧上限 96 symbols（NEC 完整帧 34 symbols），长原始数据回放由 copy encoder 分段发送
+- **S3 RMT DMA RX**：RX 使用 512-symbol DMA 缓冲区，单帧最多 1024 段
+  （NEC 完整帧 34 symbols），长原始数据回放由 copy encoder 分段发送（TX 非 DMA，
+  默认上限 2048 symbols = 4096 段）
 - **回放极性**：采集自 VS1838B（active-low）的帧在分析时归一化为"首段载波开"的
   逻辑序列，回放/显示直接复用；RMT TX 只在电平 1 时输出载波
 - **载波动态切换**：`rmt_apply_carrier` 无状态限制，回放前可即时重设
-- **内存**：历史帧静态环形缓冲（32 帧 × 约 1.1KB ≈ 36KB），不依赖文件系统
+- **内存**：历史帧静态环形缓冲（32 帧 × 约 4.2KB ≈ 134KB），不依赖文件系统
 - **Web 数据流**：前端通过 WebSocket（`/api/ws`）接收状态（每秒）与新帧（实时）推送；
   REST `/api/frames?since=N` 保留作断线回退，服务端 chunked 输出

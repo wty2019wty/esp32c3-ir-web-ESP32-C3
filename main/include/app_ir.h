@@ -4,7 +4,7 @@
 #include <stdint.h>
 #include "esp_err.h"
 
-#define IR_RAW_MAX_SEGS 192              /* RX buffer 96 symbols -> up to 192 alternating segments */
+#define IR_RAW_MAX_SEGS 1024             /* RX DMA buffer 512 symbols -> up to 1024 alternating segments */
 #define IR_MAX_TX_SYMBOLS CONFIG_IR_TOOL_MAX_RAW_SYMBOLS  /* cap for one transmission */
 #define IR_HISTORY_DEPTH CONFIG_IR_TOOL_HISTORY_DEPTH
 
