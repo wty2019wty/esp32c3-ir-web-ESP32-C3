@@ -58,6 +58,13 @@ bool ir_get_frame(ir_frame_t *out);
 typedef void (*ir_frame_cb_t)(const ir_frame_t *frame, void *arg);
 void ir_set_frame_cb(ir_frame_cb_t cb, void *arg);
 
+/**
+ * Callback invoked right after the playback state changes
+ * (true = playback started, false = playback finished).
+ */
+typedef void (*ir_play_cb_t)(bool playing, void *arg);
+void ir_set_play_cb(ir_play_cb_t cb, void *arg);
+
 /* ---- in-memory history ring (no filesystem) ---- */
 uint32_t ir_history_count(void);
 esp_err_t ir_history_get(uint32_t index, ir_frame_t *out);  /* 0 = oldest */

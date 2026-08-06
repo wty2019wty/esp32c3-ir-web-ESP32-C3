@@ -1055,6 +1055,73 @@ static esp_err_t ws_reply_text(httpd_req_t *req, const char *json)
     return httpd_ws_send_frame(req, &frame);
 }
 
+/* Send the cached status to clients whose acked_id is stale. Caller must
+ * hold s_ws_mutex; dead fds are collected into dead[] / ndead. */
+static void ws_send_status_locked(int *dead, int *ndead)
+{
+    if (!s_status_inner || !s_server) {
+        return;
+    }
+    size_t cap = strlen(s_status_inner) + 64;
+    char *wrapped = malloc(cap);
+    if (!wrapped) {
+        return;
+    }
+    snprintf(wrapped, cap, "{\"type\":\"status\",\"id\":%lu,\"data\":%s}",
+             (unsigned long)s_status_id, s_status_inner);
+    httpd_ws_frame_t frame = {
+        .final = true,
+        .fragmented = false,
+        .type = HTTPD_WS_TYPE_TEXT,
+        .payload = (uint8_t *)wrapped,
+        .len = strlen(wrapped),
+    };
+    for (int i = 0; i < WS_MAX_CLIENTS; i++) {
+        if (s_ws_clients[i].fd < 0 || !s_ws_clients[i].authed ||
+            s_ws_clients[i].acked_id == s_status_id) {
+            continue;
+        }
+        esp_err_t err = httpd_ws_send_frame_async(s_server, s_ws_clients[i].fd, &frame);
+        if (err != ESP_OK && *ndead < WS_MAX_CLIENTS) {
+            dead[(*ndead)++] = s_ws_clients[i].fd;
+            ESP_LOGD(TAG, "ws: status send to fd %d failed: %s",
+                     s_ws_clients[i].fd, esp_err_to_name(err));
+        }
+    }
+    free(wrapped);
+}
+
+/* Rebuild status and broadcast it with a fresh id immediately. Used for
+ * event-driven pushes (e.g. playback start/stop) where the 1s sampling
+ * timer could miss a short-lived state change. */
+static void ws_push_status_now(void)
+{
+    if (!s_server || !s_ws_mutex) {
+        return;
+    }
+    char *inner = status_json();
+    if (!inner) {
+        return;
+    }
+    int dead[WS_MAX_CLIENTS];
+    int ndead = 0;
+    if (xSemaphoreTake(s_ws_mutex, portMAX_DELAY) != pdTRUE) {
+        free(inner);
+        return;
+    }
+    free(s_status_inner);
+    s_status_inner = inner;
+    s_status_id++;
+    if (s_status_id == 0) {
+        s_status_id = 1;
+    }
+    ws_send_status_locked(dead, &ndead);
+    xSemaphoreGive(s_ws_mutex);
+    for (int i = 0; i < ndead; i++) {
+        ws_client_remove(dead[i]);
+    }
+}
+
 static void ws_status_timer_cb(void *arg)
 {
     (void)arg;
@@ -1066,6 +1133,8 @@ static void ws_status_timer_cb(void *arg)
     if (!inner) {
         return;
     }
+    int dead[WS_MAX_CLIENTS];
+    int ndead = 0;
     if (xSemaphoreTake(s_ws_mutex, portMAX_DELAY) != pdTRUE) {
         free(inner);
         return;
@@ -1086,40 +1155,20 @@ static void ws_status_timer_cb(void *arg)
 
     /* send the latest status to clients that have not confirmed receipt yet;
      * unchanged states are never re-broadcast to clients that already acked */
-    int dead[WS_MAX_CLIENTS];
-    int ndead = 0;
-    if (s_status_inner) {
-        size_t cap = strlen(s_status_inner) + 64;
-        char *wrapped = malloc(cap);
-        if (wrapped) {
-            snprintf(wrapped, cap, "{\"type\":\"status\",\"id\":%lu,\"data\":%s}",
-                     (unsigned long)s_status_id, s_status_inner);
-            httpd_ws_frame_t frame = {
-                .final = true,
-                .fragmented = false,
-                .type = HTTPD_WS_TYPE_TEXT,
-                .payload = (uint8_t *)wrapped,
-                .len = strlen(wrapped),
-            };
-            for (int i = 0; i < WS_MAX_CLIENTS; i++) {
-                if (s_ws_clients[i].fd < 0 || !s_ws_clients[i].authed ||
-                    s_ws_clients[i].acked_id == s_status_id) {
-                    continue;
-                }
-                esp_err_t err = httpd_ws_send_frame_async(s_server, s_ws_clients[i].fd, &frame);
-                if (err != ESP_OK && ndead < WS_MAX_CLIENTS) {
-                    dead[ndead++] = s_ws_clients[i].fd;
-                    ESP_LOGD(TAG, "ws: status send to fd %d failed: %s",
-                             s_ws_clients[i].fd, esp_err_to_name(err));
-                }
-            }
-            free(wrapped);
-        }
-    }
+    ws_send_status_locked(dead, &ndead);
     xSemaphoreGive(s_ws_mutex);
     for (int i = 0; i < ndead; i++) {
         ws_client_remove(dead[i]);
     }
+}
+
+/* Playback start/stop: push the status immediately so the UI never stays
+ * stuck at "playing" waiting for the next 1s sampling tick. */
+static void ws_play_cb(bool playing, void *arg)
+{
+    (void)playing;
+    (void)arg;
+    ws_push_status_now();
 }
 
 static void ws_frame_push_cb(const ir_frame_t *fr, void *arg)
@@ -1282,6 +1331,7 @@ esp_err_t web_init(void)
         }
     }
     ir_set_frame_cb(ws_frame_push_cb, NULL);
+    ir_set_play_cb(ws_play_cb, NULL);
 #endif
 
     static const httpd_uri_t uris[] = {

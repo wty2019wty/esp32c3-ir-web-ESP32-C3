@@ -62,6 +62,8 @@ static bool s_frame_new;
 static uint32_t s_seq;
 static ir_frame_cb_t s_frame_cb = NULL;
 static void *s_frame_cb_arg = NULL;
+static ir_play_cb_t s_play_cb = NULL;
+static void *s_play_cb_arg = NULL;
 static ir_seg_t s_segs[IR_RAW_MAX_SEGS];
 
 /* TX variables */
@@ -426,6 +428,12 @@ void ir_set_frame_cb(ir_frame_cb_t cb, void *arg)
     s_frame_cb_arg = arg;
 }
 
+void ir_set_play_cb(ir_play_cb_t cb, void *arg)
+{
+    s_play_cb = cb;
+    s_play_cb_arg = arg;
+}
+
 uint32_t ir_history_count(void)
 {
     uint32_t c;
@@ -578,6 +586,9 @@ static void ir_playback_task(void *arg)
             continue;
         }
         s_playing = true;
+        if (s_play_cb) {
+            s_play_cb(true, s_play_cb_arg);
+        }
 
         /* pause IR reception while transmitting to avoid self-loop frames */
         if (!s_rx_paused && s_rx_pause_enabled) {
@@ -611,6 +622,9 @@ static void ir_playback_task(void *arg)
         free(req->symbols);
         free(req);
         s_playing = false;
+        if (s_play_cb) {
+            s_play_cb(false, s_play_cb_arg);
+        }
 
         /* resume RX once the queue drains */
         if (s_rx_paused && uxQueueMessagesWaiting(s_play_queue) == 0) {
