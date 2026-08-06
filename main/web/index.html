@@ -265,7 +265,7 @@ async function postJSON(url, body) {
 async function refreshStatus() {
   if (!auth) return;   /* not logged in: no polling */
   try {
-    const s = await (await fetch('/api/status')).json();
+    const s = await (await apiFetch('/api/status')).json();
     statusInfo = s;
     const mode = s.mode;
     const badgeCls = mode === 'AP' ? 'ap' : (mode === 'STA' ? 'sta' : (mode === 'AP+STA' ? 'sta' : 'off'));
@@ -364,7 +364,7 @@ function selectFrame(seq) {
 async function pollFrames() {
   if (!auth) return;   /* not logged in: no polling */
   try {
-    const d = await (await fetch('/api/frames?since=' + lastSeq)).json();
+    const d = await (await apiFetch('/api/frames?since=' + lastSeq)).json();
     if (d.frames && d.frames.length) {
       let newest = null;
       for (const f of d.frames) {
@@ -454,7 +454,7 @@ function showTab(t) {
 async function loadWifiCfg() {
   $('cfgStatus').textContent = '';
   try {
-    const c = await (await fetch('/api/wificfg')).json();
+    const c = await (await apiFetch('/api/wificfg')).json();
     $('cfgApSsid').value = c.ap_ssid;
     $('cfgApPwd').value = c.ap_password;
     $('cfgStaSsid').value = c.sta_ssid;
