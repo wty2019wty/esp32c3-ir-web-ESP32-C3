@@ -213,7 +213,14 @@ static esp_err_t play_handler(httpd_req_t *req)
     cJSON *freq_item = cJSON_GetObjectItem(root, "freq");
     uint32_t freq = 0;
     if (cJSON_IsNumber(freq_item)) {
-        freq = (uint32_t)freq_item->valuedouble;
+        double fv = freq_item->valuedouble;
+        /* 0 = use global carrier; otherwise must be in the valid range */
+        if (fv != 0.0 && (fv < IR_CARRIER_FREQ_MIN || fv > IR_CARRIER_FREQ_MAX)) {
+            cJSON_Delete(root);
+            respond_json(req, 400, "{\"error\":\"bad freq\"}");
+            return ESP_OK;
+        }
+        freq = (uint32_t)fv;
     }
 
     esp_err_t ret = ESP_ERR_INVALID_ARG;
@@ -226,16 +233,30 @@ static esp_err_t play_handler(httpd_req_t *req)
         cJSON *data = cJSON_GetObjectItem(root, "data");
         if (cJSON_IsArray(data)) {
             int n = cJSON_GetArraySize(data);
-            uint32_t *durs = malloc((size_t)n * sizeof(uint32_t));
-            if (durs) {
-                for (int i = 0; i < n; i++) {
-                    cJSON *it = cJSON_GetArrayItem(data, i);
-                    durs[i] = cJSON_IsNumber(it) ? (uint32_t)it->valuedouble : 0;
-                }
-                ret = ir_play_raw(durs, (uint32_t)n, freq);
-                free(durs);
+            if (n <= 0) {
+                ret = ESP_ERR_INVALID_ARG;
             } else {
-                ret = ESP_ERR_NO_MEM;
+                uint32_t *durs = malloc((size_t)n * sizeof(uint32_t));
+                if (durs) {
+                    bool good = true;
+                    for (int i = 0; i < n; i++) {
+                        cJSON *it = cJSON_GetArrayItem(data, i);
+                        double dv = cJSON_IsNumber(it) ? it->valuedouble : -1.0;
+                        if (dv <= 0.0 || dv > 65000.0) {
+                            good = false;
+                            break;
+                        }
+                        durs[i] = (uint32_t)dv;
+                    }
+                    if (good) {
+                        ret = ir_play_raw(durs, (uint32_t)n, freq);
+                    } else {
+                        ret = ESP_ERR_INVALID_ARG;
+                    }
+                    free(durs);
+                } else {
+                    ret = ESP_ERR_NO_MEM;
+                }
             }
         }
     } else if (cJSON_IsString(type) && strcmp(type->valuestring, "frame") == 0) {
@@ -275,7 +296,13 @@ static esp_err_t carrier_handler(httpd_req_t *req)
         respond_json(req, 400, "{\"error\":\"missing freq\"}");
         return ESP_OK;
     }
-    uint32_t freq = (uint32_t)freq_item->valuedouble;
+    double fv = freq_item->valuedouble;
+    if (fv < IR_CARRIER_FREQ_MIN || fv > IR_CARRIER_FREQ_MAX) {
+        cJSON_Delete(root);
+        respond_json(req, 400, "{\"error\":\"invalid freq\"}");
+        return ESP_OK;
+    }
+    uint32_t freq = (uint32_t)fv;
     esp_err_t ret = ir_set_carrier_freq(freq);
     cJSON_Delete(root);
 
@@ -315,6 +342,6 @@ esp_err_t web_init(void)
         }
     }
 
-    ESP_LOGI(TAG, "Web UI ready: http://<ip>:%d/", HTTP_PORT);
+    ESP_LOGI(TAG, "Web UI ready: http://192.168.4.1:%d/", HTTP_PORT);
     return ESP_OK;
 }

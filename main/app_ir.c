@@ -483,6 +483,12 @@ static esp_err_t ir_build_symbols(const uint32_t *durs, uint32_t count,
         return ESP_ERR_INVALID_ARG;
     }
     uint32_t n_syms = (count + 1) / 2;
+    /* RMT duration field is 15-bit: at 500kHz (2us/tick) the cap is 65534us */
+    for (uint32_t i = 0; i < count; i++) {
+        if (durs[i] == 0 || durs[i] > 65000U) {
+            return ESP_ERR_INVALID_ARG;
+        }
+    }
     rmt_symbol_word_t *syms = calloc(n_syms, sizeof(rmt_symbol_word_t));
     if (!syms) {
         return ESP_ERR_NO_MEM;
@@ -549,7 +555,9 @@ static void ir_playback_task(void *arg)
             .duty_cycle = IR_CARRIER_DUTY / 100.0f,
             .frequency_hz = freq,
         };
-        rmt_apply_carrier(s_tx_ch, &cc);
+        if (rmt_apply_carrier(s_tx_ch, &cc) != ESP_OK) {
+            ESP_LOGW(TAG, "Failed to apply carrier %lu Hz", (unsigned long)freq);
+        }
 
         esp_err_t ret = rmt_transmit(s_tx_ch, s_copy_enc, req->symbols,
                                      req->symbol_count * sizeof(rmt_symbol_word_t), &s_tx_cfg);

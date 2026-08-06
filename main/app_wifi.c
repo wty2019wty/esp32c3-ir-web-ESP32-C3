@@ -27,11 +27,6 @@ static volatile bool s_sta_connected = false;
 static bool s_fell_back = false;
 static char s_sta_ip[16] = "";
 
-static bool role_wants_ap(void)
-{
-    return s_role != WIFI_ROLE_STA;
-}
-
 static bool role_wants_sta(void)
 {
     return s_role != WIFI_ROLE_AP && STA_SSID[0] != '\0';
@@ -53,6 +48,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
         case WIFI_EVENT_STA_DISCONNECTED:
             ESP_LOGW(TAG, "STA disconnected");
             s_sta_connected = false;
+            s_sta_ip[0] = '\0';
             /* reconnect unless we fell back to AP-only mode */
             if (!s_fell_back && role_wants_sta()) {
                 esp_wifi_connect();
@@ -73,7 +69,7 @@ static void wifi_configure_ap(void)
 {
     wifi_config_t cfg = {0};
     strlcpy((char *)cfg.ap.ssid, AP_SSID, sizeof(cfg.ap.ssid));
-    cfg.ap.ssid_len = (uint8_t)strlen(AP_SSID);
+    cfg.ap.ssid_len = (uint8_t)strlen((const char *)cfg.ap.ssid); /* strlcpy guarantees NUL, <= 32 */
     cfg.ap.channel = AP_CHANNEL;
     cfg.ap.max_connection = AP_MAX_CONN;
     if (AP_PASSWORD[0] != '\0' && strlen(AP_PASSWORD) >= 8) {
@@ -112,10 +108,11 @@ esp_err_t wifi_init(void)
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
 
-    if (role_wants_ap()) {
-        s_ap_netif = esp_netif_create_default_wifi_ap();
-        ESP_RETURN_ON_FALSE(s_ap_netif, ESP_ERR_NO_MEM, TAG, "create AP netif");
-    }
+    /* AP netif is always created: in AP/APSTA roles it serves the hotspot;
+     * in STA role it is required by the SoftAP fallback path (DHCP server
+     * starts automatically when the AP interface comes up). */
+    s_ap_netif = esp_netif_create_default_wifi_ap();
+    ESP_RETURN_ON_FALSE(s_ap_netif, ESP_ERR_NO_MEM, TAG, "create AP netif");
     if (role_wants_sta()) {
         s_sta_netif = esp_netif_create_default_wifi_sta();
         ESP_RETURN_ON_FALSE(s_sta_netif, ESP_ERR_NO_MEM, TAG, "create STA netif");
@@ -129,9 +126,8 @@ esp_err_t wifi_init(void)
     ESP_RETURN_ON_ERROR(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
                                                    wifi_event_handler, NULL), TAG, "reg ip events");
 
-    if (role_wants_ap()) {
-        wifi_configure_ap();
-    }
+    /* configure AP always: in STA role this prepares the SoftAP fallback */
+    wifi_configure_ap();
     if (role_wants_sta()) {
         wifi_configure_sta();
     }
