@@ -10,6 +10,9 @@
 #include "esp_check.h"
 #include "esp_timer.h"
 #include "esp_system.h"
+#include "esp_random.h"
+#include "nvs_flash.h"
+#include "nvs.h"
 #include "cJSON.h"
 
 #define TAG "web"
@@ -17,11 +20,134 @@
 #define HTTP_PORT        CONFIG_IR_TOOL_HTTP_PORT
 #define MAX_BODY_LEN     32768
 
+static httpd_handle_t s_server = NULL;
+
+/* forward declarations (defined below) */
+static void respond_json(httpd_req_t *req, int status, const char *json);
+static char *httpd_read_body(httpd_req_t *req);
+
+/* ---- web login (token auth; NVS user/pass, default admin/admin) ---- */
+#define AUTH_NS        "ir_tool"
+#define AUTH_KEY_USER  "web_user"
+#define AUTH_KEY_PASS  "web_pass"
+#define AUTH_DEF_USER  "admin"
+#define AUTH_DEF_PASS  "admin"
+#define AUTH_TOKEN_LEN 32   /* hex chars */
+
+typedef struct {
+    char user[33];
+    char pass[65];
+} web_auth_cfg_t;
+
+static char s_token[AUTH_TOKEN_LEN + 1] = ""; /* single active session token */
+
+static void web_auth_load(web_auth_cfg_t *cfg)
+{
+    strlcpy(cfg->user, AUTH_DEF_USER, sizeof(cfg->user));
+    strlcpy(cfg->pass, AUTH_DEF_PASS, sizeof(cfg->pass));
+    nvs_handle_t h;
+    if (nvs_open(AUTH_NS, NVS_READONLY, &h) != ESP_OK) {
+        return;
+    }
+    size_t len = sizeof(cfg->user);
+    if (nvs_get_str(h, AUTH_KEY_USER, cfg->user, &len) != ESP_OK) {
+        strlcpy(cfg->user, AUTH_DEF_USER, sizeof(cfg->user));
+    }
+    len = sizeof(cfg->pass);
+    if (nvs_get_str(h, AUTH_KEY_PASS, cfg->pass, &len) != ESP_OK) {
+        strlcpy(cfg->pass, AUTH_DEF_PASS, sizeof(cfg->pass));
+    }
+    nvs_close(h);
+}
+
+static esp_err_t web_auth_save(const web_auth_cfg_t *cfg)
+{
+    nvs_handle_t h;
+    ESP_RETURN_ON_ERROR(nvs_open(AUTH_NS, NVS_READWRITE, &h), TAG, "open nvs");
+    esp_err_t err = nvs_set_str(h, AUTH_KEY_USER, cfg->user);
+    if (err == ESP_OK) err = nvs_set_str(h, AUTH_KEY_PASS, cfg->pass);
+    if (err == ESP_OK) err = nvs_commit(h);
+    nvs_close(h);
+    return err;
+}
+
+/* Verify the X-Auth-Token header against the active session token. */
+static bool web_auth_ok(httpd_req_t *req)
+{
+    if (s_token[0] == '\0') {
+        return false;
+    }
+    size_t len = httpd_req_get_hdr_value_len(req, "X-Auth-Token");
+    if (len != AUTH_TOKEN_LEN) {
+        return false;
+    }
+    char buf[AUTH_TOKEN_LEN + 1];
+    if (httpd_req_get_hdr_value_str(req, "X-Auth-Token", buf, sizeof(buf)) != ESP_OK) {
+        return false;
+    }
+    return strcmp(buf, s_token) == 0;
+}
+
+/* Generate a fresh session token (invalidates any previous one). */
+static void token_new(void)
+{
+    uint8_t rnd[16];
+    esp_fill_random(rnd, sizeof(rnd));
+    for (int i = 0; i < 16; i++) {
+        snprintf(&s_token[i * 2], 3, "%02x", rnd[i]);
+    }
+}
+
+/* Require auth; on failure sends 401 and returns false. */
+static bool require_auth(httpd_req_t *req)
+{
+    if (web_auth_ok(req)) {
+        return true;
+    }
+    httpd_resp_set_status(req, "401 Unauthorized");
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"error\":\"unauthorized\"}");
+    return false;
+}
+
+/* POST /api/login {"user":"...","pass":"..."} -> {"ok":true,"token":"..."} */
+static esp_err_t login_handler(httpd_req_t *req)
+{
+    char *body = httpd_read_body(req);
+    if (!body) {
+        respond_json(req, 400, "{\"error\":\"bad body\"}");
+        return ESP_OK;
+    }
+    cJSON *root = cJSON_Parse(body);
+    free(body);
+    if (!root) {
+        respond_json(req, 400, "{\"error\":\"bad json\"}");
+        return ESP_OK;
+    }
+    web_auth_cfg_t cfg;
+    web_auth_load(&cfg);
+    cJSON *u = cJSON_GetObjectItem(root, "user");
+    cJSON *p = cJSON_GetObjectItem(root, "pass");
+    bool ok = cJSON_IsString(u) && cJSON_IsString(p) &&
+              strcmp(u->valuestring, cfg.user) == 0 &&
+              strcmp(p->valuestring, cfg.pass) == 0;
+    cJSON_Delete(root);
+    if (!ok) {
+        httpd_resp_set_status(req, "401 Unauthorized");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_sendstr(req, "{\"error\":\"bad credentials\"}");
+        return ESP_OK;
+    }
+    token_new();
+    char buf[80];
+    snprintf(buf, sizeof(buf), "{\"ok\":true,\"token\":\"%s\"}", s_token);
+    respond_json(req, 200, buf);
+    return ESP_OK;
+}
+
 /* Embedded web UI (main/web/index.html via EMBED_TXTFILES) */
 extern const uint8_t index_html_start[] asm("_binary_index_html_start");
 extern const uint8_t index_html_end[] asm("_binary_index_html_end");
-
-static httpd_handle_t s_server = NULL;
 
 /* ---------- helpers ---------- */
 
@@ -135,6 +261,9 @@ static void schedule_restart(void)
 /* GET /api/wificfg -> current (NVS) WiFi configuration */
 static esp_err_t wificfg_get_handler(httpd_req_t *req)
 {
+    if (!require_auth(req)) {
+        return ESP_OK;
+    }
     wifi_web_config_t cfg;
     wifi_web_config_load(&cfg);
     char ip[16], gw[16], mask[16], dns[16];
@@ -167,6 +296,9 @@ static esp_err_t wificfg_get_handler(httpd_req_t *req)
 /* POST /api/wificfg -> save config, respond, restart */
 static esp_err_t wificfg_post_handler(httpd_req_t *req)
 {
+    if (!require_auth(req)) {
+        return ESP_OK;
+    }
     char *body = httpd_read_body(req);
     if (!body) {
         respond_json(req, 400, "{\"error\":\"bad body\"}");
@@ -260,12 +392,17 @@ static esp_err_t wificfg_post_handler(httpd_req_t *req)
 static esp_err_t index_handler(httpd_req_t *req)
 {
     httpd_resp_set_type(req, "text/html; charset=utf-8");
+    /* always fetch the latest embedded page (browser cache caused stale UIs) */
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
     httpd_resp_send(req, (const char *)index_html_start, index_html_end - index_html_start);
     return ESP_OK;
 }
 
 static esp_err_t status_handler(httpd_req_t *req)
 {
+    if (!require_auth(req)) {
+        return ESP_OK;
+    }
     cJSON *root = cJSON_CreateObject();
     if (!root) {
         respond_json(req, 400, "{\"error\":\"oom\"}");
@@ -343,6 +480,9 @@ static esp_err_t send_frame_chunk(httpd_req_t *req, const ir_frame_t *f)
 /* GET /api/frames?since=N -> {"last_seq":N,"frames":[...]} */
 static esp_err_t frames_handler(httpd_req_t *req)
 {
+    if (!require_auth(req)) {
+        return ESP_OK;
+    }
     uint32_t since = 0;
     char query[32];
     int qlen = httpd_req_get_url_query_len(req);
@@ -397,6 +537,9 @@ static esp_err_t play_by_seq(uint32_t seq, uint32_t freq)
 /* POST /api/play {"type":"hxd"|"raw"|"frame", ...} */
 static esp_err_t play_handler(httpd_req_t *req)
 {
+    if (!require_auth(req)) {
+        return ESP_OK;
+    }
     char *body = httpd_read_body(req);
     if (!body) {
         respond_json(req, 400, "{\"error\":\"bad body\"}");
@@ -479,6 +622,9 @@ static esp_err_t play_handler(httpd_req_t *req)
 /* POST /api/carrier {"freq":38000} */
 static esp_err_t carrier_handler(httpd_req_t *req)
 {
+    if (!require_auth(req)) {
+        return ESP_OK;
+    }
     char *body = httpd_read_body(req);
     if (!body) {
         respond_json(req, 400, "{\"error\":\"bad body\"}");
@@ -519,6 +665,9 @@ static esp_err_t carrier_handler(httpd_req_t *req)
 /* POST /api/rxpause {"enabled":true|false} */
 static esp_err_t rx_pause_handler(httpd_req_t *req)
 {
+    if (!require_auth(req)) {
+        return ESP_OK;
+    }
     char *body = httpd_read_body(req);
     if (!body) {
         respond_json(req, 400, "{\"error\":\"bad body\"}");
@@ -546,12 +695,74 @@ static esp_err_t rx_pause_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+/* GET /api/authcfg -> current login user (password is never returned) */
+static esp_err_t authcfg_get_handler(httpd_req_t *req)
+{
+    if (!require_auth(req)) {
+        return ESP_OK;
+    }
+    web_auth_cfg_t cfg;
+    web_auth_load(&cfg);
+    char buf[128];
+    snprintf(buf, sizeof(buf), "{\"user\":\"%s\"}", cfg.user);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, buf);
+    return ESP_OK;
+}
+
+/* POST /api/authcfg {"user":"...","pass":"..."} — pass empty = keep current */
+static esp_err_t authcfg_post_handler(httpd_req_t *req)
+{
+    if (!require_auth(req)) {
+        return ESP_OK;
+    }
+    char *body = httpd_read_body(req);
+    if (!body) {
+        respond_json(req, 400, "{\"error\":\"bad body\"}");
+        return ESP_OK;
+    }
+    cJSON *root = cJSON_Parse(body);
+    free(body);
+    if (!root) {
+        respond_json(req, 400, "{\"error\":\"bad json\"}");
+        return ESP_OK;
+    }
+
+    web_auth_cfg_t cfg;
+    web_auth_load(&cfg);
+
+    cJSON *j = cJSON_GetObjectItem(root, "user");
+    if (cJSON_IsString(j) && j->valuestring[0] != '\0') {
+        strlcpy(cfg.user, j->valuestring, sizeof(cfg.user));
+    }
+    j = cJSON_GetObjectItem(root, "pass");
+    if (cJSON_IsString(j) && j->valuestring[0] != '\0') {
+        if (strlen(j->valuestring) < 4 || strlen(j->valuestring) >= sizeof(cfg.pass)) {
+            cJSON_Delete(root);
+            respond_json(req, 400, "{\"error\":\"pass must be 4-63 chars\"}");
+            return ESP_OK;
+        }
+        strlcpy(cfg.pass, j->valuestring, sizeof(cfg.pass));
+    }
+    cJSON_Delete(root);
+
+    esp_err_t err = web_auth_save(&cfg);
+    if (err != ESP_OK) {
+        respond_json(req, 400, "{\"error\":\"nvs write failed\"}");
+        return ESP_OK;
+    }
+    /* credentials changed: force a fresh login */
+    s_token[0] = '\0';
+    respond_ok(req);
+    return ESP_OK;
+}
+
 esp_err_t web_init(void)
 {
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.server_port = HTTP_PORT;
     cfg.stack_size = 8192;
-    cfg.max_uri_handlers = 8;
+    cfg.max_uri_handlers = 16; /* 11 registered handlers + headroom */
 
     if (httpd_start(&s_server, &cfg) != ESP_OK) {
         ESP_LOGE(TAG, "Failed to start HTTP server on port %d", HTTP_PORT);
@@ -560,6 +771,7 @@ esp_err_t web_init(void)
 
     static const httpd_uri_t uris[] = {
         {.uri = "/",             .method = HTTP_GET,  .handler = index_handler},
+        {.uri = "/api/login",    .method = HTTP_POST, .handler = login_handler},
         {.uri = "/api/status",   .method = HTTP_GET,  .handler = status_handler},
         {.uri = "/api/frames",   .method = HTTP_GET,  .handler = frames_handler},
         {.uri = "/api/play",     .method = HTTP_POST, .handler = play_handler},
@@ -567,6 +779,8 @@ esp_err_t web_init(void)
         {.uri = "/api/rxpause",  .method = HTTP_POST, .handler = rx_pause_handler},
         {.uri = "/api/wificfg",  .method = HTTP_GET,  .handler = wificfg_get_handler},
         {.uri = "/api/wificfg",  .method = HTTP_POST, .handler = wificfg_post_handler},
+        {.uri = "/api/authcfg",  .method = HTTP_GET,  .handler = authcfg_get_handler},
+        {.uri = "/api/authcfg",  .method = HTTP_POST, .handler = authcfg_post_handler},
     };
     for (size_t i = 0; i < sizeof(uris) / sizeof(uris[0]); i++) {
         if (httpd_register_uri_handler(s_server, &uris[i]) != ESP_OK) {
