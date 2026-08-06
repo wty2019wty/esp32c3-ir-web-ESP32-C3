@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <ctype.h>
+#include <unistd.h>
 #include "app_web.h"
 #include "app_ir.h"
 #include "app_wifi.h"
@@ -1096,6 +1097,10 @@ static void ws_session_close(httpd_handle_t hd, int sockfd)
 {
     (void)hd;
     ws_client_remove(sockfd);
+    /* With a custom close_fn set, esp_http_server does NOT close the socket
+     * itself; we must close it here or every closed session leaks an lwIP
+     * socket (eventually accept() fails with ENFILE / errno 23). */
+    close(sockfd);
 }
 
 static esp_err_t ws_handler(httpd_req_t *req)
