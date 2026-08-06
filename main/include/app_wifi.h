@@ -5,19 +5,40 @@
 #include <stdint.h>
 #include "esp_err.h"
 
+#define WIFI_CFG_SSID_LEN 32
+#define WIFI_CFG_PWD_LEN  64
+
 typedef enum {
     WIFI_ROLE_AP = 0,    /* device creates a hotspot only */
     WIFI_ROLE_STA,       /* join a router network; falls back to AP on timeout */
     WIFI_ROLE_APSTA,     /* hotspot + station at the same time */
 } wifi_role_t;
 
+/* Web-editable WiFi configuration (persisted in NVS, menuconfig provides defaults) */
+typedef struct {
+    char ap_ssid[WIFI_CFG_SSID_LEN + 1];
+    char ap_password[WIFI_CFG_PWD_LEN + 1];   /* empty = open network */
+    char sta_ssid[WIFI_CFG_SSID_LEN + 1];     /* empty = skip station */
+    char sta_password[WIFI_CFG_PWD_LEN + 1];
+    bool sta_dhcp;                            /* true = DHCP, false = static */
+    uint32_t sta_ip;                          /* static config, network byte order */
+    uint32_t sta_gw;
+    uint32_t sta_mask;
+    uint32_t sta_dns;
+} wifi_web_config_t;
+
 /**
- * Initialize WiFi (netif, event loop, driver), apply the configured role
- * and start. In STA role this blocks up to CONFIG_IR_TOOL_WIFI_STA_TIMEOUT_MS
- * waiting for the connection, then falls back to SoftAP so the web UI stays
- * reachable. Must be called after nvs_flash_init().
+ * Initialize WiFi (netif, event loop, driver), load the web configuration from
+ * NVS (menuconfig values as defaults), apply the configured role and start.
+ * In STA role this blocks up to CONFIG_IR_TOOL_WIFI_STA_TIMEOUT_MS waiting for
+ * the connection, then falls back to SoftAP so the web UI stays reachable.
+ * Must be called after nvs_flash_init().
  */
 esp_err_t wifi_init(void);
+
+/* Load/save the web-editable WiFi configuration (NVS, namespace "ir_tool"). */
+esp_err_t wifi_web_config_load(wifi_web_config_t *cfg);
+esp_err_t wifi_web_config_save(const wifi_web_config_t *cfg);
 
 wifi_role_t wifi_get_role(void);
 const char *wifi_mode_str(void);        /* actual mode: "AP" / "STA" / "AP+STA" */

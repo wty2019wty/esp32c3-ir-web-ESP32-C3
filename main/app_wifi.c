@@ -7,18 +7,17 @@
 #include "esp_mac.h"
 #include "esp_log.h"
 #include "esp_check.h"
+#include "nvs_flash.h"
+#include "nvs.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
 #define TAG "wifi"
 
-#define AP_SSID        CONFIG_IR_TOOL_WIFI_AP_SSID
-#define AP_PASSWORD    CONFIG_IR_TOOL_WIFI_AP_PASSWORD
 #define AP_CHANNEL     CONFIG_IR_TOOL_WIFI_AP_CHANNEL
 #define AP_MAX_CONN    CONFIG_IR_TOOL_WIFI_AP_MAX_CONN
-#define STA_SSID       CONFIG_IR_TOOL_WIFI_STA_SSID
-#define STA_PASSWORD   CONFIG_IR_TOOL_WIFI_STA_PASSWORD
 #define STA_TIMEOUT_MS CONFIG_IR_TOOL_WIFI_STA_TIMEOUT_MS
+#define NVS_NS         "ir_tool"
 
 static wifi_role_t s_role;
 static wifi_mode_t s_actual_mode;
@@ -28,9 +27,96 @@ static volatile bool s_sta_connected = false;
 static bool s_fell_back = false;
 static char s_sta_ip[16] = "";
 
+/* Web-editable configuration, loaded once at boot */
+static wifi_web_config_t s_web_cfg;
+
 static bool role_wants_sta(void)
 {
-    return s_role != WIFI_ROLE_AP && STA_SSID[0] != '\0';
+    return s_role != WIFI_ROLE_AP && s_web_cfg.sta_ssid[0] != '\0';
+}
+
+/* ---------------- NVS config load / save ---------------- */
+
+esp_err_t wifi_web_config_load(wifi_web_config_t *cfg)
+{
+    memset(cfg, 0, sizeof(*cfg));
+    strlcpy(cfg->ap_ssid, CONFIG_IR_TOOL_WIFI_AP_SSID, sizeof(cfg->ap_ssid));
+    strlcpy(cfg->ap_password, CONFIG_IR_TOOL_WIFI_AP_PASSWORD, sizeof(cfg->ap_password));
+    strlcpy(cfg->sta_ssid, CONFIG_IR_TOOL_WIFI_STA_SSID, sizeof(cfg->sta_ssid));
+    strlcpy(cfg->sta_password, CONFIG_IR_TOOL_WIFI_STA_PASSWORD, sizeof(cfg->sta_password));
+    cfg->sta_dhcp = true;
+
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS, NVS_READONLY, &h) != ESP_OK) {
+        return ESP_OK; /* defaults only */
+    }
+    size_t len;
+    len = sizeof(cfg->ap_ssid);
+    if (nvs_get_str(h, "ap_ssid", cfg->ap_ssid, &len) != ESP_OK) {
+        strlcpy(cfg->ap_ssid, CONFIG_IR_TOOL_WIFI_AP_SSID, sizeof(cfg->ap_ssid));
+    }
+    len = sizeof(cfg->ap_password);
+    if (nvs_get_str(h, "ap_pwd", cfg->ap_password, &len) != ESP_OK) {
+        strlcpy(cfg->ap_password, CONFIG_IR_TOOL_WIFI_AP_PASSWORD, sizeof(cfg->ap_password));
+    }
+    len = sizeof(cfg->sta_ssid);
+    if (nvs_get_str(h, "sta_ssid", cfg->sta_ssid, &len) != ESP_OK) {
+        strlcpy(cfg->sta_ssid, CONFIG_IR_TOOL_WIFI_STA_SSID, sizeof(cfg->sta_ssid));
+    }
+    len = sizeof(cfg->sta_password);
+    if (nvs_get_str(h, "sta_pwd", cfg->sta_password, &len) != ESP_OK) {
+        strlcpy(cfg->sta_password, CONFIG_IR_TOOL_WIFI_STA_PASSWORD, sizeof(cfg->sta_password));
+    }
+    uint8_t v8 = 1;
+    if (nvs_get_u8(h, "sta_dhcp", &v8) == ESP_OK) {
+        cfg->sta_dhcp = v8 != 0;
+    }
+    nvs_get_u32(h, "sta_ip", &cfg->sta_ip);
+    nvs_get_u32(h, "sta_gw", &cfg->sta_gw);
+    nvs_get_u32(h, "sta_mask", &cfg->sta_mask);
+    nvs_get_u32(h, "sta_dns", &cfg->sta_dns);
+    nvs_close(h);
+    return ESP_OK;
+}
+
+esp_err_t wifi_web_config_save(const wifi_web_config_t *cfg)
+{
+    nvs_handle_t h;
+    ESP_RETURN_ON_ERROR(nvs_open(NVS_NS, NVS_READWRITE, &h), TAG, "open nvs");
+    esp_err_t err = nvs_set_str(h, "ap_ssid", cfg->ap_ssid);
+    if (err == ESP_OK) err = nvs_set_str(h, "ap_pwd", cfg->ap_password);
+    if (err == ESP_OK) err = nvs_set_str(h, "sta_ssid", cfg->sta_ssid);
+    if (err == ESP_OK) err = nvs_set_str(h, "sta_pwd", cfg->sta_password);
+    if (err == ESP_OK) err = nvs_set_u8(h, "sta_dhcp", cfg->sta_dhcp ? 1 : 0);
+    if (err == ESP_OK) err = nvs_set_u32(h, "sta_ip", cfg->sta_ip);
+    if (err == ESP_OK) err = nvs_set_u32(h, "sta_gw", cfg->sta_gw);
+    if (err == ESP_OK) err = nvs_set_u32(h, "sta_mask", cfg->sta_mask);
+    if (err == ESP_OK) err = nvs_set_u32(h, "sta_dns", cfg->sta_dns);
+    if (err == ESP_OK) err = nvs_commit(h);
+    nvs_close(h);
+    return err;
+}
+
+/* ---------------- events ---------------- */
+
+static void sta_apply_static_ip(void)
+{
+    if (s_web_cfg.sta_dhcp || !s_sta_netif) {
+        return;
+    }
+    esp_netif_dhcpc_stop(s_sta_netif);
+    esp_netif_ip_info_t ip = {0};
+    ip.ip.addr = s_web_cfg.sta_ip;
+    ip.gw.addr = s_web_cfg.sta_gw;
+    ip.netmask.addr = s_web_cfg.sta_mask ? s_web_cfg.sta_mask : 0x00FFFFFFU; /* 255.255.255.0 */
+    esp_netif_set_ip_info(s_sta_netif, &ip);
+    if (s_web_cfg.sta_dns) {
+        esp_netif_dns_info_t dns = {0};
+        dns.ip.type = ESP_IPADDR_TYPE_V4;
+        dns.ip.u_addr.ip4.addr = s_web_cfg.sta_dns;
+        esp_netif_set_dns_info(s_sta_netif, ESP_NETIF_DNS_MAIN, &dns);
+    }
+    ESP_LOGI(TAG, "STA static IP applied");
 }
 
 static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data)
@@ -39,7 +125,10 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
     if (base == WIFI_EVENT) {
         switch (id) {
         case WIFI_EVENT_STA_START:
-            ESP_LOGI(TAG, "STA started, connecting to \"%s\"", STA_SSID);
+            ESP_LOGI(TAG, "STA started, connecting to \"%s\"", s_web_cfg.sta_ssid);
+            if (!s_web_cfg.sta_dhcp) {
+                sta_apply_static_ip();
+            }
             esp_wifi_connect();
             break;
         case WIFI_EVENT_STA_CONNECTED:
@@ -84,29 +173,29 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
 static void wifi_configure_ap(void)
 {
     wifi_config_t cfg = {0};
-    strlcpy((char *)cfg.ap.ssid, AP_SSID, sizeof(cfg.ap.ssid));
+    strlcpy((char *)cfg.ap.ssid, s_web_cfg.ap_ssid, sizeof(cfg.ap.ssid));
     cfg.ap.ssid_len = (uint8_t)strlen((const char *)cfg.ap.ssid); /* strlcpy guarantees NUL, <= 32 */
     cfg.ap.channel = AP_CHANNEL;
     cfg.ap.max_connection = AP_MAX_CONN;
-    if (AP_PASSWORD[0] != '\0' && strlen(AP_PASSWORD) >= 8) {
-        strlcpy((char *)cfg.ap.password, AP_PASSWORD, sizeof(cfg.ap.password));
+    if (s_web_cfg.ap_password[0] != '\0' && strlen(s_web_cfg.ap_password) >= 8) {
+        strlcpy((char *)cfg.ap.password, s_web_cfg.ap_password, sizeof(cfg.ap.password));
         cfg.ap.authmode = WIFI_AUTH_WPA2_PSK;
     } else {
-        if (AP_PASSWORD[0] != '\0') {
+        if (s_web_cfg.ap_password[0] != '\0') {
             ESP_LOGW(TAG, "AP password shorter than 8 chars, using open network");
         }
         cfg.ap.authmode = WIFI_AUTH_OPEN;
     }
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &cfg));
     ESP_LOGI(TAG, "SoftAP \"%s\" (auth=%d, ch=%d, max=%d)",
-             AP_SSID, cfg.ap.authmode, AP_CHANNEL, AP_MAX_CONN);
+             s_web_cfg.ap_ssid, cfg.ap.authmode, AP_CHANNEL, AP_MAX_CONN);
 }
 
 static void wifi_configure_sta(void)
 {
     wifi_config_t cfg = {0};
-    strlcpy((char *)cfg.sta.ssid, STA_SSID, sizeof(cfg.sta.ssid));
-    strlcpy((char *)cfg.sta.password, STA_PASSWORD, sizeof(cfg.sta.password));
+    strlcpy((char *)cfg.sta.ssid, s_web_cfg.sta_ssid, sizeof(cfg.sta.ssid));
+    strlcpy((char *)cfg.sta.password, s_web_cfg.sta_password, sizeof(cfg.sta.password));
     cfg.sta.threshold.authmode = WIFI_AUTH_OPEN;
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &cfg));
 }
@@ -120,6 +209,8 @@ esp_err_t wifi_init(void)
 #else
     s_role = WIFI_ROLE_AP;
 #endif
+
+    wifi_web_config_load(&s_web_cfg);
 
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
@@ -152,7 +243,7 @@ esp_err_t wifi_init(void)
     if (s_role == WIFI_ROLE_APSTA) {
         mode = WIFI_MODE_APSTA;
     } else if (s_role == WIFI_ROLE_STA) {
-        mode = STA_SSID[0] != '\0' ? WIFI_MODE_STA : WIFI_MODE_AP;
+        mode = s_web_cfg.sta_ssid[0] != '\0' ? WIFI_MODE_STA : WIFI_MODE_AP;
     } else {
         mode = WIFI_MODE_AP;
     }
@@ -234,10 +325,10 @@ bool wifi_get_sta_ip(char *buf, size_t len)
 
 const char *wifi_ap_ssid(void)
 {
-    return AP_SSID;
+    return s_web_cfg.ap_ssid;
 }
 
 const char *wifi_sta_ssid(void)
 {
-    return STA_SSID;
+    return s_web_cfg.sta_ssid;
 }

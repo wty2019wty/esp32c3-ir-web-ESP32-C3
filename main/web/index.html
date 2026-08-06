@@ -35,6 +35,11 @@
   .badge.ap { background: #1f5c2e; color: #7ee08a; }
   .badge.sta { background: #1f4a6e; color: #7ec4e0; }
   .badge.off { background: #5c1f1f; color: #e07e7e; }
+  .tabbtn { background: #232936; color: #d7dae0; border: 1px solid #2a2f3a; }
+  .tabbtn.active { background: #2f6fed; color: #fff; border-color: #2f6fed; }
+  .formgrid { display: grid; grid-template-columns: 190px 1fr; gap: 9px 12px; align-items: center; }
+  .formgrid label { color: #8a93a3; font-size: 13px; }
+  input.ip { width: 170px; }
   .kv { display: grid; grid-template-columns: 130px 1fr; gap: 4px 10px; font-size: 13.5px; }
   .kv b { color: #8a93a3; font-weight: 500; }
   #statusText { font-size: 14px; }
@@ -44,6 +49,13 @@
 </head>
 <body>
 <h1>esp32c3-ir-web 红外信号监视器</h1>
+
+<div class="row" style="margin-bottom: 12px;">
+  <button id="tabMonBtn" class="tabbtn active" onclick="showTab('mon')">实时监视</button>
+  <button id="tabSetBtn" class="tabbtn" onclick="showTab('set')">设置</button>
+</div>
+
+<div id="viewMon">
 
 <div class="card">
   <div id="statusText">加载中...</div>
@@ -102,6 +114,44 @@
     <thead><tr><th>#</th><th>时间</th><th>类型</th><th>NEC hxd</th><th>段数</th></tr></thead>
     <tbody></tbody>
   </table>
+</div>
+
+</div><!-- /viewMon -->
+
+<div id="viewSet" style="display:none;">
+  <div class="card">
+    <h2>WiFi 设置</h2>
+    <div style="font-size:12px; color:#8a93a3; margin-bottom:10px;">
+      修改后点击"保存并重启"：设备 2 秒后自动重启应用新配置，请稍候 10-20 秒重新连接。
+    </div>
+    <div class="formgrid">
+      <label>热点名称 (SoftAP SSID)</label>
+      <input type="text" id="cfgApSsid" maxlength="32" placeholder="ESP32C3-IR">
+      <label>热点密码</label>
+      <input type="text" id="cfgApPwd" maxlength="64" placeholder="留空 = 开放网络（8-63 位则启用加密）">
+      <label>连接 WiFi 名称 (STA SSID)</label>
+      <input type="text" id="cfgStaSsid" maxlength="32" placeholder="留空 = 不连接路由器">
+      <label>连接 WiFi 密码</label>
+      <input type="text" id="cfgStaPwd" maxlength="64">
+      <label>STA 地址获取方式</label>
+      <span class="row" style="margin:0;">
+        <label style="display:flex;align-items:center;gap:4px;color:#d7dae0;"><input type="radio" name="staDhcp" value="1" checked> DHCP</label>
+        <label style="display:flex;align-items:center;gap:4px;color:#d7dae0;"><input type="radio" name="staDhcp" value="0"> 静态 IP</label>
+      </span>
+      <label>静态 IP</label>
+      <input type="text" id="cfgStaIp" class="ip" placeholder="192.168.1.100">
+      <label>子网掩码</label>
+      <input type="text" id="cfgStaMask" class="ip" placeholder="255.255.255.0">
+      <label>网关</label>
+      <input type="text" id="cfgStaGw" class="ip" placeholder="192.168.1.1">
+      <label>DNS</label>
+      <input type="text" id="cfgStaDns" class="ip" placeholder="可留空">
+    </div>
+    <div class="row" style="margin-top:12px;">
+      <button id="cfgSaveBtn" onclick="saveWifiCfg()">保存并重启</button>
+      <span id="cfgStatus"></span>
+    </div>
+  </div>
 </div>
 
 <div id="toast"></div>
@@ -308,6 +358,83 @@ async function setRxPause(enabled) {
     else toast('设置失败');
   } catch (e) { toast('设置请求失败'); }
   refreshStatus();
+}
+
+/* ---------------- settings tab ---------------- */
+
+function showTab(t) {
+  $('viewMon').style.display = t === 'mon' ? '' : 'none';
+  $('viewSet').style.display = t === 'set' ? '' : 'none';
+  $('tabMonBtn').classList.toggle('active', t === 'mon');
+  $('tabSetBtn').classList.toggle('active', t === 'set');
+  if (t === 'set') loadWifiCfg();
+}
+
+async function loadWifiCfg() {
+  $('cfgStatus').textContent = '';
+  try {
+    const c = await (await fetch('/api/wificfg')).json();
+    $('cfgApSsid').value = c.ap_ssid;
+    $('cfgApPwd').value = c.ap_password;
+    $('cfgStaSsid').value = c.sta_ssid;
+    $('cfgStaPwd').value = c.sta_password;
+    document.querySelector('input[name=staDhcp][value="' + (c.sta_dhcp ? '1' : '0') + '"]').checked = true;
+    $('cfgStaIp').value = c.sta_ip;
+    $('cfgStaMask').value = c.sta_mask;
+    $('cfgStaGw').value = c.sta_gw;
+    $('cfgStaDns').value = c.sta_dns;
+  } catch (e) {
+    $('cfgStatus').textContent = '读取配置失败';
+  }
+}
+
+function validIp(v) {
+  v = v.trim();
+  if (v === '') return false;
+  const parts = v.split('.');
+  if (parts.length !== 4) return false;
+  return parts.every(p => /^\d{1,3}$/.test(p) && +p >= 0 && +p <= 255);
+}
+
+async function saveWifiCfg() {
+  const staDhcp = document.querySelector('input[name=staDhcp]:checked').value === '1';
+  const apPwd = $('cfgApPwd').value;
+  if (apPwd !== '' && apPwd.length < 8) {
+    $('cfgStatus').textContent = '热点密码需 ≥8 位，或留空使用开放网络';
+    return;
+  }
+  const ipV = $('cfgStaIp').value.trim();
+  const maskV = $('cfgStaMask').value.trim();
+  const gwV = $('cfgStaGw').value.trim();
+  const dnsV = $('cfgStaDns').value.trim();
+  if (!staDhcp) {
+    if (!validIp(ipV)) { $('cfgStatus').textContent = '静态 IP 格式错误'; return; }
+    if (maskV && !validIp(maskV)) { $('cfgStatus').textContent = '子网掩码格式错误'; return; }
+    if (gwV && !validIp(gwV)) { $('cfgStatus').textContent = '网关格式错误'; return; }
+    if (dnsV && !validIp(dnsV)) { $('cfgStatus').textContent = 'DNS 格式错误'; return; }
+  }
+  const body = {
+    ap_ssid: $('cfgApSsid').value.trim(),
+    ap_password: apPwd,
+    sta_ssid: $('cfgStaSsid').value.trim(),
+    sta_password: $('cfgStaPwd').value,
+    sta_dhcp: staDhcp,
+    sta_ip: ipV,
+    sta_mask: maskV || '255.255.255.0',
+    sta_gw: gwV,
+    sta_dns: dnsV
+  };
+  try {
+    const d = await postJSON('/api/wificfg', body);
+    if (d.ok && d.restart) {
+      $('cfgStatus').textContent = '已保存，设备 2 秒后重启，请稍候重新连接...';
+      $('cfgSaveBtn').disabled = true;
+    } else {
+      $('cfgStatus').textContent = '保存失败：' + (d.error || '未知错误');
+    }
+  } catch (e) {
+    $('cfgStatus').textContent = '保存请求失败';
+  }
 }
 
 /* ---------------- init ---------------- */
