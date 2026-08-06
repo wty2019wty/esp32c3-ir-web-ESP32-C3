@@ -134,8 +134,9 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
             ESP_LOGI(TAG, "STA connected");
             s_sta_connected = true;
             break;
-        case WIFI_EVENT_STA_DISCONNECTED:
-            ESP_LOGW(TAG, "STA disconnected");
+        case WIFI_EVENT_STA_DISCONNECTED: {
+            wifi_event_sta_disconnected_t *ev = (wifi_event_sta_disconnected_t *)data;
+            ESP_LOGW(TAG, "STA disconnected (reason=%d, rssi=%d)", ev->reason, ev->rssi);
             s_sta_connected = false;
             s_sta_ip[0] = '\0';
             /* reconnect unless we fell back to AP-only mode */
@@ -143,6 +144,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
                 esp_wifi_connect();
             }
             break;
+        }
         case WIFI_EVENT_AP_START:
             ESP_LOGI(TAG, "SoftAP started");
             break;
@@ -244,6 +246,14 @@ esp_err_t wifi_init(void)
 
     /* STA-only role: wait for the connection, then fall back to AP on timeout */
     if (mode == WIFI_MODE_STA) {
+        /* Some ESP32-C3 boards fail open-auth at the default 20 dBm
+         * (reason=2, AUTH_EXPIRE) while SoftAP works fine. Capping the TX
+         * power is the documented fix; the limit also stays active if we
+         * later fall back to SoftAP. */
+        esp_err_t pwr_err = esp_wifi_set_max_tx_power(CONFIG_IR_TOOL_WIFI_STA_TX_POWER_DBM * 4);
+        if (pwr_err != ESP_OK) {
+            ESP_LOGW(TAG, "set max TX power failed: %s", esp_err_to_name(pwr_err));
+        }
         ESP_LOGI(TAG, "Waiting for STA connection (%lu ms max)...", (unsigned long)STA_TIMEOUT_MS);
         uint32_t waited = 0;
         while (!s_sta_connected && waited < STA_TIMEOUT_MS) {

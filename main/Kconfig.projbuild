@@ -8,7 +8,7 @@ menu "IR Web Tool Configuration"
 
     config IR_TOOL_IR_TX_GPIO
         int "IR transmitter GPIO (needs transistor driver)"
-        default 3
+        default 5
         help
             Carrier-modulated output. Drive an IR LED via a transistor.
 
@@ -28,7 +28,7 @@ menu "IR Web Tool Configuration"
 
     config IR_TOOL_WIFI_AP_SSID
         string "SoftAP SSID"
-        default "ESP32C3-IR"
+        default "ESP32S3-IR"
 
     config IR_TOOL_WIFI_AP_PASSWORD
         string "SoftAP password (empty = open network)"
@@ -54,13 +54,24 @@ menu "IR Web Tool Configuration"
         int "Station connection timeout (ms), then fall back to SoftAP"
         default 10000
 
+    config IR_TOOL_WIFI_STA_TX_POWER_DBM
+        int "Max station TX power (dBm)"
+        default 15 if IDF_TARGET_ESP32C3
+        default 20
+        range 8 20
+        help
+            Cap the station TX power. Some ESP32-C3 boards fail open-auth
+            (WIFI_REASON_AUTH_EXPIRE, reason 2) at the default 20 dBm while
+            SoftAP works fine; 15 dBm connects reliably on such boards.
+            ESP32-S3 is unaffected and keeps the full 20 dBm.
+
     config IR_TOOL_HTTP_PORT
         int "HTTP server port"
         default 80
 
     config IR_TOOL_HOSTNAME
         string "DHCP hostname (shown in router client list)"
-        default "esp32c3-ir-web"
+        default "ir-web"
 
     config IR_TOOL_HISTORY_DEPTH
         int "In-memory frame history depth"
