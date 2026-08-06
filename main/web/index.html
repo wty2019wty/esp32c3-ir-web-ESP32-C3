@@ -58,6 +58,12 @@
     <span id="carrierStatus"></span>
   </div>
   <div style="font-size:12px; color:#8a93a3;">回放时使用此频率调制载波（默认 38000 Hz，重启后保留）。</div>
+  <div class="row" style="margin-top:10px;">
+    <label style="display:flex;align-items:center;gap:8px;cursor:pointer;">
+      <input type="checkbox" id="rxPauseChk" onchange="setRxPause(this.checked)">
+      回放时暂停 IR 接收（页面保持静止，不被自环帧刷新）
+    </label>
+  </div>
 </div>
 
 <div class="card">
@@ -143,6 +149,7 @@ async function refreshStatus() {
 
     const ci = $('carrierInput');
     if (String(parseInt(ci.value)) !== String(s.carrier_hz)) ci.value = s.carrier_hz;
+    $('rxPauseChk').checked = !!s.rx_pause_on_play;
 
     if (s.playing) {
       $('playLatestBtn').disabled = true;
@@ -291,6 +298,15 @@ async function setCarrier() {
     if (d.ok) { $('carrierStatus').textContent = '已设置 ' + d.freq + ' Hz'; toast('载波已更新'); }
     else toast('载波设置失败');
   } catch (e) { toast('载波请求失败'); }
+  refreshStatus();
+}
+
+async function setRxPause(enabled) {
+  try {
+    const d = await postJSON('/api/rxpause', { enabled });
+    if (d.ok) toast(enabled ? '已开启：回放时暂停接收' : '已关闭：回放时允许自环');
+    else toast('设置失败');
+  } catch (e) { toast('设置请求失败'); }
   refreshStatus();
 }
 

@@ -81,6 +81,7 @@ static esp_err_t status_handler(httpd_req_t *req)
     cJSON_AddStringToObject(root, "sta_ssid", wifi_sta_ssid());
     cJSON_AddBoolToObject(root, "sta_connected", wifi_is_sta_connected());
     cJSON_AddNumberToObject(root, "carrier_hz", ir_get_carrier_freq());
+    cJSON_AddBoolToObject(root, "rx_pause_on_play", ir_get_rx_pause_enabled());
     cJSON_AddBoolToObject(root, "playing", ir_is_playing());
     cJSON_AddNumberToObject(root, "history_count", ir_history_count());
 
@@ -316,6 +317,36 @@ static esp_err_t carrier_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+/* POST /api/rxpause {"enabled":true|false} */
+static esp_err_t rx_pause_handler(httpd_req_t *req)
+{
+    char *body = httpd_read_body(req);
+    if (!body) {
+        respond_json(req, 400, "{\"error\":\"bad body\"}");
+        return ESP_OK;
+    }
+    cJSON *root = cJSON_Parse(body);
+    free(body);
+    if (!root) {
+        respond_json(req, 400, "{\"error\":\"bad json\"}");
+        return ESP_OK;
+    }
+    cJSON *en = cJSON_GetObjectItem(root, "enabled");
+    if (!cJSON_IsBool(en)) {
+        cJSON_Delete(root);
+        respond_json(req, 400, "{\"error\":\"missing enabled\"}");
+        return ESP_OK;
+    }
+    ir_set_rx_pause_enabled(cJSON_IsTrue(en));
+    cJSON_Delete(root);
+
+    char buf[64];
+    snprintf(buf, sizeof(buf), "{\"ok\":true,\"rx_pause_on_play\":%s}",
+             ir_get_rx_pause_enabled() ? "true" : "false");
+    respond_json(req, 200, buf);
+    return ESP_OK;
+}
+
 esp_err_t web_init(void)
 {
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
@@ -334,6 +365,7 @@ esp_err_t web_init(void)
         {.uri = "/api/frames",   .method = HTTP_GET,  .handler = frames_handler},
         {.uri = "/api/play",     .method = HTTP_POST, .handler = play_handler},
         {.uri = "/api/carrier",  .method = HTTP_POST, .handler = carrier_handler},
+        {.uri = "/api/rxpause",  .method = HTTP_POST, .handler = rx_pause_handler},
     };
     for (size_t i = 0; i < sizeof(uris) / sizeof(uris[0]); i++) {
         if (httpd_register_uri_handler(s_server, &uris[i]) != ESP_OK) {

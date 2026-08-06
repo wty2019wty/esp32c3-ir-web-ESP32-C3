@@ -38,6 +38,7 @@
 
 #define IR_NVS_NS           "ir_tool"
 #define IR_NVS_KEY_FREQ     "carrier_hz"
+#define IR_NVS_KEY_RX_PAUSE "rx_pause"
 
 typedef struct {
     uint32_t dur;   /* duration in us */
@@ -67,7 +68,8 @@ static rmt_encoder_handle_t s_copy_enc = NULL;
 static rmt_transmit_config_t s_tx_cfg;
 static QueueHandle_t s_play_queue;
 static volatile bool s_playing = false;
-static volatile bool s_rx_paused = false; /* RX paused while transmitting */
+static volatile bool s_rx_paused = false;      /* RX paused while transmitting */
+static bool s_rx_pause_enabled = true;         /* user switch, default on */
 
 /* global carrier frequency (Hz) */
 static uint32_t s_carrier_freq = CONFIG_IR_TOOL_CARRIER_FREQ_HZ;
@@ -316,6 +318,15 @@ esp_err_t ir_init(void)
 
     ir_load_carrier_from_nvs();
 
+    nvs_handle_t nh;
+    if (nvs_open(IR_NVS_NS, NVS_READONLY, &nh) == ESP_OK) {
+        uint8_t v = 1;
+        if (nvs_get_u8(nh, IR_NVS_KEY_RX_PAUSE, &v) == ESP_OK) {
+            s_rx_pause_enabled = v != 0;
+        }
+        nvs_close(nh);
+    }
+
     /* Configure RMT RX channel (ESP32-C3: no DMA, multiple mem blocks, ping-pong) */
     rmt_rx_channel_config_t rx_ch_cfg = {
         .gpio_num = IR_RX_GPIO,
@@ -556,7 +567,7 @@ static void ir_playback_task(void *arg)
         s_playing = true;
 
         /* pause IR reception while transmitting to avoid self-loop frames */
-        if (!s_rx_paused) {
+        if (!s_rx_paused && s_rx_pause_enabled) {
             if (rmt_disable(s_rx_ch) == ESP_OK) {
                 s_rx_paused = true;
             } else {
@@ -598,6 +609,24 @@ static void ir_playback_task(void *arg)
             }
         }
     }
+}
+
+bool ir_get_rx_pause_enabled(void)
+{
+    return s_rx_pause_enabled;
+}
+
+esp_err_t ir_set_rx_pause_enabled(bool enabled)
+{
+    s_rx_pause_enabled = enabled;
+    nvs_handle_t nh;
+    if (nvs_open(IR_NVS_NS, NVS_READWRITE, &nh) == ESP_OK) {
+        nvs_set_u8(nh, IR_NVS_KEY_RX_PAUSE, enabled ? 1 : 0);
+        nvs_commit(nh);
+        nvs_close(nh);
+    }
+    ESP_LOGI(TAG, "RX pause on playback: %s", enabled ? "on" : "off");
+    return ESP_OK;
 }
 
 bool ir_is_playing(void)

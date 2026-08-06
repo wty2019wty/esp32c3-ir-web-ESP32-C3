@@ -63,6 +63,10 @@ uint32_t ir_get_latest_seq(void);
 uint32_t ir_get_carrier_freq(void);
 esp_err_t ir_set_carrier_freq(uint32_t freq_hz);            /* applies + persists to NVS */
 
+/* ---- RX pause on playback (default on; persists to NVS) ---- */
+bool ir_get_rx_pause_enabled(void);
+esp_err_t ir_set_rx_pause_enabled(bool enabled);
+
 /* ---- playback (freq_hz == 0 -> use current global carrier) ---- */
 esp_err_t ir_play_hxd(const char *hex, uint32_t freq_hz);   /* e.g. "ED127F80", LSB order */
 esp_err_t ir_play_raw(const uint32_t *durs, uint32_t count, uint32_t freq_hz);
