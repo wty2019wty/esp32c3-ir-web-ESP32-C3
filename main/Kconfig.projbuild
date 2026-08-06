@@ -26,29 +26,6 @@ menu "IR Web Tool Configuration"
         help
             Duty cycle of the carrier signal in percent. 25-50%, 33% is common.
 
-    choice IR_TOOL_WIFI_MODE
-        prompt "WiFi operation mode"
-        default IR_TOOL_WIFI_MODE_AP
-
-        config IR_TOOL_WIFI_MODE_AP
-            bool "SoftAP only (device creates a hotspot)"
-            help
-                Device creates a hotspot "ESP32C3-IR", connect to it and open
-                http://192.168.4.1
-
-        config IR_TOOL_WIFI_MODE_STA
-            bool "Station only (join a router network)"
-            help
-                Device joins the router WiFi configured below. If connection
-                times out, it falls back to SoftAP so the web UI stays reachable.
-
-        config IR_TOOL_WIFI_MODE_APSTA
-            bool "AP + Station (both at once)"
-            help
-                Hotspot and station connection are both active. Use the AP IP
-                (192.168.4.1) or the station IP to reach the web UI.
-    endchoice
-
     config IR_TOOL_WIFI_AP_SSID
         string "SoftAP SSID"
         default "ESP32C3-IR"

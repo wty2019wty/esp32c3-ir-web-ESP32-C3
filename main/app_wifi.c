@@ -19,7 +19,6 @@
 #define STA_TIMEOUT_MS CONFIG_IR_TOOL_WIFI_STA_TIMEOUT_MS
 #define NVS_NS         "ir_tool"
 
-static wifi_role_t s_role;
 static wifi_mode_t s_actual_mode;
 static esp_netif_t *s_ap_netif = NULL;
 static esp_netif_t *s_sta_netif = NULL;
@@ -32,7 +31,7 @@ static wifi_web_config_t s_web_cfg;
 
 static bool role_wants_sta(void)
 {
-    return s_role != WIFI_ROLE_AP && s_web_cfg.sta_ssid[0] != '\0';
+    return s_web_cfg.sta_ssid[0] != '\0';
 }
 
 /* ---------------- NVS config load / save ---------------- */
@@ -202,22 +201,14 @@ static void wifi_configure_sta(void)
 
 esp_err_t wifi_init(void)
 {
-#if defined(CONFIG_IR_TOOL_WIFI_MODE_STA)
-    s_role = WIFI_ROLE_STA;
-#elif defined(CONFIG_IR_TOOL_WIFI_MODE_APSTA)
-    s_role = WIFI_ROLE_APSTA;
-#else
-    s_role = WIFI_ROLE_AP;
-#endif
-
     wifi_web_config_load(&s_web_cfg);
 
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
 
-    /* AP netif is always created: in AP/APSTA roles it serves the hotspot;
-     * in STA role it is required by the SoftAP fallback path (DHCP server
-     * starts automatically when the AP interface comes up). */
+    /* AP netif is always created: in AP mode it serves the hotspot, in STA
+     * mode it is required by the SoftAP fallback path (DHCP server starts
+     * automatically when the AP interface comes up). */
     s_ap_netif = esp_netif_create_default_wifi_ap();
     ESP_RETURN_ON_FALSE(s_ap_netif, ESP_ERR_NO_MEM, TAG, "create AP netif");
     if (role_wants_sta()) {
@@ -239,14 +230,9 @@ esp_err_t wifi_init(void)
         wifi_configure_sta();
     }
 
-    wifi_mode_t mode;
-    if (s_role == WIFI_ROLE_APSTA) {
-        mode = WIFI_MODE_APSTA;
-    } else if (s_role == WIFI_ROLE_STA) {
-        mode = s_web_cfg.sta_ssid[0] != '\0' ? WIFI_MODE_STA : WIFI_MODE_AP;
-    } else {
-        mode = WIFI_MODE_AP;
-    }
+    /* STA and SoftAP are mutually exclusive: connect to the configured router
+     * when a station SSID is set, otherwise open the hotspot only. */
+    wifi_mode_t mode = role_wants_sta() ? WIFI_MODE_STA : WIFI_MODE_AP;
     ESP_RETURN_ON_ERROR(esp_wifi_set_mode(mode), TAG, "set mode");
     ESP_RETURN_ON_ERROR(esp_wifi_start(), TAG, "esp_wifi_start");
     s_actual_mode = mode;
@@ -277,17 +263,11 @@ esp_err_t wifi_init(void)
     return ESP_OK;
 }
 
-wifi_role_t wifi_get_role(void)
-{
-    return s_role;
-}
-
 const char *wifi_mode_str(void)
 {
     switch (s_actual_mode) {
     case WIFI_MODE_AP:     return "AP";
     case WIFI_MODE_STA:    return "STA";
-    case WIFI_MODE_APSTA:  return "AP+STA";
     default:               return "?";
     }
 }

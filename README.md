@@ -14,8 +14,8 @@
   - 原始数据（可带 `Frequency:` 行）
   - RAM 历史帧（点击历史记录回放）
 - **载波 Web 可配置**：默认 38000 Hz，Web 设置即时生效并写入 NVS（重启保留）
-- **WiFi 双模式**：SoftAP（设备释放热点）/ Station（连接路由器）/ AP+STA；
-  Station 连接超时自动降级 SoftAP，保证 Web 始终可达
+- **WiFi 自动互斥**：配置了连接 WiFi 则只连路由器（不开热点）；未配置则只开热点（SoftAP）；
+  STA 连接超时自动降级 SoftAP，保证 Web 始终可达
 
 ## 硬件连接
 
@@ -53,18 +53,20 @@ idf.py menuconfig   # → "IR Web Tool Configuration"
 | IR transmitter GPIO | 3 | 三极管驱动 IR LED |
 | Default IR carrier | 38000 Hz | 初始载波，Web 可改并持久化 |
 | Carrier duty cycle | 33% | 载波占空比 |
-| WiFi mode | AP | AP / STA / AP+STA 三选一 |
-| SoftAP SSID / password | ESP32C3-IR / 空 | 空密码为开放网络（≥8 位时用 WPA2） |
-| Station SSID / password | 空 | STA 模式凭据（空 = 跳过 STA） |
-| STA timeout | 10000 ms | 连接超时后降级为 SoftAP |
+| SoftAP SSID / password | ESP32C3-IR / 空 | 热点名称/密码（空 = 开放网络；可在 Web 设置页修改） |
+| Station SSID / password | 空 | 连接的路由器凭据（Web 设置页修改；非空则自动切 STA 模式） |
+| STA timeout | 10000 ms | STA 连接超时后降级为 SoftAP |
 | HTTP port | 80 | Web 服务端口 |
 | History depth | 32 | RAM 历史帧条数 |
 
+> 工作模式自动互斥：配置了 STA SSID 则设备只连接路由器（不开热点）；STA SSID 为空则只开热点。
+> 两者不会同时开启。
+
 ## 使用
 
-1. 上电后按配置模式连接：
-   - **AP 模式**：手机/电脑连接热点 `ESP32C3-IR`，浏览器打开 `http://192.168.4.1`
-   - **STA 模式**：设备连接路由器，IP 见串口日志（`esp_wifi_connect` / `got IP` 日志），浏览器打开 `http://<IP>`
+1. 上电后自动选择模式：
+   - **配置了连接 WiFi**：设备连接路由器，IP 见串口日志，浏览器打开 `http://<IP>`（此时不开热点）
+   - **未配置（默认）**：设备开启热点 `ESP32C3-IR`（无密码），浏览器打开 `http://192.168.4.1`
 2. 将遥控器对准 VS1838B 按键，页面实时显示 NEC 解码与原始数据
 3. 回放：点击"回放此信号"或历史记录行；也可粘贴 `ED127F80` 或
    `Frequency: 38000 Hz` + 逗号序列到"手动回放"区域
