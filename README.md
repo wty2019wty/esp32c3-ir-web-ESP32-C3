@@ -6,7 +6,8 @@
 
 ## 功能
 
-- **实时监视**：Web 页面实时显示最新红外信号（NEC 解码、hxd、特征、原始波形数据）
+- **实时监视**：Web 页面实时显示最新红外信号（NEC 解码、hxd、特征、原始波形数据），
+  通过 WebSocket 推送，无需轮询
 - **NEC 解码**：支持 8/16 位地址、重复码、校验和检测（极性无关扫描 9ms 引导码）
 - **原始数据**：按 `Frequency: 38000 Hz` + 逗号分隔微秒序列格式显示，可直接复制回放
 - **三种回放**：
@@ -120,13 +121,26 @@ idf.py menuconfig   # → "IR Web Tool Configuration"
 | `/api/login` | POST | 登录认证，请求体 `{"user":"...","pass":"..."}` ，返回 `{"ok":true,"token":"...","expires_in":86400,"must_change_pwd":bool}`；连续失败会返回 `429` |
 | `/api/logout` | POST | 退出登录，作废当前 token |
 | `/api/renew` | POST | 续期当前会话，返回新的 `expires_in` |
-| `/api/status` | GET | 设备状态（WiFi 模式、IP、载波、播放状态等） |
-| `/api/frames` | GET | 增量拉取帧历史，参数 `?since=N`（N 为已知最大序号） |
+| `/api/ws` | GET(WS) | WebSocket 端点：认证后推送 status（每秒）与 frame（新信号实时到达） |
+| `/api/status` | GET | 设备状态（WiFi 模式、IP、载波、播放状态等）；WebSocket 推送已取代轮询，此端点保留作回退 |
+| `/api/frames` | GET | 增量拉取帧历史，参数 `?since=N`（N 为已知最大序号）；WebSocket 推送已取代轮询，此端点保留作回退 |
 | `/api/play` | POST | 回放信号，支持三种 type：`hxd`（`{"value":"ED127F80"}`）、`raw`（`{"data":[...]}`）、`frame`（`{"seq":N}`），可选 `freq` |
 | `/api/carrier` | POST | 设置载波频率，`{"freq":38000}` |
 | `/api/rxpause` | POST | 回放时暂停 IR 接收开关，`{"enabled":true/false}` |
 | `/api/wificfg` | GET/POST | 读取/保存 WiFi 配置；密码不回显（`ap_password_set`/`sta_password_set` 标志），POST 中密码字段传 `null` 表示不修改、空字符串表示清除 |
 | `/api/authcfg` | GET/POST | 读取/修改登录凭据（GET 不返回密码） |
+
+### WebSocket 推送（状态 / 帧）
+
+页面登录后自动连接 `ws://<IP>/api/ws`，替代 `/api/status` 与 `/api/frames` 的轮询：
+
+- **认证**：连接后第一条消息发送 `{"type":"auth","token":"<session token>"}`；
+  服务端回复 `{"type":"auth","ok":true}`；token 无效或过期则回复 `ok:false` 并断开连接。
+- **推送消息**：
+  - `{"type":"status","data":{...}}` —— 每秒推送一次设备状态（字段同 `/api/status`）
+  - `{"type":"frame","data":{...}}` —— 收到新红外信号时立即推送（字段同 `/api/frames` 中的单帧）
+- **断线回退**：连接断开后前端自动切换回 REST 轮询，并每 10 秒尝试重连 WebSocket；
+  连接恢复后停止轮询。
 
 ## 工程结构
 
@@ -155,4 +169,5 @@ esp32c3-IR/
   逻辑序列，回放/显示直接复用；RMT TX 只在电平 1 时输出载波
 - **载波动态切换**：`rmt_apply_carrier` 无状态限制，回放前可即时重设
 - **内存**：历史帧静态环形缓冲（32 帧 × 约 1.1KB ≈ 36KB），不依赖文件系统
-- **Web 数据流**：前端 500ms 轮询 `/api/frames?since=N` 增量拉取，服务端 chunked 输出
+- **Web 数据流**：前端通过 WebSocket（`/api/ws`）接收状态（每秒）与新帧（实时）推送；
+  REST `/api/frames?since=N` 保留作断线回退，服务端 chunked 输出
