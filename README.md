@@ -90,10 +90,26 @@ idf.py menuconfig   # → "IR Web Tool Configuration"
 
 ### Web 登录认证
 
-- 默认账号 **admin / admin**，存 NVS，可在设置页修改。
+- 默认账号 **admin / admin**，存 NVS；**首次用默认凭据登录会强制修改密码**
+  （登录接口返回 `must_change_pwd`，前端弹出强制改密对话框，保存后自动重新登录）。
 - 访问 Web 页面时会弹出登录框，输入用户名密码后获得 session token，
-  后续请求通过 `X-Auth-Token` 请求头携带 token 认证。
+  后续请求通过 `X-Auth-Token` 请求头携带 token 认证；token 有效期为 **24 小时**，
+  前端会自动续期（`/api/renew`），过期后需重新登录。
+- 登录连续失败 **5 次** 后锁定 **30 秒**（返回 `429`），防止暴力破解。
+- 支持退出登录（`/api/logout`），服务端立即作废当前 token。
+- WiFi 密码（热点/路由器）**不再回显明文**，设置页只显示"已设置"，留空表示不修改，
+  勾选"清除"才会删除；`GET /api/wificfg` 仅返回 `ap_password_set` / `sta_password_set` 标志。
 - 修改登录凭据后会强制注销，需用新账号重新登录。
+
+### NVS 加密
+
+- 固件启用 NVS 加密（`CONFIG_NVS_ENCRYPTION`），采用 **HMAC 方案**：NVS 加解密密钥由
+  eFuse 中的 HMAC 密钥派生，**首次启动时自动生成并烧写一个 32 字节随机密钥到 eFuse
+  `KEY4` 块**（`CONFIG_NVS_SEC_HMAC_EFUSE_KEY_ID=4`）。此烧写**不可逆**，烧写后该
+  eFuse 块不可再用于其他用途。
+- **升级注意**：现有设备此前 NVS 为明文存储，启用加密后旧数据无法解密，需要
+  **擦除一次 flash**（如 `idf.py erase-flash`，或开机 2 秒内按 BOOT 恢复出厂），
+  之后设备回到默认配置并触发强制改密流程。
 
 ### Web API
 
@@ -101,14 +117,16 @@ idf.py menuconfig   # → "IR Web Tool Configuration"
 
 | 端点 | 方法 | 说明 |
 |------|------|------|
-| `/api/login` | POST | 登录认证，请求体 `{"user":"...","pass":"..."}` ，返回 `{"ok":true,"token":"..."}` |
+| `/api/login` | POST | 登录认证，请求体 `{"user":"...","pass":"..."}` ，返回 `{"ok":true,"token":"...","expires_in":86400,"must_change_pwd":bool}`；连续失败会返回 `429` |
+| `/api/logout` | POST | 退出登录，作废当前 token |
+| `/api/renew` | POST | 续期当前会话，返回新的 `expires_in` |
 | `/api/status` | GET | 设备状态（WiFi 模式、IP、载波、播放状态等） |
 | `/api/frames` | GET | 增量拉取帧历史，参数 `?since=N`（N 为已知最大序号） |
 | `/api/play` | POST | 回放信号，支持三种 type：`hxd`（`{"value":"ED127F80"}`）、`raw`（`{"data":[...]}`）、`frame`（`{"seq":N}`），可选 `freq` |
 | `/api/carrier` | POST | 设置载波频率，`{"freq":38000}` |
 | `/api/rxpause` | POST | 回放时暂停 IR 接收开关，`{"enabled":true/false}` |
-| `/api/wificfg` | GET/POST | 读取/保存 WiFi 配置（热点名称、密码、路由器凭据、静态 IP 等） |
-| `/api/authcfg` | GET/POST | 读取/修改登录凭据 |
+| `/api/wificfg` | GET/POST | 读取/保存 WiFi 配置；密码不回显（`ap_password_set`/`sta_password_set` 标志），POST 中密码字段传 `null` 表示不修改、空字符串表示清除 |
+| `/api/authcfg` | GET/POST | 读取/修改登录凭据（GET 不返回密码） |
 
 ## 工程结构
 

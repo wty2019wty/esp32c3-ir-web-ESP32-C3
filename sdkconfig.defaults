@@ -8,3 +8,10 @@ CONFIG_FREERTOS_HZ=1000
 # Custom partition table
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+# NVS encryption: HMAC scheme derives the NVS keys from an eFuse key.
+# The eFuse key (KEY4) is generated and burned automatically on first boot
+# with this configuration - this is irreversible.
+CONFIG_NVS_ENCRYPTION=y
+CONFIG_NVS_SEC_KEY_PROTECT_USING_HMAC=y
+CONFIG_NVS_SEC_HMAC_EFUSE_KEY_ID=4

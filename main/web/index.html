@@ -3,6 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ccircle cx='8' cy='8' r='7' fill='%232f6fed'/%3E%3C/svg%3E">
 <title>esp32c3-ir-web 红外监视器</title>
 <style>
@@ -50,6 +51,12 @@
                   display: none; align-items: center; justify-content: center; }
   #loginOverlay .card { width: 320px; }
   #loginOverlay input { width: 100%; margin-bottom: 8px; box-sizing: border-box; }
+  #pwdOverlay { position: fixed; inset: 0; background: rgba(10,12,16,.85); z-index: 100;
+                display: none; align-items: center; justify-content: center; }
+  #pwdOverlay .card { width: 340px; }
+  #pwdOverlay input { width: 100%; margin-bottom: 8px; box-sizing: border-box; }
+  #logoutBtn { margin-left: auto; background: #3a3f4a; }
+  #logoutBtn:hover { background: #5c1f1f; }
 </style>
 </head>
 <body>
@@ -58,6 +65,7 @@
 <div class="row" style="margin-bottom: 12px;">
   <button id="tabMonBtn" class="tabbtn active" onclick="showTab('mon')">实时监视</button>
   <button id="tabSetBtn" class="tabbtn" onclick="showTab('set')">设置</button>
+  <button id="logoutBtn" onclick="doLogout()">退出登录</button>
 </div>
 
 <div id="viewMon">
@@ -134,11 +142,21 @@
       <label>热点名称 (SoftAP SSID)</label>
       <input type="text" id="cfgApSsid" maxlength="32" placeholder="ESP32C3-IR">
       <label>热点密码</label>
-      <input type="text" id="cfgApPwd" maxlength="64" placeholder="留空 = 开放网络（8-63 位则启用加密）">
+      <span class="row" style="margin:0;">
+        <input type="password" id="cfgApPwd" maxlength="63" style="width:220px;" placeholder="留空 = 不修改">
+        <label style="display:none;align-items:center;gap:4px;color:#d7dae0;font-size:12px;margin:0;">
+          <input type="checkbox" id="cfgApPwdClear"> 清除（开放网络）
+        </label>
+      </span>
       <label>连接 WiFi 名称 (STA SSID)</label>
       <input type="text" id="cfgStaSsid" maxlength="32" placeholder="留空 = 不连接路由器">
       <label>连接 WiFi 密码</label>
-      <input type="text" id="cfgStaPwd" maxlength="64">
+      <span class="row" style="margin:0;">
+        <input type="password" id="cfgStaPwd" maxlength="63" style="width:220px;" placeholder="留空 = 不修改">
+        <label style="display:none;align-items:center;gap:4px;color:#d7dae0;font-size:12px;margin:0;">
+          <input type="checkbox" id="cfgStaPwdClear"> 清除
+        </label>
+      </span>
       <label>STA 地址获取方式</label>
       <span class="row" style="margin:0;">
         <label style="display:flex;align-items:center;gap:4px;color:#d7dae0;"><input type="radio" name="staDhcp" value="1" checked> DHCP</label>
@@ -161,7 +179,7 @@
 
   <div class="card">
     <h2>Web 登录</h2>
-    <div style="font-size:12px; color:#8a93a3; margin-bottom:10px;">默认 admin / admin。修改后需用新账号重新登录。</div>
+    <div style="font-size:12px; color:#8a93a3; margin-bottom:10px;">默认 admin / admin，首次登录会强制修改。修改后需用新账号重新登录。</div>
     <div class="formgrid">
       <label>用户名</label>
       <input type="text" id="cfgAuthUser" maxlength="32">
@@ -180,11 +198,23 @@
 <div id="loginOverlay">
   <div class="card">
     <h2>登录</h2>
-    <div style="font-size:12px; color:#8a93a3; margin-bottom:10px;">默认账号 admin / admin，可在设置页修改。</div>
+    <div style="font-size:12px; color:#8a93a3; margin-bottom:10px;">默认账号 admin / admin，首次登录将强制修改密码。</div>
     <input type="text" id="loginUser" placeholder="用户名" autocomplete="username">
     <input type="password" id="loginPass" placeholder="密码" autocomplete="current-password" onkeydown="if(event.key==='Enter')doLogin()">
     <button style="width:100%;" onclick="doLogin()">登录</button>
     <div id="loginMsg" style="color:#e07e7e; font-size:12px; margin-top:8px;"></div>
+  </div>
+</div>
+
+<div id="pwdOverlay">
+  <div class="card">
+    <h2>修改默认密码</h2>
+    <div style="font-size:12px; color:#8a93a3; margin-bottom:10px;">当前仍在使用默认账号 admin / admin。请先设置新密码以保护设备，保存后将自动登录。</div>
+    <input type="text" id="pwdUser" placeholder="用户名" maxlength="32" autocomplete="username">
+    <input type="password" id="pwdPass" placeholder="新密码（至少 4 位）" maxlength="63" autocomplete="new-password">
+    <input type="password" id="pwdPass2" placeholder="确认新密码" maxlength="63" autocomplete="new-password" onkeydown="if(event.key==='Enter')saveForcedPwd()">
+    <button style="width:100%;" onclick="saveForcedPwd()">保存并继续</button>
+    <div id="pwdMsg" style="color:#e07e7e; font-size:12px; margin-top:8px;"></div>
   </div>
 </div>
 
@@ -199,11 +229,33 @@ let playingTimer = null;
 
 function $(id) { return document.getElementById(id); }
 
+function esc(s) {
+  return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
 /* ---- auth (token from /api/login, saved in sessionStorage) ---- */
+const TOKEN_TTL_MS = 24 * 60 * 60 * 1000;
 let auth = sessionStorage.getItem('auth') || '';
+let authExpires = Number(sessionStorage.getItem('authExpires') || 0);
+if (auth && !authExpires) authExpires = Date.now() + TOKEN_TTL_MS; /* sessions from older firmware */
 function authHeaders() { return auth ? { 'X-Auth-Token': auth } : {}; }
+function tokenAlive() { return auth && authExpires && Date.now() < authExpires; }
+function clearAuth() {
+  auth = '';
+  authExpires = 0;
+  sessionStorage.removeItem('auth');
+  sessionStorage.removeItem('authExpires');
+}
 function showLogin() { $('loginOverlay').style.display = 'flex'; $('loginUser').focus(); }
 function hideLogin() { $('loginOverlay').style.display = 'none'; }
+function showPwdChange() {
+  $('pwdOverlay').style.display = 'flex';
+  $('pwdUser').value = 'admin';
+  $('pwdPass').value = '';
+  $('pwdPass2').value = '';
+  $('pwdMsg').textContent = '';
+  $('pwdUser').focus();
+}
 
 async function doLogin() {
   const u = $('loginUser').value;
@@ -218,10 +270,18 @@ async function doLogin() {
     const d = await r.json();
     if (r.status === 200 && d.token) {
       auth = d.token;
+      authExpires = Date.now() + (d.expires_in || 86400) * 1000;
       sessionStorage.setItem('auth', auth);
+      sessionStorage.setItem('authExpires', String(authExpires));
       $('loginMsg').textContent = '';
       hideLogin();
+      if (d.must_change_pwd) {
+        showPwdChange();
+        return;
+      }
       location.reload();
+    } else if (r.status === 429) {
+      $('loginMsg').textContent = '尝试次数过多，请 ' + (d.retry_after || 30) + ' 秒后再试';
     } else {
       $('loginMsg').textContent = '用户名或密码错误';
     }
@@ -230,17 +290,74 @@ async function doLogin() {
   }
 }
 
+async function saveForcedPwd() {
+  const u = $('pwdUser').value.trim();
+  const p = $('pwdPass').value;
+  const p2 = $('pwdPass2').value;
+  if (!u) { $('pwdMsg').textContent = '用户名不能为空'; return; }
+  if (p.length < 4) { $('pwdMsg').textContent = '密码至少 4 位'; return; }
+  if (p !== p2) { $('pwdMsg').textContent = '两次输入的密码不一致'; return; }
+  try {
+    const r = await fetch('/api/authcfg', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Auth-Token': auth },
+      body: JSON.stringify({ user: u, pass: p })
+    });
+    const d = await r.json();
+    if (d.ok) {
+      clearAuth(); /* server invalidated the old token */
+      $('loginUser').value = u;
+      $('loginPass').value = p;
+      $('pwdMsg').textContent = '';
+      $('pwdOverlay').style.display = 'none';
+      await doLogin(); /* re-login with the new credentials */
+    } else {
+      $('pwdMsg').textContent = '保存失败：' + (d.error || '未知错误');
+    }
+  } catch (e) {
+    $('pwdMsg').textContent = '保存请求失败';
+  }
+}
+
+async function doLogout() {
+  try {
+    await apiFetch('/api/logout', { method: 'POST' });
+  } catch (e) { /* token may already be invalid */ }
+  clearAuth();
+  location.reload();
+}
+
 async function apiFetch(url, opts) {
   opts = opts || {};
+  if (!tokenAlive()) {
+    clearAuth();
+    showLogin();
+    throw new Error('unauthorized');
+  }
   opts.headers = Object.assign({}, opts.headers, authHeaders());
   const r = await fetch(url, opts);
   if (r.status === 401) {
-    sessionStorage.removeItem('auth');
-    auth = '';
+    clearAuth();
     showLogin();
     throw new Error('unauthorized');
   }
   return r;
+}
+
+function scheduleRenew() {
+  const delay = Math.max(60 * 1000, (authExpires - Date.now()) / 2);
+  setTimeout(async () => {
+    if (!tokenAlive()) return;
+    try {
+      const r = await apiFetch('/api/renew', { method: 'POST' });
+      if (r.status === 200) {
+        const d = await r.json();
+        authExpires = Date.now() + (d.expires_in || 86400) * 1000;
+        sessionStorage.setItem('authExpires', String(authExpires));
+      }
+    } catch (e) { /* 401 handled inside apiFetch */ }
+    scheduleRenew();
+  }, delay);
 }
 
 function toast(msg) {
@@ -268,11 +385,11 @@ async function refreshStatus() {
     statusInfo = s;
     const mode = s.mode;
     const badgeCls = mode === 'AP' ? 'ap' : (mode === 'STA' ? 'sta' : (mode === 'AP+STA' ? 'sta' : 'off'));
-    let txt = `连接方式：<span class="badge ${badgeCls}">${mode}</span>`;
-    if (s.ap_ip) txt += ` 热点 <b>${s.ap_ssid}</b> → <span class="mono">http://${s.ap_ip}</span>`;
-    if (s.sta_ip) txt += ` ｜ STA <b>${s.sta_ssid}</b> → <span class="mono">${s.sta_ip}</span>（${s.sta_ip_mode === 'static' ? '静态IP' : 'DHCP'}）`;
-    else if (s.sta_ssid) txt += ` ｜ STA <b>${s.sta_ssid}</b>（未连接，${s.sta_ip_mode === 'static' ? '静态IP' : 'DHCP'}）`;
-    txt += ` ｜ 载波 <span class="mono">${s.carrier_hz} Hz</span>`;
+    let txt = `连接方式：<span class="badge ${badgeCls}">${esc(mode)}</span>`;
+    if (s.ap_ip) txt += ` 热点 <b>${esc(s.ap_ssid)}</b> → <span class="mono">http://${esc(s.ap_ip)}</span>`;
+    if (s.sta_ip) txt += ` ｜ STA <b>${esc(s.sta_ssid)}</b> → <span class="mono">${esc(s.sta_ip)}</span>（${esc(s.sta_ip_mode === 'static' ? '静态IP' : 'DHCP')}）`;
+    else if (s.sta_ssid) txt += ` ｜ STA <b>${esc(s.sta_ssid)}</b>（未连接，${esc(s.sta_ip_mode === 'static' ? '静态IP' : 'DHCP')}）`;
+    txt += ` ｜ 载波 <span class="mono">${esc(s.carrier_hz)} Hz</span>`;
     txt += ` ｜ 回放：${s.playing ? '<b style="color:#ffd479;">播放中</b>' : '空闲'}`;
     $('statusText').innerHTML = txt;
 
@@ -311,17 +428,17 @@ function rawFormat(f) {
 }
 
 function renderLatest(f) {
-  selectedSeq = f.seq;
+  selectedSeq = Number(f.seq);
   const n = f.nec;
   let html = `<div class="kv">`;
-  html += `<b>类型</b><span>${necText(f)}</span>`;
-  html += `<b>NEC hxd</b><span class="mono">${n.ok ? n.hxd : '-'}</span>`;
-  html += `<b>地址 / 命令</b><span class="mono">0x${n.ok ? n.addr.toString(16).toUpperCase().padStart(2,'0') : '-'} / 0x${n.ok ? n.cmd.toString(16).toUpperCase().padStart(2,'0') : '-'}</span>`;
-  html += `<b>总时长</b><span>${f.feat.total_us} µs</span>`;
-  html += `<b>脉冲数 / 段数</b><span>${f.feat.pulses} / ${f.feat.seg_count}</span>`;
-  html += `<b>最短脉冲 / 最长</b><span>${f.feat.min_pulse} / ${f.feat.max_pulse} µs</span>`;
-  html += `<b>引导码</b><span>${f.feat.leader_pulse} + ${f.feat.leader_space} µs</span>`;
-  html += `<b>序号</b><span>${f.seq}</span>`;
+  html += `<b>类型</b><span>${esc(necText(f))}</span>`;
+  html += `<b>NEC hxd</b><span class="mono">${esc(n.ok ? n.hxd : '-')}</span>`;
+  html += `<b>地址 / 命令</b><span class="mono">0x${esc(n.ok ? n.addr.toString(16).toUpperCase().padStart(2,'0') : '-')} / 0x${esc(n.ok ? n.cmd.toString(16).toUpperCase().padStart(2,'0') : '-')}</span>`;
+  html += `<b>总时长</b><span>${esc(f.feat.total_us)} µs</span>`;
+  html += `<b>脉冲数 / 段数</b><span>${esc(f.feat.pulses)} / ${esc(f.feat.seg_count)}</span>`;
+  html += `<b>最短脉冲 / 最长</b><span>${esc(f.feat.min_pulse)} / ${esc(f.feat.max_pulse)} µs</span>`;
+  html += `<b>引导码</b><span>${esc(f.feat.leader_pulse)} + ${esc(f.feat.leader_space)} µs</span>`;
+  html += `<b>序号</b><span>${esc(f.seq)}</span>`;
   html += `</div>`;
   $('latest').innerHTML = html;
   $('rawText').textContent = rawFormat(f);
@@ -336,13 +453,14 @@ function renderHistory() {
   for (let i = frames.length - 1; i >= 0; i--) {
     const f = frames[i];
     const n = f.nec;
-    const sel = (f.seq === selectedSeq) ? ' class="sel"' : '';
+    const seq = Number(f.seq);
+    const sel = (seq === selectedSeq) ? ' class="sel"' : '';
     const type = n.repeat ? 'NEC 重复' : (n.ok ? 'NEC' : '未知');
     const hxd = n.ok ? n.hxd : '-';
     const t = new Date(f.ts).toISOString().substr(11, 8) + '.' + String(f.ts % 1000).padStart(3, '0');
-    html += `<tr${sel} onclick="selectFrame(${f.seq})">` +
-            `<td>${f.seq}</td><td class="mono">${t}</td><td>${type}</td>` +
-            `<td class="mono">${hxd}</td><td>${f.feat.seg_count}</td></tr>`;
+    html += `<tr${sel} onclick="selectFrame(${seq})">` +
+            `<td>${seq}</td><td class="mono">${esc(t)}</td><td>${esc(type)}</td>` +
+            `<td class="mono">${esc(hxd)}</td><td>${esc(f.feat.seg_count)}</td></tr>`;
   }
   tb.innerHTML = html;
 }
@@ -455,9 +573,15 @@ async function loadWifiCfg() {
   try {
     const c = await (await apiFetch('/api/wificfg')).json();
     $('cfgApSsid').value = c.ap_ssid;
-    $('cfgApPwd').value = c.ap_password;
+    $('cfgApPwd').value = '';
+    $('cfgApPwd').placeholder = c.ap_password_set ? '已设置（留空 = 不修改）' : '留空 = 开放网络';
+    $('cfgApPwdClear').checked = false;
+    $('cfgApPwdClear').parentElement.style.display = c.ap_password_set ? 'inline-flex' : 'none';
     $('cfgStaSsid').value = c.sta_ssid;
-    $('cfgStaPwd').value = c.sta_password;
+    $('cfgStaPwd').value = '';
+    $('cfgStaPwd').placeholder = c.sta_password_set ? '已设置（留空 = 不修改）' : '未设置';
+    $('cfgStaPwdClear').checked = false;
+    $('cfgStaPwdClear').parentElement.style.display = c.sta_password_set ? 'inline-flex' : 'none';
     document.querySelector('input[name=staDhcp][value="' + (c.sta_dhcp ? '1' : '0') + '"]').checked = true;
     $('cfgStaIp').value = c.sta_ip;
     $('cfgStaMask').value = c.sta_mask;
@@ -487,6 +611,11 @@ async function saveWifiCfg() {
     $('cfgStatus').textContent = '热点密码需 ≥8 位，或留空使用开放网络';
     return;
   }
+  const staPwd = $('cfgStaPwd').value;
+  if (staPwd !== '' && staPwd.length > 63) {
+    $('cfgStatus').textContent = '连接 WiFi 密码过长';
+    return;
+  }
   const ipV = $('cfgStaIp').value.trim();
   const maskV = $('cfgStaMask').value.trim();
   const gwV = $('cfgStaGw').value.trim();
@@ -499,9 +628,9 @@ async function saveWifiCfg() {
   }
   const body = {
     ap_ssid: $('cfgApSsid').value.trim(),
-    ap_password: apPwd,
+    ap_password: apPwd !== '' ? apPwd : ($('cfgApPwdClear').checked ? '' : null),
     sta_ssid: $('cfgStaSsid').value.trim(),
-    sta_password: $('cfgStaPwd').value,
+    sta_password: staPwd !== '' ? staPwd : ($('cfgStaPwdClear').checked ? '' : null),
     sta_dhcp: staDhcp,
     sta_ip: ipV,
     sta_mask: maskV || '255.255.255.0',
@@ -539,8 +668,7 @@ async function saveAuthCfg() {
       $('cfgAuthPass').value = '';
       $('cfgAuthPass2').value = '';
       toast('登录设置已保存，请重新登录');
-      sessionStorage.removeItem('auth');
-      auth = '';
+      clearAuth();
       showLogin();
     } else {
       $('authStatus').textContent = '保存失败：' + (d.error || '未知错误');
@@ -549,10 +677,12 @@ async function saveAuthCfg() {
 }
 
 /* ---------------- init ---------------- */
-if (auth) {
+if (tokenAlive()) {
   refreshStatus();
   pollFrames();
+  scheduleRenew();
 } else {
+  clearAuth();
   showLogin();
 }
 setInterval(pollFrames, 500);
