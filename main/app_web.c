@@ -80,7 +80,7 @@ static bool web_auth_ok(httpd_req_t *req)
     }
     size_t len = httpd_req_get_hdr_value_len(req, "X-Auth-Token");
     if (len == 0) {
-        char ua[64] = "";
+        char ua[512] = "";
         size_t ulen = httpd_req_get_hdr_value_len(req, "User-Agent");
         if (ulen > 0 && ulen < sizeof(ua)) {
             httpd_req_get_hdr_value_str(req, "User-Agent", ua, sizeof(ua));
