@@ -42,5 +42,6 @@ const char *wifi_mode_str(void);        /* actual mode: "AP" or "STA" */
 bool wifi_is_sta_connected(void);
 bool wifi_get_ap_ip(char *buf, size_t len);
 bool wifi_get_sta_ip(char *buf, size_t len);
+const char *wifi_sta_ip_mode(void);     /* "dhcp" / "static" / "-" */
 const char *wifi_ap_ssid(void);
 const char *wifi_sta_ssid(void);

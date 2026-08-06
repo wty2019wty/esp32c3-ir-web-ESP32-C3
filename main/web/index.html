@@ -192,8 +192,8 @@ async function refreshStatus() {
     const badgeCls = mode === 'AP' ? 'ap' : (mode === 'STA' ? 'sta' : (mode === 'AP+STA' ? 'sta' : 'off'));
     let txt = `连接方式：<span class="badge ${badgeCls}">${mode}</span>`;
     if (s.ap_ip) txt += ` 热点 <b>${s.ap_ssid}</b> → <span class="mono">http://${s.ap_ip}</span>`;
-    if (s.sta_ip) txt += ` ｜ STA <b>${s.sta_ssid}</b> → <span class="mono">${s.sta_ip}</span>`;
-    else if (s.sta_ssid) txt += ` ｜ STA <b>${s.sta_ssid}</b>（未连接）`;
+    if (s.sta_ip) txt += ` ｜ STA <b>${s.sta_ssid}</b> → <span class="mono">${s.sta_ip}</span>（${s.sta_ip_mode === 'static' ? '静态IP' : 'DHCP'}）`;
+    else if (s.sta_ssid) txt += ` ｜ STA <b>${s.sta_ssid}</b>（未连接，${s.sta_ip_mode === 'static' ? '静态IP' : 'DHCP'}）`;
     txt += ` ｜ 载波 <span class="mono">${s.carrier_hz} Hz</span>`;
     txt += ` ｜ 回放：${s.playing ? '<b style="color:#ffd479;">播放中</b>' : '空闲'}`;
     $('statusText').innerHTML = txt;

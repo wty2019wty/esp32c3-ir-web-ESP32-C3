@@ -275,6 +275,7 @@ static esp_err_t status_handler(httpd_req_t *req)
     cJSON_AddStringToObject(root, "sta_ip", wifi_get_sta_ip(ip, sizeof(ip)) ? ip : "");
     cJSON_AddStringToObject(root, "ap_ssid", wifi_ap_ssid());
     cJSON_AddStringToObject(root, "sta_ssid", wifi_sta_ssid());
+    cJSON_AddStringToObject(root, "sta_ip_mode", wifi_sta_ip_mode());
     cJSON_AddBoolToObject(root, "sta_connected", wifi_is_sta_connected());
     cJSON_AddNumberToObject(root, "carrier_hz", ir_get_carrier_freq());
     cJSON_AddBoolToObject(root, "rx_pause_on_play", ir_get_rx_pause_enabled());

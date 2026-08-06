@@ -303,6 +303,18 @@ bool wifi_get_sta_ip(char *buf, size_t len)
     return true;
 }
 
+const char *wifi_sta_ip_mode(void)
+{
+    if (!s_sta_netif) {
+        return "-";
+    }
+    esp_netif_dhcp_status_t st = ESP_NETIF_DHCP_INIT;
+    if (esp_netif_dhcpc_get_status(s_sta_netif, &st) != ESP_OK) {
+        return "-";
+    }
+    return st == ESP_NETIF_DHCP_STOPPED ? "static" : "dhcp";
+}
+
 const char *wifi_ap_ssid(void)
 {
     return s_web_cfg.ap_ssid;
