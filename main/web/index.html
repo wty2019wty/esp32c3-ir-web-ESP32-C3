@@ -221,8 +221,7 @@ async function doLogin() {
       sessionStorage.setItem('auth', auth);
       $('loginMsg').textContent = '';
       hideLogin();
-      refreshStatus(); pollFrames();
-      if ($('viewSet').style.display !== 'none') loadWifiCfg();
+      location.reload();
     } else {
       $('loginMsg').textContent = '用户名或密码错误';
     }
