@@ -54,6 +54,15 @@ menu "IR Web Tool Configuration"
         int "Station connection timeout (ms), then fall back to SoftAP"
         default 10000
 
+    config IR_TOOL_WIFI_STA_TX_POWER_DBM
+        int "Max station TX power (dBm)"
+        default 15
+        range 8 20
+        help
+            Cap the station TX power. Some ESP32-C3 boards fail open-auth
+            (WIFI_REASON_AUTH_EXPIRE, reason 2) at the default 20 dBm while
+            SoftAP works fine; 15 dBm connects reliably on such boards.
+
     config IR_TOOL_HTTP_PORT
         int "HTTP server port"
         default 80
