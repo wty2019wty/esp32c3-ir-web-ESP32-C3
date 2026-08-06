@@ -75,12 +75,20 @@ static esp_err_t web_auth_save(const web_auth_cfg_t *cfg)
 static bool web_auth_ok(httpd_req_t *req)
 {
     if (s_token[0] == '\0') {
-        ESP_LOGD(TAG, "auth: no token issued (login first)");
+        ESP_LOGW(TAG, "auth: no token issued (login first)");
         return false;
     }
     size_t len = httpd_req_get_hdr_value_len(req, "X-Auth-Token");
     if (len == 0) {
-        ESP_LOGD(TAG, "auth: request has no X-Auth-Token header");
+        char ua[64] = "";
+        size_t ulen = httpd_req_get_hdr_value_len(req, "User-Agent");
+        if (ulen > 0 && ulen < sizeof(ua)) {
+            httpd_req_get_hdr_value_str(req, "User-Agent", ua, sizeof(ua));
+        }
+        /* requests without a User-Agent are non-browser clients (noise), stay quiet */
+        if (ua[0] != '\0') {
+            ESP_LOGW(TAG, "auth: no token header (UA: %s)", ua);
+        }
         return false;
     }
     if (len > 64) {
@@ -150,7 +158,11 @@ static esp_err_t login_handler(httpd_req_t *req)
         httpd_resp_sendstr(req, "{\"error\":\"bad credentials\"}");
         return ESP_OK;
     }
-    token_new();
+    /* reuse the existing session token if one is active, so multiple tabs
+     * / devices sharing the same credentials do not kick each other out */
+    if (s_token[0] == '\0') {
+        token_new();
+    }
     ESP_LOGI(TAG, "login ok, token issued");
     char buf[80];
     snprintf(buf, sizeof(buf), "{\"ok\":true,\"token\":\"%s\"}", s_token);
@@ -786,6 +798,7 @@ esp_err_t web_init(void)
 
     static const httpd_uri_t uris[] = {
         {.uri = "/",             .method = HTTP_GET,  .handler = index_handler},
+        {.uri = "/index.html",   .method = HTTP_GET,  .handler = index_handler},
         {.uri = "/api/login",    .method = HTTP_POST, .handler = login_handler},
         {.uri = "/api/status",   .method = HTTP_GET,  .handler = status_handler},
         {.uri = "/api/frames",   .method = HTTP_GET,  .handler = frames_handler},
