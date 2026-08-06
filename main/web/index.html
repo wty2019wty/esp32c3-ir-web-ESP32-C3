@@ -607,7 +607,6 @@ async function play(body) {
     if (d.ok) toast('回放已开始');
     else toast('回放失败：参数错误');
   } catch (e) { toast('回放请求失败'); }
-  refreshStatus();
 }
 
 async function setCarrier() {
@@ -618,7 +617,6 @@ async function setCarrier() {
     if (d.ok) { $('carrierStatus').textContent = '已设置 ' + d.freq + ' Hz'; toast('载波已更新'); }
     else toast('载波设置失败');
   } catch (e) { toast('载波请求失败'); }
-  refreshStatus();
 }
 
 async function setRxPause(enabled) {
@@ -627,7 +625,6 @@ async function setRxPause(enabled) {
     if (d.ok) toast(enabled ? '已开启：回放时暂停接收' : '已关闭：回放时允许自环');
     else toast('设置失败');
   } catch (e) { toast('设置请求失败'); }
-  refreshStatus();
 }
 
 /* ---------------- settings tab ---------------- */
@@ -750,7 +747,6 @@ async function saveAuthCfg() {
 
 /* ---------------- init ---------------- */
 if (tokenAlive()) {
-  refreshStatus();
   wsConnect();
   scheduleRenew();
 } else {
