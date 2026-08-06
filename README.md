@@ -1,4 +1,4 @@
-# ESP32-C3 红外信号 Web 监视器（NEC 解码 / 回放）
+# esp32c3-ir-web — ESP32-C3 红外信号 Web 监视器（NEC 解码 / 回放）
 
 基于 **ESP32-C3 SuperMini（4MB Flash，ESP32C3FN4）** 与 **ESP-IDF v6.0.2**。
 通过 VS1838B 接收红外遥控信号，RMT 以 2us 分辨率采集原始波形，NEC 解码后在 **Web 页面**实时显示，
