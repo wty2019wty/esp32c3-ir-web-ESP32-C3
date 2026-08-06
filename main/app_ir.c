@@ -23,6 +23,7 @@
 #define IR_TX_GPIO          CONFIG_IR_TOOL_IR_TX_GPIO
 #define IR_RX_BUF_SYMBOLS   96         /* 2 mem blocks of 48; NEC frame fits */
 #define IR_TX_BUF_SYMBOLS   96
+#define IR_CAP_SYMBOLS      512        /* partial-RX accumulation buffer: 512 symbols = up to 1024 segments */
 #define IR_RX_MIN_PULSE_NS  1000U      /* glitches < 1 us are ignored */
 #define IR_RX_TIMEOUT_NS    50000000U  /* idle gap > 50 ms ends the frame */
 
@@ -93,13 +94,29 @@ static inline bool dur_in_range(uint32_t v, uint32_t nom, uint32_t margin)
 /* Simple flag + copy instead of a FreeRTOS queue in ISR (avoids ISR compatibility issues) */
 static volatile bool s_rx_done = false;
 static rmt_rx_done_event_data_t s_rx_data;
+static rmt_symbol_word_t s_cap_buf[IR_CAP_SYMBOLS];  /* accumulates one full frame across partial-RX chunks */
+static volatile size_t s_cap_count = 0;              /* symbols accumulated for the current frame */
 
 static bool ir_rx_done_cb(rmt_channel_handle_t ch, const rmt_rx_done_event_data_t *edata, void *udata)
 {
     (void)ch;
     (void)udata;
-    s_rx_data = *edata;
-    s_rx_done = true;
+    /* Partial RX: each callback delivers a chunk; append it to the capture buffer.
+     * is_last == true means the idle timeout ended the frame -> hand it to ir_task. */
+    size_t n = edata->num_symbols;
+    if (n > IR_CAP_SYMBOLS - s_cap_count) {
+        n = IR_CAP_SYMBOLS - s_cap_count;   /* truncate instead of overflowing */
+    }
+    if (n > 0) {
+        memcpy(&s_cap_buf[s_cap_count], edata->received_symbols, n * sizeof(rmt_symbol_word_t));
+        s_cap_count += n;
+    }
+    if (edata->flags.is_last) {
+        s_rx_data.received_symbols = s_cap_buf;
+        s_rx_data.num_symbols = s_cap_count;
+        s_cap_count = 0;                    /* ready for the next frame */
+        s_rx_done = true;
+    }
     return true; /* request context switch so ir_task wakes immediately */
 }
 
@@ -265,8 +282,8 @@ static void ir_task(void *arg)
         ir_frame_t fr;
         memset(&fr, 0, sizeof(fr));
         size_t num = ev.num_symbols;
-        if (num > IR_RX_BUF_SYMBOLS) {
-            num = IR_RX_BUF_SYMBOLS;
+        if (num > IR_CAP_SYMBOLS) {
+            num = IR_CAP_SYMBOLS;
         }
         ir_analyze(ev.received_symbols, num, &fr);
         fr.seq = ++s_seq;
@@ -336,7 +353,7 @@ esp_err_t ir_init(void)
         nvs_close(nh);
     }
 
-    /* Configure RMT RX channel (ESP32-C3: no DMA, multiple mem blocks, ping-pong) */
+    /* Configure RMT RX channel (no DMA; mem blocks + ping-pong) */
     rmt_rx_channel_config_t rx_ch_cfg = {
         .gpio_num = IR_RX_GPIO,
         .clk_src = RMT_CLK_SRC_DEFAULT,
@@ -359,7 +376,7 @@ esp_err_t ir_init(void)
 
     s_rx_cfg.signal_range_min_ns = IR_RX_MIN_PULSE_NS;
     s_rx_cfg.signal_range_max_ns = IR_RX_TIMEOUT_NS;
-    s_rx_cfg.flags.en_partial_rx = 0;
+    s_rx_cfg.flags.en_partial_rx = 1;   /* long-frame capture without DMA */
 
     /* Configure RMT TX channel (no DMA; copy encoder segments long payloads) */
     rmt_tx_channel_config_t tx_ch_cfg = {
