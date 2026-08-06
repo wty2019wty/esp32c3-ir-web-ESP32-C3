@@ -214,6 +214,8 @@ esp_err_t wifi_init(void)
     if (role_wants_sta()) {
         s_sta_netif = esp_netif_create_default_wifi_sta();
         ESP_RETURN_ON_FALSE(s_sta_netif, ESP_ERR_NO_MEM, TAG, "create STA netif");
+        /* set the DHCP hostname shown in the router client list */
+        esp_netif_set_hostname(s_sta_netif, CONFIG_IR_TOOL_HOSTNAME);
     }
 
     wifi_init_config_t init_cfg = WIFI_INIT_CONFIG_DEFAULT();

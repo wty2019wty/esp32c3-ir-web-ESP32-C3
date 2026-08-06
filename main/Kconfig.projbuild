@@ -58,6 +58,10 @@ menu "IR Web Tool Configuration"
         int "HTTP server port"
         default 80
 
+    config IR_TOOL_HOSTNAME
+        string "DHCP hostname (shown in router client list)"
+        default "esp32c3-ir-web"
+
     config IR_TOOL_HISTORY_DEPTH
         int "In-memory frame history depth"
         default 32
