@@ -4,6 +4,7 @@
 #include "esp_wifi.h"
 #include "esp_netif.h"
 #include "esp_event.h"
+#include "esp_mac.h"
 #include "esp_log.h"
 #include "esp_check.h"
 #include "freertos/FreeRTOS.h"
@@ -54,6 +55,21 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
                 esp_wifi_connect();
             }
             break;
+        case WIFI_EVENT_AP_START:
+            ESP_LOGI(TAG, "SoftAP started");
+            break;
+        case WIFI_EVENT_AP_STACONNECTED: {
+            wifi_event_ap_staconnected_t *ev = (wifi_event_ap_staconnected_t *)data;
+            ESP_LOGI(TAG, "AP client joined: " MACSTR " (aid=%d)",
+                     MAC2STR(ev->mac), ev->aid);
+            break;
+        }
+        case WIFI_EVENT_AP_STADISCONNECTED: {
+            wifi_event_ap_stadisconnected_t *ev = (wifi_event_ap_stadisconnected_t *)data;
+            ESP_LOGW(TAG, "AP client left: " MACSTR " (aid=%d, reason=%d)",
+                     MAC2STR(ev->mac), ev->aid, ev->reason);
+            break;
+        }
         default:
             break;
         }
@@ -163,6 +179,10 @@ esp_err_t wifi_init(void)
     }
 
     ESP_LOGI(TAG, "WiFi ready, actual mode: %s", wifi_mode_str());
+    char ip[16];
+    if (wifi_get_ap_ip(ip, sizeof(ip))) {
+        ESP_LOGI(TAG, "SoftAP IP: %s (open http://%s/)", ip, ip);
+    }
     return ESP_OK;
 }
 
