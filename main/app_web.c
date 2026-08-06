@@ -14,6 +14,8 @@
 #include "nvs_flash.h"
 #include "nvs.h"
 #include "cJSON.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 
 #define TAG "web"
 
@@ -100,8 +102,8 @@ static bool creds_are_default(const web_auth_cfg_t *cfg)
            strcmp(cfg->pass, AUTH_DEF_PASS) == 0;
 }
 
-/* Verify the X-Auth-Token header against the active session token. */
-static bool web_auth_ok(httpd_req_t *req)
+/* Check a token string against the active session (constant-time, with TTL). */
+static bool web_auth_token_ok(const char *token)
 {
     if (s_token[0] == '\0') {
         ESP_LOGW(TAG, "auth: no token issued (login first)");
@@ -113,6 +115,12 @@ static bool web_auth_ok(httpd_req_t *req)
         s_token_ts = 0;
         return false;
     }
+    return token && ct_equal(token, s_token);
+}
+
+/* Verify the X-Auth-Token header against the active session token. */
+static bool web_auth_ok(httpd_req_t *req)
+{
     size_t len = httpd_req_get_hdr_value_len(req, "X-Auth-Token");
     if (len == 0) {
         char ua[512] = "";
@@ -135,7 +143,7 @@ static bool web_auth_ok(httpd_req_t *req)
         ESP_LOGW(TAG, "auth: header read failed");
         return false;
     }
-    if (!ct_equal(buf, s_token)) {
+    if (!web_auth_token_ok(buf)) {
         ESP_LOGW(TAG, "auth: token mismatch (got \"%.12s...\" len=%u, expect \"%.8s...\")",
                  buf, (unsigned)strlen(buf), s_token);
         return false;
@@ -504,15 +512,12 @@ static esp_err_t index_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
-static esp_err_t status_handler(httpd_req_t *req)
+/* Build the status object as a JSON string (caller frees). */
+static char *status_json(void)
 {
-    if (!require_auth(req)) {
-        return ESP_OK;
-    }
     cJSON *root = cJSON_CreateObject();
     if (!root) {
-        respond_json(req, 400, "{\"error\":\"oom\"}");
-        return ESP_OK;
+        return NULL;
     }
     cJSON_AddStringToObject(root, "mode", wifi_mode_str());
     char ip[16];
@@ -529,6 +534,15 @@ static esp_err_t status_handler(httpd_req_t *req)
 
     char *s = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
+    return s;
+}
+
+static esp_err_t status_handler(httpd_req_t *req)
+{
+    if (!require_auth(req)) {
+        return ESP_OK;
+    }
+    char *s = status_json();
     if (!s) {
         respond_json(req, 400, "{\"error\":\"oom\"}");
         return ESP_OK;
@@ -539,14 +553,10 @@ static esp_err_t status_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
-/* One frame as a JSON object, streamed as a single chunk. */
-static esp_err_t send_frame_chunk(httpd_req_t *req, const ir_frame_t *f)
+/* Serialize one frame as a JSON object into buf; returns length, or -1. */
+static int frame_to_json(const ir_frame_t *f, char *buf, size_t cap)
 {
-    char *buf = malloc(4096);
-    if (!buf) {
-        return httpd_resp_send_chunk(req, "{}", 2);
-    }
-    int off = snprintf(buf, 4096,
+    int off = snprintf(buf, cap,
         "{\"seq\":%lu,\"ts\":%lu,"
         "\"nec\":{\"ok\":%s,\"repeat\":%s,\"ext\":%s,\"chksum\":%s,\"bits\":%u,"
         "\"addr\":%u,\"cmd\":%u,\"raw\":%lu,\"hxd\":\"%08lX\"},"
@@ -563,20 +573,34 @@ static esp_err_t send_frame_chunk(httpd_req_t *req, const ir_frame_t *f)
         (unsigned long)f->leader_pulse_us, (unsigned long)f->leader_space_us,
         (unsigned long)f->last_gap_us, (unsigned long)f->seg_count,
         (unsigned long)ir_get_carrier_freq());
-    if (off < 0 || off >= 4096) {
-        free(buf);
-        return httpd_resp_send_chunk(req, "{}", 2);
+    if (off < 0 || off >= (int)cap) {
+        return -1;
     }
     for (uint32_t i = 0; i < f->raw_count; i++) {
-        int n = snprintf(buf + off, 4096 - (size_t)off, "%s%lu",
+        int n = snprintf(buf + off, cap - (size_t)off, "%s%lu",
                          i ? "," : "", (unsigned long)f->raw_durs[i]);
-        if (n < 0 || off + n >= 4096) {
+        if (n < 0 || off + n >= (int)cap) {
             break; /* truncated guard */
         }
         off += n;
     }
-    if (off + 3 < 4096) {
-        off += snprintf(buf + off, 4096 - (size_t)off, "]}");
+    if (off + 3 < (int)cap) {
+        off += snprintf(buf + off, cap - (size_t)off, "]}");
+    }
+    return off;
+}
+
+/* One frame as a JSON object, streamed as a single chunk. */
+static esp_err_t send_frame_chunk(httpd_req_t *req, const ir_frame_t *f)
+{
+    char *buf = malloc(4096);
+    if (!buf) {
+        return httpd_resp_send_chunk(req, "{}", 2);
+    }
+    int off = frame_to_json(f, buf, 4096);
+    if (off < 0) {
+        free(buf);
+        return httpd_resp_send_chunk(req, "{}", 2);
     }
     esp_err_t ret = httpd_resp_send_chunk(req, buf, (ssize_t)off);
     free(buf);
@@ -889,17 +913,312 @@ static esp_err_t renew_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+/* ---------- WebSocket push (status every 1s + new IR frames) ---------- */
+#if CONFIG_HTTPD_WS_SUPPORT
+
+#define WS_MAX_CLIENTS 6
+
+typedef struct {
+    int fd;
+    bool authed;
+} ws_client_t;
+
+static ws_client_t s_ws_clients[WS_MAX_CLIENTS];
+static SemaphoreHandle_t s_ws_mutex = NULL;
+
+static void ws_client_remove(int fd)
+{
+    if (!s_ws_mutex || fd < 0) {
+        return;
+    }
+    if (xSemaphoreTake(s_ws_mutex, portMAX_DELAY) != pdTRUE) {
+        return;
+    }
+    for (int i = 0; i < WS_MAX_CLIENTS; i++) {
+        if (s_ws_clients[i].fd == fd) {
+            s_ws_clients[i].fd = -1;
+            s_ws_clients[i].authed = false;
+        }
+    }
+    xSemaphoreGive(s_ws_mutex);
+}
+
+static void ws_client_add(int fd, bool authed)
+{
+    if (!s_ws_mutex || fd < 0) {
+        return;
+    }
+    if (xSemaphoreTake(s_ws_mutex, portMAX_DELAY) != pdTRUE) {
+        return;
+    }
+    for (int i = 0; i < WS_MAX_CLIENTS; i++) {
+        if (s_ws_clients[i].fd == fd) {
+            s_ws_clients[i].authed = authed;
+            xSemaphoreGive(s_ws_mutex);
+            return;
+        }
+    }
+    for (int i = 0; i < WS_MAX_CLIENTS; i++) {
+        if (s_ws_clients[i].fd < 0) {
+            s_ws_clients[i].fd = fd;
+            s_ws_clients[i].authed = authed;
+            break;
+        }
+    }
+    xSemaphoreGive(s_ws_mutex);
+}
+
+static bool ws_has_authed_clients(void)
+{
+    bool has = false;
+    if (!s_ws_mutex) {
+        return false;
+    }
+    if (xSemaphoreTake(s_ws_mutex, portMAX_DELAY) != pdTRUE) {
+        return false;
+    }
+    for (int i = 0; i < WS_MAX_CLIENTS; i++) {
+        if (s_ws_clients[i].fd >= 0 && s_ws_clients[i].authed) {
+            has = true;
+            break;
+        }
+    }
+    xSemaphoreGive(s_ws_mutex);
+    return has;
+}
+
+static void ws_send_text_all(const char *json)
+{
+    if (!s_server || !s_ws_mutex) {
+        return;
+    }
+    int dead[WS_MAX_CLIENTS];
+    int ndead = 0;
+    if (xSemaphoreTake(s_ws_mutex, portMAX_DELAY) != pdTRUE) {
+        return;
+    }
+    httpd_ws_frame_t frame = {
+        .final = true,
+        .fragmented = false,
+        .type = HTTPD_WS_TYPE_TEXT,
+        .payload = (uint8_t *)json,
+        .len = strlen(json),
+    };
+    for (int i = 0; i < WS_MAX_CLIENTS; i++) {
+        if (s_ws_clients[i].fd < 0 || !s_ws_clients[i].authed) {
+            continue;
+        }
+        esp_err_t err = httpd_ws_send_frame_async(s_server, s_ws_clients[i].fd, &frame);
+        if (err != ESP_OK && ndead < WS_MAX_CLIENTS) {
+            dead[ndead++] = s_ws_clients[i].fd;
+            ESP_LOGD(TAG, "ws: async send to fd %d failed: %s", s_ws_clients[i].fd, esp_err_to_name(err));
+        }
+    }
+    xSemaphoreGive(s_ws_mutex);
+    for (int i = 0; i < ndead; i++) {
+        ws_client_remove(dead[i]);
+    }
+}
+
+static esp_err_t ws_reply_text(httpd_req_t *req, const char *json)
+{
+    httpd_ws_frame_t frame = {
+        .final = true,
+        .fragmented = false,
+        .type = HTTPD_WS_TYPE_TEXT,
+        .payload = (uint8_t *)json,
+        .len = strlen(json),
+    };
+    return httpd_ws_send_frame(req, &frame);
+}
+
+static char *ws_status_wrapped(void)
+{
+    char *inner = status_json();
+    if (!inner) {
+        return NULL;
+    }
+    size_t cap = strlen(inner) + 64;
+    char *buf = malloc(cap);
+    if (!buf) {
+        free(inner);
+        return NULL;
+    }
+    snprintf(buf, cap, "{\"type\":\"status\",\"data\":%s}", inner);
+    free(inner);
+    return buf;
+}
+
+static void ws_status_timer_cb(void *arg)
+{
+    (void)arg;
+    if (!ws_has_authed_clients()) {
+        return;
+    }
+    char *s = ws_status_wrapped();
+    if (!s) {
+        return;
+    }
+    ws_send_text_all(s);
+    free(s);
+}
+
+static void ws_frame_push_cb(const ir_frame_t *fr, void *arg)
+{
+    (void)arg;
+    if (!ws_has_authed_clients()) {
+        return;
+    }
+    size_t cap = 4096 + 64;
+    char *buf = malloc(cap);
+    if (!buf) {
+        return;
+    }
+    int off = snprintf(buf, cap, "{\"type\":\"frame\",\"data\":");
+    if (off < 0 || off >= (int)cap) {
+        free(buf);
+        return;
+    }
+    int n = frame_to_json(fr, buf + off, cap - (size_t)off);
+    if (n < 0) {
+        free(buf);
+        return;
+    }
+    off += n;
+    if (off + 2 < (int)cap) {
+        off += snprintf(buf + off, cap - (size_t)off, "}");
+    }
+    ws_send_text_all(buf);
+    free(buf);
+}
+
+static void ws_session_close(httpd_handle_t hd, int sockfd)
+{
+    (void)hd;
+    ws_client_remove(sockfd);
+}
+
+static esp_err_t ws_handler(httpd_req_t *req)
+{
+    int fd = httpd_req_to_sockfd(req);
+    httpd_ws_frame_t frame = {0};
+
+    esp_err_t err = httpd_ws_recv_frame(req, &frame, 0);
+    if (err != ESP_OK) {
+        return ESP_FAIL;
+    }
+    if (frame.len == 0) {
+        return ESP_OK;
+    }
+    if (frame.len > 1024) {
+        ESP_LOGW(TAG, "ws: oversized frame (%u bytes) from fd %d", (unsigned)frame.len, fd);
+        return ESP_FAIL;
+    }
+
+    char *payload = malloc(frame.len + 1);
+    if (!payload) {
+        return ESP_OK;
+    }
+    frame.payload = (uint8_t *)payload;
+    err = httpd_ws_recv_frame(req, &frame, frame.len);
+    if (err != ESP_OK) {
+        free(payload);
+        return ESP_FAIL;
+    }
+    payload[frame.len] = '\0';
+
+    if (frame.type == HTTPD_WS_TYPE_PING) {
+        httpd_ws_frame_t pong = {
+            .final = true,
+            .fragmented = false,
+            .type = HTTPD_WS_TYPE_PONG,
+            .payload = (uint8_t *)payload,
+            .len = frame.len,
+        };
+        err = httpd_ws_send_frame(req, &pong);
+        free(payload);
+        return err;
+    }
+    if (frame.type == HTTPD_WS_TYPE_CLOSE) {
+        httpd_ws_frame_t close = {
+            .final = true,
+            .fragmented = false,
+            .type = HTTPD_WS_TYPE_CLOSE,
+            .payload = (uint8_t *)payload,
+            .len = frame.len,
+        };
+        httpd_ws_send_frame(req, &close);
+        free(payload);
+        return ESP_OK;
+    }
+    if (frame.type != HTTPD_WS_TYPE_TEXT) {
+        free(payload);
+        return ESP_OK;
+    }
+
+    cJSON *root = cJSON_Parse(payload);
+    free(payload);
+    if (!root) {
+        return ESP_OK;
+    }
+
+    cJSON *type = cJSON_GetObjectItem(root, "type");
+    if (cJSON_IsString(type) && strcmp(type->valuestring, "auth") == 0) {
+        cJSON *tok = cJSON_GetObjectItem(root, "token");
+        if (cJSON_IsString(tok) && web_auth_token_ok(tok->valuestring)) {
+            ws_client_add(fd, true);
+            ESP_LOGI(TAG, "ws: client fd %d authenticated", fd);
+            ws_reply_text(req, "{\"type\":\"auth\",\"ok\":true}");
+            char *s = ws_status_wrapped();
+            if (s) {
+                ws_reply_text(req, s);
+                free(s);
+            }
+        } else {
+            ESP_LOGW(TAG, "ws: auth failed for fd %d", fd);
+            ws_reply_text(req, "{\"type\":\"auth\",\"ok\":false,\"error\":\"unauthorized\"}");
+            cJSON_Delete(root);
+            return ESP_FAIL; /* close the socket */
+        }
+    }
+    cJSON_Delete(root);
+    return ESP_OK;
+}
+
+#endif /* CONFIG_HTTPD_WS_SUPPORT */
+
 esp_err_t web_init(void)
 {
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.server_port = HTTP_PORT;
     cfg.stack_size = 8192;
-    cfg.max_uri_handlers = 16; /* 11 registered handlers + headroom */
+    cfg.max_uri_handlers = 20; /* registered handlers + headroom */
+#if CONFIG_HTTPD_WS_SUPPORT
+    cfg.close_fn = ws_session_close;
+#endif
 
     if (httpd_start(&s_server, &cfg) != ESP_OK) {
         ESP_LOGE(TAG, "Failed to start HTTP server on port %d", HTTP_PORT);
         return ESP_FAIL;
     }
+
+#if CONFIG_HTTPD_WS_SUPPORT
+    s_ws_mutex = xSemaphoreCreateMutex();
+    if (s_ws_mutex) {
+        for (int i = 0; i < WS_MAX_CLIENTS; i++) {
+            s_ws_clients[i].fd = -1;
+        }
+        const esp_timer_create_args_t targs = {
+            .callback = ws_status_timer_cb,
+            .name = "ws_status",
+        };
+        esp_timer_handle_t status_timer = NULL;
+        if (esp_timer_create(&targs, &status_timer) == ESP_OK) {
+            esp_timer_start_periodic(status_timer, 1000 * 1000);
+        }
+    }
+    ir_set_frame_cb(ws_frame_push_cb, NULL);
+#endif
 
     static const httpd_uri_t uris[] = {
         {.uri = "/",             .method = HTTP_GET,  .handler = index_handler},
@@ -916,6 +1235,10 @@ esp_err_t web_init(void)
         {.uri = "/api/authcfg",  .method = HTTP_POST, .handler = authcfg_post_handler},
         {.uri = "/api/logout",   .method = HTTP_POST, .handler = logout_handler},
         {.uri = "/api/renew",    .method = HTTP_POST, .handler = renew_handler},
+#if CONFIG_HTTPD_WS_SUPPORT
+        {.uri = "/api/ws",       .method = HTTP_GET,  .handler = ws_handler,
+         .is_websocket = true, .handle_ws_control_frames = true},
+#endif
     };
     for (size_t i = 0; i < sizeof(uris) / sizeof(uris[0]); i++) {
         if (httpd_register_uri_handler(s_server, &uris[i]) != ESP_OK) {
@@ -924,6 +1247,11 @@ esp_err_t web_init(void)
         }
     }
 
-    ESP_LOGI(TAG, "Web UI ready: http://192.168.4.1:%d/", HTTP_PORT);
+    char ip[16];
+    if (wifi_is_sta_connected() ? wifi_get_sta_ip(ip, sizeof(ip)) : wifi_get_ap_ip(ip, sizeof(ip))) {
+        ESP_LOGI(TAG, "Web UI ready: http://%s:%d/", ip, HTTP_PORT);
+    } else {
+        ESP_LOGI(TAG, "Web UI ready: port %d", HTTP_PORT);
+    }
     return ESP_OK;
 }

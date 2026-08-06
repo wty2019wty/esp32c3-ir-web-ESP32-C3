@@ -225,7 +225,6 @@ let lastSeq = 0;
 let frames = [];      // ordered list of frames (oldest -> newest)
 let selectedSeq = null;
 let statusInfo = null;
-let playingTimer = null;
 
 function $(id) { return document.getElementById(id); }
 
@@ -360,6 +359,74 @@ function scheduleRenew() {
   }, delay);
 }
 
+/* ---------------- WebSocket push (status + frames) ---------------- */
+
+let ws = null;
+let wsRetryTimer = null;
+let pollTimers = [];
+
+function stopPolling() {
+  if (!pollTimers.length) return;
+  pollTimers.forEach(clearInterval);
+  pollTimers = [];
+}
+
+function startPollingFallback() {
+  if (pollTimers.length) return;
+  refreshStatus();
+  pollFrames();
+  pollTimers.push(setInterval(pollFrames, 500));
+  pollTimers.push(setInterval(refreshStatus, 3000));
+}
+
+function scheduleWsRetry() {
+  if (!tokenAlive()) return;
+  clearTimeout(wsRetryTimer);
+  wsRetryTimer = setTimeout(wsConnect, 10000);
+}
+
+function wsConnect() {
+  if (!tokenAlive()) return;
+  clearTimeout(wsRetryTimer);
+  wsRetryTimer = null;
+  let s;
+  try {
+    s = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/api/ws');
+  } catch (e) {
+    scheduleWsRetry();
+    return;
+  }
+  ws = s;
+  s.onopen = () => {
+    try { s.send(JSON.stringify({ type: 'auth', token: auth })); } catch (e) { /* ignored */ }
+  };
+  s.onmessage = (ev) => {
+    let d;
+    try { d = JSON.parse(ev.data); } catch (e) { return; }
+    if (d.type === 'auth') {
+      if (d.ok === true) {
+        stopPolling();
+      } else if (d.ok === false) {
+        clearAuth();
+        showLogin();
+        try { s.close(); } catch (e) { /* ignored */ }
+      }
+    } else if (d.type === 'status' && d.data) {
+      applyStatus(d.data);
+    } else if (d.type === 'frame' && d.data) {
+      applyFrame(d.data);
+    }
+  };
+  s.onclose = () => {
+    ws = null;
+    if (tokenAlive()) {
+      startPollingFallback();
+      scheduleWsRetry();
+    }
+  };
+  s.onerror = () => { try { s.close(); } catch (e) { /* ignored */ } };
+}
+
 function toast(msg) {
   const t = $('toast');
   t.textContent = msg;
@@ -378,34 +445,36 @@ async function postJSON(url, body) {
 
 /* ---------------- status ---------------- */
 
+function applyStatus(s) {
+  statusInfo = s;
+  const mode = s.mode;
+  const badgeCls = mode === 'AP' ? 'ap' : (mode === 'STA' ? 'sta' : (mode === 'AP+STA' ? 'sta' : 'off'));
+  let txt = `连接方式：<span class="badge ${badgeCls}">${esc(mode)}</span>`;
+  if (s.ap_ip) txt += ` 热点 <b>${esc(s.ap_ssid)}</b> → <span class="mono">http://${esc(s.ap_ip)}</span>`;
+  if (s.sta_ip) txt += ` ｜ STA <b>${esc(s.sta_ssid)}</b> → <span class="mono">${esc(s.sta_ip)}</span>（${esc(s.sta_ip_mode === 'static' ? '静态IP' : 'DHCP')}）`;
+  else if (s.sta_ssid) txt += ` ｜ STA <b>${esc(s.sta_ssid)}</b>（未连接，${esc(s.sta_ip_mode === 'static' ? '静态IP' : 'DHCP')}）`;
+  txt += ` ｜ 载波 <span class="mono">${esc(s.carrier_hz)} Hz</span>`;
+  txt += ` ｜ 回放：${s.playing ? '<b style="color:#ffd479;">播放中</b>' : '空闲'}`;
+  $('statusText').innerHTML = txt;
+
+  const ci = $('carrierInput');
+  if (String(parseInt(ci.value)) !== String(s.carrier_hz)) ci.value = s.carrier_hz;
+  $('rxPauseChk').checked = !!s.rx_pause_on_play;
+
+  if (s.playing) {
+    $('playLatestBtn').disabled = true;
+    $('playingInfo').textContent = '正在回放...';
+  } else {
+    $('playLatestBtn').disabled = (selectedSeq === null);
+    $('playingInfo').textContent = '';
+  }
+}
+
 async function refreshStatus() {
   if (!auth) return;   /* not logged in: no polling */
   try {
     const s = await (await apiFetch('/api/status')).json();
-    statusInfo = s;
-    const mode = s.mode;
-    const badgeCls = mode === 'AP' ? 'ap' : (mode === 'STA' ? 'sta' : (mode === 'AP+STA' ? 'sta' : 'off'));
-    let txt = `连接方式：<span class="badge ${badgeCls}">${esc(mode)}</span>`;
-    if (s.ap_ip) txt += ` 热点 <b>${esc(s.ap_ssid)}</b> → <span class="mono">http://${esc(s.ap_ip)}</span>`;
-    if (s.sta_ip) txt += ` ｜ STA <b>${esc(s.sta_ssid)}</b> → <span class="mono">${esc(s.sta_ip)}</span>（${esc(s.sta_ip_mode === 'static' ? '静态IP' : 'DHCP')}）`;
-    else if (s.sta_ssid) txt += ` ｜ STA <b>${esc(s.sta_ssid)}</b>（未连接，${esc(s.sta_ip_mode === 'static' ? '静态IP' : 'DHCP')}）`;
-    txt += ` ｜ 载波 <span class="mono">${esc(s.carrier_hz)} Hz</span>`;
-    txt += ` ｜ 回放：${s.playing ? '<b style="color:#ffd479;">播放中</b>' : '空闲'}`;
-    $('statusText').innerHTML = txt;
-
-    const ci = $('carrierInput');
-    if (String(parseInt(ci.value)) !== String(s.carrier_hz)) ci.value = s.carrier_hz;
-    $('rxPauseChk').checked = !!s.rx_pause_on_play;
-
-    if (s.playing) {
-      $('playLatestBtn').disabled = true;
-      $('playingInfo').textContent = '正在回放...';
-      clearTimeout(playingTimer);
-      playingTimer = setTimeout(refreshStatus, 1000);
-    } else {
-      $('playLatestBtn').disabled = (selectedSeq === null);
-      $('playingInfo').textContent = '';
-    }
+    applyStatus(s);
   } catch (e) { /* transient */ }
 }
 
@@ -478,21 +547,21 @@ function selectFrame(seq) {
   if (f) renderLatest(f);
 }
 
+function applyFrame(f) {
+  if (!f || f.seq == null) return;
+  frames.push(f);
+  if (f.seq > lastSeq) lastSeq = f.seq;
+  if (frames.length > 200) frames = frames.slice(-200); // UI guard
+  renderLatest(f);
+  renderHistory();
+}
+
 async function pollFrames() {
   if (!auth) return;   /* not logged in: no polling */
   try {
     const d = await (await apiFetch('/api/frames?since=' + lastSeq)).json();
-    if (d.frames && d.frames.length) {
-      let newest = null;
-      for (const f of d.frames) {
-        frames.push(f);
-        if (f.seq > lastSeq) lastSeq = f.seq;
-        newest = f;
-      }
-      if (frames.length > 200) frames = frames.slice(-200); // UI guard
-      renderHistory();
-      if (newest) renderLatest(newest);
-    }
+    if (d.last_seq != null && d.last_seq > lastSeq) lastSeq = d.last_seq;
+    (d.frames || []).forEach(applyFrame);
   } catch (e) { /* transient */ }
 }
 
@@ -679,14 +748,12 @@ async function saveAuthCfg() {
 /* ---------------- init ---------------- */
 if (tokenAlive()) {
   refreshStatus();
-  pollFrames();
+  wsConnect();
   scheduleRenew();
 } else {
   clearAuth();
   showLogin();
 }
-setInterval(pollFrames, 500);
-setInterval(refreshStatus, 3000);
 </script>
 </body>
 </html>

@@ -60,6 +60,8 @@ static SemaphoreHandle_t s_mutex;
 static ir_frame_t s_frame;
 static bool s_frame_new;
 static uint32_t s_seq;
+static ir_frame_cb_t s_frame_cb = NULL;
+static void *s_frame_cb_arg = NULL;
 static ir_seg_t s_segs[IR_RAW_MAX_SEGS];
 
 /* TX variables */
@@ -281,6 +283,11 @@ static void ir_task(void *arg)
             xSemaphoreGive(s_mutex);
         }
 
+        /* notify listeners (e.g. WebSocket push) about the new frame */
+        if (s_frame_cb) {
+            s_frame_cb(&fr, s_frame_cb_arg);
+        }
+
         /* While the TX task is transmitting, RX stays paused (avoids
          * self-loop frames). The playback task resumes the receive loop. */
         if (!s_rx_paused) {
@@ -411,6 +418,12 @@ bool ir_get_frame(ir_frame_t *out)
         xSemaphoreGive(s_mutex);
     }
     return got;
+}
+
+void ir_set_frame_cb(ir_frame_cb_t cb, void *arg)
+{
+    s_frame_cb = cb;
+    s_frame_cb_arg = arg;
 }
 
 uint32_t ir_history_count(void)
