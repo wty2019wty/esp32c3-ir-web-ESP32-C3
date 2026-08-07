@@ -1,8 +1,8 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
-#include <ctype.h>
 #include "app_ir.h"
+#include "app_ir_internal.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
@@ -26,24 +26,12 @@
 #define IR_RX_MIN_PULSE_NS  1000U      /* glitches < 1 us are ignored */
 #define IR_RX_TIMEOUT_NS    50000000U  /* idle gap > 50 ms ends the frame */
 
-#define NEC_LEAD_PULSE_US   9000U
-#define NEC_LEAD_SPACE_US   4500U
-#define NEC_REPEAT_SPACE_US 2250U
-#define NEC_BIT_PULSE_US    560U
-#define NEC_BIT0_SPACE_US   560U
-#define NEC_BIT1_SPACE_US   1690U
-
 #define IR_CARRIER_DUTY     CONFIG_IR_TOOL_CARRIER_DUTY
 #define IR_PLAY_QUEUE_LEN   4
 
 #define IR_NVS_NS           "ir_tool"
 #define IR_NVS_KEY_FREQ     "carrier_hz"
 #define IR_NVS_KEY_RX_PAUSE "rx_pause"
-
-typedef struct {
-    uint32_t dur;   /* duration in us */
-    uint8_t level;
-} ir_seg_t;
 
 /* Playback request passed to the playback task via queue */
 typedef struct {
@@ -56,15 +44,7 @@ typedef struct {
 static rmt_channel_handle_t s_rx_ch = NULL;
 static rmt_receive_config_t s_rx_cfg;
 static rmt_symbol_word_t s_rx_buf[IR_RX_BUF_SYMBOLS];
-static SemaphoreHandle_t s_mutex;
-static ir_frame_t s_frame;
-static bool s_frame_new;
-static uint32_t s_seq;
-static ir_frame_cb_t s_frame_cb = NULL;
-static void *s_frame_cb_arg = NULL;
-static ir_play_cb_t s_play_cb = NULL;
-static void *s_play_cb_arg = NULL;
-static ir_seg_t s_segs[IR_RAW_MAX_SEGS];
+static ir_seg_t s_segs[IR_RAW_MAX_SEGS];   /* analysis scratch (RMT ticks -> us) */
 
 /* TX variables */
 static rmt_channel_handle_t s_tx_ch = NULL;
@@ -78,17 +58,7 @@ static bool s_rx_pause_enabled = true;         /* user switch, default on */
 /* global carrier frequency (Hz) */
 static uint32_t s_carrier_freq = CONFIG_IR_TOOL_CARRIER_FREQ_HZ;
 
-/* history ring */
-static ir_frame_t s_history[IR_HISTORY_DEPTH];
-static uint32_t s_history_head = 0;
-static uint32_t s_history_count = 0;
-
 static void ir_playback_task(void *arg);
-
-static inline bool dur_in_range(uint32_t v, uint32_t nom, uint32_t margin)
-{
-    return (v >= nom - margin) && (v <= nom + margin);
-}
 
 /* Simple flag + copy instead of a FreeRTOS queue in ISR (avoids ISR compatibility issues) */
 static volatile bool s_rx_done = false;
@@ -176,78 +146,8 @@ static void ir_analyze(const rmt_symbol_word_t *sym, size_t num, ir_frame_t *f)
         f->raw_durs[f->raw_count++] = s_segs[i].dur;
     }
 
-    /* NEC decode: scan for the 9 ms leader (polarity agnostic) */
-    f->nec_ok = false;
-    f->nec_repeat = false;
-    f->nec_chksum_ok = false;
-    f->nec_ext_addr = false;
-    f->nec_bits = 0;
-    f->nec_addr = 0;
-    f->nec_cmd = 0;
-    f->nec_raw = 0;
-
-    for (int i = start; i + 1 < end; i++) {
-        if (s_segs[i + 1].level == s_segs[i].level) {
-            continue;
-        }
-        if (!dur_in_range(s_segs[i].dur, NEC_LEAD_PULSE_US, 1200)) {
-            continue;
-        }
-
-        /* repeat code: 9ms + 2.25ms + 560us */
-        if (dur_in_range(s_segs[i + 1].dur, NEC_REPEAT_SPACE_US, 500)) {
-            if (i + 2 < end && dur_in_range(s_segs[i + 2].dur, NEC_BIT_PULSE_US, 300)) {
-                f->nec_ok = true;
-                f->nec_repeat = true;
-            }
-            return;
-        }
-        if (!dur_in_range(s_segs[i + 1].dur, NEC_LEAD_SPACE_US, 700)) {
-            continue;
-        }
-
-        /* 32 data bits, LSB first: (pulse, space) pairs */
-        uint32_t raw = 0;
-        bool good = true;
-        for (int b = 0; b < 32; b++) {
-            int p = i + 2 + b * 2;
-            if (p + 1 >= end || !dur_in_range(s_segs[p].dur, NEC_BIT_PULSE_US, 300)) {
-                good = false;
-                break;
-            }
-            if (dur_in_range(s_segs[p + 1].dur, NEC_BIT0_SPACE_US, 350)) {
-                /* logic 0 */
-            } else if (dur_in_range(s_segs[p + 1].dur, NEC_BIT1_SPACE_US, 450)) {
-                raw |= (1UL << b);
-            } else {
-                good = false;
-                break;
-            }
-        }
-        if (good) {
-            uint8_t a = raw & 0xFF;
-            uint8_t ai = (raw >> 8) & 0xFF;
-            uint8_t c = (raw >> 16) & 0xFF;
-            uint8_t ci = (raw >> 24) & 0xFF;
-            f->nec_ok = true;
-            f->nec_bits = 32;
-            f->nec_raw = raw;
-            if (ai == (uint8_t)~a && ci == (uint8_t)~c) {
-                f->nec_chksum_ok = true;
-                f->nec_addr = a;
-                f->nec_cmd = c;
-            } else if (ci == (uint8_t)~c) {
-                /* extended NEC with 16-bit address */
-                f->nec_ext_addr = true;
-                f->nec_addr = raw & 0xFFFF;
-                f->nec_cmd = c;
-            } else {
-                f->nec_addr = a;
-                f->nec_cmd = c;
-            }
-        }
-        return;
-    }
+    /* NEC decode (separate module) */
+    ir_nec_decode(s_segs, start, end, f);
 }
 
 static void ir_task(void *arg)
@@ -269,26 +169,12 @@ static void ir_task(void *arg)
             num = IR_RX_BUF_SYMBOLS;
         }
         ir_analyze(ev.received_symbols, num, &fr);
-        fr.seq = ++s_seq;
         fr.valid = true;
         fr.timestamp_ms = (uint32_t)(esp_timer_get_time() / 1000);
 
-        if (xSemaphoreTake(s_mutex, portMAX_DELAY) == pdTRUE) {
-            s_frame = fr;
-            s_frame_new = true;
-            /* push into history ring */
-            s_history[s_history_head] = fr;
-            s_history_head = (s_history_head + 1) % IR_HISTORY_DEPTH;
-            if (s_history_count < IR_HISTORY_DEPTH) {
-                s_history_count++;
-            }
-            xSemaphoreGive(s_mutex);
-        }
-
-        /* notify listeners (e.g. WebSocket push) about the new frame */
-        if (s_frame_cb) {
-            s_frame_cb(&fr, s_frame_cb_arg);
-        }
+        /* store into latest + history ring and notify listeners (e.g.
+         * WebSocket push) about the new frame (assigns seq) */
+        ir_store_push(&fr);
 
         /* While the TX task is transmitting, RX stays paused (avoids
          * self-loop frames). The playback task resumes the receive loop. */
@@ -316,8 +202,7 @@ static esp_err_t ir_load_carrier_from_nvs(void)
 
 esp_err_t ir_init(void)
 {
-    s_mutex = xSemaphoreCreateMutex();
-    if (!s_mutex) {
+    if (ir_store_init() != ESP_OK) {
         return ESP_ERR_NO_MEM;
     }
     s_play_queue = xQueueCreate(IR_PLAY_QUEUE_LEN, sizeof(ir_play_req_t *));
@@ -408,80 +293,6 @@ esp_err_t ir_init(void)
     return ESP_OK;
 }
 
-bool ir_get_frame(ir_frame_t *out)
-{
-    bool got = false;
-    if (xSemaphoreTake(s_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-        if (s_frame_new) {
-            *out = s_frame;
-            s_frame_new = false;
-            got = true;
-        }
-        xSemaphoreGive(s_mutex);
-    }
-    return got;
-}
-
-void ir_set_frame_cb(ir_frame_cb_t cb, void *arg)
-{
-    s_frame_cb = cb;
-    s_frame_cb_arg = arg;
-}
-
-void ir_set_play_cb(ir_play_cb_t cb, void *arg)
-{
-    s_play_cb = cb;
-    s_play_cb_arg = arg;
-}
-
-uint32_t ir_history_count(void)
-{
-    uint32_t c;
-    if (xSemaphoreTake(s_mutex, pdMS_TO_TICKS(10)) != pdTRUE) {
-        return 0;
-    }
-    c = s_history_count;
-    xSemaphoreGive(s_mutex);
-    return c;
-}
-
-esp_err_t ir_history_get(uint32_t index, ir_frame_t *out)
-{
-    if (!out) {
-        return ESP_ERR_INVALID_ARG;
-    }
-    if (xSemaphoreTake(s_mutex, pdMS_TO_TICKS(50)) != pdTRUE) {
-        return ESP_ERR_TIMEOUT;
-    }
-    if (index >= s_history_count) {
-        xSemaphoreGive(s_mutex);
-        return ESP_ERR_NOT_FOUND;
-    }
-    /* ring: oldest = head - count (mod depth) */
-    uint32_t pos = (s_history_head + IR_HISTORY_DEPTH - s_history_count + index) % IR_HISTORY_DEPTH;
-    *out = s_history[pos];
-    xSemaphoreGive(s_mutex);
-    return ESP_OK;
-}
-
-esp_err_t ir_history_get_latest(ir_frame_t *out)
-{
-    uint32_t c = ir_history_count();
-    if (c == 0) {
-        return ESP_ERR_NOT_FOUND;
-    }
-    return ir_history_get(c - 1, out);
-}
-
-uint32_t ir_get_latest_seq(void)
-{
-    ir_frame_t fr;
-    if (ir_history_get_latest(&fr) == ESP_OK) {
-        return fr.seq;
-    }
-    return 0;
-}
-
 uint32_t ir_get_carrier_freq(void)
 {
     return s_carrier_freq;
@@ -546,8 +357,9 @@ static esp_err_t ir_build_symbols(const uint32_t *durs, uint32_t count,
     return ESP_OK;
 }
 
-/* Enqueue a playback request; task applies carrier, transmits, frees the payload. */
-static esp_err_t ir_play_durs(const uint32_t *durs, uint32_t count, uint32_t freq_hz)
+/* Enqueue a playback request; task applies carrier, transmits, frees the payload.
+ * Shared with the playback API layer (app_ir_play.c). */
+esp_err_t ir_play_durs(const uint32_t *durs, uint32_t count, uint32_t freq_hz)
 {
     if (count == 0 || count > IR_MAX_TX_SYMBOLS * 2) {
         return ESP_ERR_INVALID_ARG;
@@ -586,9 +398,7 @@ static void ir_playback_task(void *arg)
             continue;
         }
         s_playing = true;
-        if (s_play_cb) {
-            s_play_cb(true, s_play_cb_arg);
-        }
+        ir_store_notify_play(true);
 
         /* pause IR reception while transmitting to avoid self-loop frames */
         if (!s_rx_paused && s_rx_pause_enabled) {
@@ -622,9 +432,7 @@ static void ir_playback_task(void *arg)
         free(req->symbols);
         free(req);
         s_playing = false;
-        if (s_play_cb) {
-            s_play_cb(false, s_play_cb_arg);
-        }
+        ir_store_notify_play(false);
 
         /* resume RX once the queue drains */
         if (s_rx_paused && uxQueueMessagesWaiting(s_play_queue) == 0) {
@@ -659,81 +467,4 @@ esp_err_t ir_set_rx_pause_enabled(bool enabled)
 bool ir_is_playing(void)
 {
     return s_playing;
-}
-
-/* Parse 1..8 hex digits (0x prefix / spaces allowed) into a 32-bit value. */
-static esp_err_t ir_parse_hxd(const char *hex, uint32_t *out_raw)
-{
-    if (!hex) {
-        return ESP_ERR_INVALID_ARG;
-    }
-    while (isspace((unsigned char)*hex)) {
-        hex++;
-    }
-    if (hex[0] == '0' && (hex[1] == 'x' || hex[1] == 'X')) {
-        hex += 2;
-    }
-    size_t len = 0;
-    const char *p = hex;
-    while (isxdigit((unsigned char)*p)) {
-        p++;
-        len++;
-    }
-    while (isspace((unsigned char)*p)) {
-        p++;
-    }
-    if (len == 0 || len > 8 || *p != '\0') {
-        return ESP_ERR_INVALID_ARG;
-    }
-    char buf[16];
-    memcpy(buf, hex, len);
-    buf[len] = '\0';
-    char *end = NULL;
-    unsigned long v = strtoul(buf, &end, 16);
-    if (end == buf || *end != '\0') {
-        return ESP_ERR_INVALID_ARG;
-    }
-    *out_raw = (uint32_t)v;
-    return ESP_OK;
-}
-
-esp_err_t ir_play_hxd(const char *hex, uint32_t freq_hz)
-{
-    uint32_t raw = 0;
-    ESP_RETURN_ON_ERROR(ir_parse_hxd(hex, &raw), TAG, "bad hex value");
-
-    /* standard NEC frame, LSB first */
-    uint32_t durs[2 + 32 * 2 + 1];
-    uint32_t n = 0;
-    durs[n++] = NEC_LEAD_PULSE_US;
-    durs[n++] = NEC_LEAD_SPACE_US;
-    for (int b = 0; b < 32; b++) {
-        durs[n++] = NEC_BIT_PULSE_US;
-        durs[n++] = (raw & (1UL << b)) ? NEC_BIT1_SPACE_US : NEC_BIT0_SPACE_US;
-    }
-    durs[n++] = NEC_BIT_PULSE_US; /* trailing stop pulse */
-
-    ESP_LOGI(TAG, "Play hxd %08lX (%lu Hz)", (unsigned long)raw, (unsigned long)(freq_hz ? freq_hz : s_carrier_freq));
-    return ir_play_durs(durs, n, freq_hz);
-}
-
-esp_err_t ir_play_raw(const uint32_t *durs, uint32_t count, uint32_t freq_hz)
-{
-    if (!durs) {
-        return ESP_ERR_INVALID_ARG;
-    }
-    return ir_play_durs(durs, count, freq_hz);
-}
-
-esp_err_t ir_play_history(uint32_t index, uint32_t freq_hz)
-{
-    ir_frame_t fr;
-    esp_err_t ret = ir_history_get(index, &fr);
-    if (ret != ESP_OK) {
-        return ret;
-    }
-    if (fr.raw_count == 0) {
-        return ESP_ERR_INVALID_STATE;
-    }
-    return ir_play_durs(fr.raw_durs, fr.raw_count, freq_hz);
 }
