@@ -38,7 +38,6 @@
   .badge.sta { background: #1f4a6e; color: #7ec4e0; }
   .badge.off { background: #5c1f1f; color: #e07e7e; }
   .badge.ws { background: #1f4a6e; color: #7ec4e0; }
-  .badge.rest { background: #5c4a1f; color: #e0c47e; }
   .badge.con { background: #3a3f4a; color: #9aa3b3; }
   .tabbtn { background: #232936; color: #d7dae0; border: 1px solid #2a2f3a; }
   .tabbtn.active { background: #2f6fed; color: #fff; border-color: #2f6fed; }
@@ -238,16 +237,17 @@ function esc(s) {
   return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
 
-/* ---- auth (token from /api/login, saved in sessionStorage) ---- */
+/* ---- auth (token via WS login, saved in sessionStorage) ---- */
 const TOKEN_TTL_MS = 24 * 60 * 60 * 1000;
 let auth = sessionStorage.getItem('auth') || '';
 let authExpires = Number(sessionStorage.getItem('authExpires') || 0);
 if (auth && !authExpires) authExpires = Date.now() + TOKEN_TTL_MS; /* sessions from older firmware */
-function authHeaders() { return auth ? { 'X-Auth-Token': auth } : {}; }
 function tokenAlive() { return auth && authExpires && Date.now() < authExpires; }
 function clearAuth() {
   auth = '';
   authExpires = 0;
+  wsReady = false;
+  setChan();
   sessionStorage.removeItem('auth');
   sessionStorage.removeItem('authExpires');
 }
@@ -262,36 +262,25 @@ function showPwdChange() {
   $('pwdUser').focus();
 }
 
-async function doLogin() {
+/* Login over the WS command channel (REST /api/login is gone). The server
+ * replies with {"type":"login",...}; handled in wsConnect().onmessage. */
+let pendingLogin = null;
+
+function doLogin() {
   const u = $('loginUser').value;
   const p = $('loginPass').value;
   if (!u) { $('loginMsg').textContent = '请输入用户名'; return; }
+  if (!ws || ws.readyState !== WebSocket.OPEN) {
+    $('loginMsg').textContent = 'WebSocket 未连接，正在重连...';
+    scheduleWsRetry();
+    return;
+  }
+  pendingLogin = { user: u, pass: p };
   try {
-    const r = await fetch('/api/login', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ user: u, pass: p })
-    });
-    const d = await r.json();
-    if (r.status === 200 && d.token) {
-      auth = d.token;
-      authExpires = Date.now() + (d.expires_in || 86400) * 1000;
-      sessionStorage.setItem('auth', auth);
-      sessionStorage.setItem('authExpires', String(authExpires));
-      $('loginMsg').textContent = '';
-      hideLogin();
-      if (d.must_change_pwd) {
-        showPwdChange();
-        return;
-      }
-      location.reload();
-    } else if (r.status === 429) {
-      $('loginMsg').textContent = '尝试次数过多，请 ' + (d.retry_after || 30) + ' 秒后再试';
-    } else {
-      $('loginMsg').textContent = '用户名或密码错误';
-    }
+    ws.send(JSON.stringify({ type: 'login', user: u, pass: p }));
   } catch (e) {
-    $('loginMsg').textContent = '请求失败';
+    pendingLogin = null;
+    $('loginMsg').textContent = '发送失败';
   }
 }
 
@@ -303,12 +292,7 @@ async function saveForcedPwd() {
   if (p.length < 4) { $('pwdMsg').textContent = '密码至少 4 位'; return; }
   if (p !== p2) { $('pwdMsg').textContent = '两次输入的密码不一致'; return; }
   try {
-    const r = await fetch('/api/authcfg', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'X-Auth-Token': auth },
-      body: JSON.stringify({ user: u, pass: p })
-    });
-    const d = await r.json();
+    const d = await rpc('POST', '/api/authcfg', { user: u, pass: p });
     if (d.ok) {
       clearAuth(); /* server invalidated the old token */
       $('loginUser').value = u;
@@ -320,7 +304,7 @@ async function saveForcedPwd() {
       $('pwdMsg').textContent = '保存失败：' + (d.error || '未知错误');
     }
   } catch (e) {
-    $('pwdMsg').textContent = '保存请求失败';
+    $('pwdMsg').textContent = '保存失败：' + ((e.payload && e.payload.error) || e.message || '请求失败');
   }
 }
 
@@ -332,31 +316,8 @@ async function doLogout() {
   location.reload();
 }
 
-/* REST-fallback call. Resolves with the parsed JSON object (normalized so a
- * non-2xx with {"ok":true} still resolves, e.g. {ok:true,restart:true}). */
-function restCall(method, url, body) {
-  return fetch(url, {
-    method: method,
-    headers: Object.assign({ 'Content-Type': 'application/json' }, authHeaders()),
-    body: body === undefined ? undefined : JSON.stringify(body)
-  }).then(async (r) => {
-    if (r.status === 401) {
-      clearAuth();
-      showLogin();
-      throw new Error('unauthorized');
-    }
-    let d = {};
-    try { d = await r.json(); } catch (e) { d = {}; }
-    if (!r.ok && !d.ok) {
-      const e = new Error(d.error || ('HTTP ' + r.status));
-      e.status = r.status;
-      e.payload = d;
-      throw e;
-    }
-    return d;
-  });
-}
-
+/* WebSocket-only command access (REST API is removed from the firmware).
+ * Rejects if the authenticated WS channel is not up. */
 function urlToCmd(method, url) {
   const path = url.split('?')[0];
   switch (path) {
@@ -373,39 +334,37 @@ function urlToCmd(method, url) {
   }
 }
 
-/* Unified API access: prefer WebSocket command RPC, fall back to REST on
- * any WebSocket failure (not connected, send error, timeout, close). */
 function rpc(method, url, body) {
   if (!tokenAlive()) {
     clearAuth();
     showLogin();
     return Promise.reject(new Error('unauthorized'));
   }
-  const runRest = () => restCall(method, url, body);
-  if (wsReady && ws && ws.readyState === WebSocket.OPEN) {
-    const cmd = urlToCmd(method, url);
-    if (cmd) {
-      return new Promise((resolve, reject) => {
-        const id = ++wsCmdId;
-        const waiter = {
-          resolve, reject, runRest,
-          timer: setTimeout(() => {
-            wsCmdWaiters.delete(id);
-            runRest().then(resolve, reject); /* timeout -> REST fallback */
-          }, WS_CMD_TIMEOUT_MS)
-        };
-        wsCmdWaiters.set(id, waiter);
-        try {
-          ws.send(JSON.stringify({ type: 'cmd', id, cmd, body: body || {} }));
-        } catch (e) {
-          clearTimeout(waiter.timer);
-          wsCmdWaiters.delete(id);
-          runRest().then(resolve, reject);
-        }
-      });
-    }
+  if (!wsReady || !ws || ws.readyState !== WebSocket.OPEN) {
+    return Promise.reject(new Error('ws offline'));
   }
-  return runRest();
+  const cmd = urlToCmd(method, url);
+  if (!cmd) {
+    return Promise.reject(new Error('no ws cmd for ' + url));
+  }
+  return new Promise((resolve, reject) => {
+    const id = ++wsCmdId;
+    const waiter = {
+      resolve, reject,
+      timer: setTimeout(() => {
+        wsCmdWaiters.delete(id);
+        reject(new Error('ws cmd timeout'));
+      }, WS_CMD_TIMEOUT_MS)
+    };
+    wsCmdWaiters.set(id, waiter);
+    try {
+      ws.send(JSON.stringify({ type: 'cmd', id, cmd, body: body || {} }));
+    } catch (e) {
+      clearTimeout(waiter.timer);
+      wsCmdWaiters.delete(id);
+      reject(e);
+    }
+  });
 }
 
 function scheduleRenew() {
@@ -427,16 +386,13 @@ function scheduleRenew() {
 
 let ws = null;
 let wsRetryTimer = null;
-let pollTimers = [];
 let wsReady = false;      /* WS connected AND authenticated */
 let wsCmdId = 0;
 const wsCmdWaiters = new Map();
 const WS_CMD_TIMEOUT_MS = 6000;
 
-/* Reflect the current API channel in the header badge:
- *   WS实时          -> commands/pushes go over WebSocket
- *   REST轮询(回退)   -> WebSocket unavailable, using REST
- *   WS连接中...      -> socket connecting (not yet authed) */
+/* Reflect the WS channel state in the header badge (WS is the only API
+ * channel now — no REST fallback). */
 function setChan() {
   const b = $('chanBadge');
   if (wsReady) {
@@ -449,35 +405,40 @@ function setChan() {
     b.className = 'badge con';
     b.textContent = 'WS连接中...';
   } else {
-    b.className = 'badge rest';
-    b.textContent = 'REST轮询(回退)';
+    b.className = 'badge off';
+    b.textContent = 'WS离线(重连中...)';
   }
 }
 
-function stopPolling() {
-  if (!pollTimers.length) return;
-  pollTimers.forEach(clearInterval);
-  pollTimers = [];
-}
-
-function startPollingFallback() {
-  if (pollTimers.length) return;
-  refreshStatus();
-  pollFrames();
-  pollTimers.push(setInterval(pollFrames, 500));
-  pollTimers.push(setInterval(refreshStatus, 3000));
-}
-
 function scheduleWsRetry() {
-  if (!tokenAlive()) return;
   clearTimeout(wsRetryTimer);
   wsRetryTimer = setTimeout(wsConnect, 10000);
 }
 
+/* Initial sync over WS after auth: current status + frame history backfill
+ * (frames may be truncated by the WS buffer; re-request with the returned
+ * last_seq until caught up). */
+async function wsSync() {
+  try {
+    applyStatus(await rpc('GET', '/api/status', {}));
+  } catch (e) { /* the 1s status push will fill it in */ }
+  for (let i = 0; i < 8; i++) {
+    let d;
+    try {
+      d = await rpc('GET', '/api/frames', { since: lastSeq });
+    } catch (e) {
+      break;
+    }
+    if (d.last_seq != null && d.last_seq > lastSeq) lastSeq = d.last_seq;
+    (d.frames || []).forEach(applyFrame);
+    if (!d.truncated) break;
+  }
+}
+
 function wsConnect() {
-  if (!tokenAlive()) return;
   clearTimeout(wsRetryTimer);
   wsRetryTimer = null;
+  if (ws && (ws.readyState === WebSocket.CONNECTING || ws.readyState === WebSocket.OPEN)) return;
   let s;
   try {
     s = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/api/ws');
@@ -489,16 +450,44 @@ function wsConnect() {
   setChan();
   s.onopen = () => {
     setChan();
-    try { s.send(JSON.stringify({ type: 'auth', token: auth })); } catch (e) { /* ignored */ }
+    if (tokenAlive()) {
+      /* existing session: authenticate with the stored token */
+      try { s.send(JSON.stringify({ type: 'auth', token: auth })); } catch (e) { /* ignored */ }
+    }
+    /* no token: wait for the user to login via the login command */
   };
   s.onmessage = (ev) => {
     let d;
     try { d = JSON.parse(ev.data); } catch (e) { return; }
-    if (d.type === 'auth') {
+    if (d.type === 'login') {
+      if (d.ok === true) {
+        auth = d.token;
+        authExpires = Date.now() + (d.expires_in || 86400) * 1000;
+        sessionStorage.setItem('auth', auth);
+        sessionStorage.setItem('authExpires', String(authExpires));
+        wsReady = true;
+        pendingLogin = null;
+        setChan();
+        $('loginMsg').textContent = '';
+        hideLogin();
+        if (d.must_change_pwd) {
+          showPwdChange();
+          return;
+        }
+        wsSync();
+        scheduleRenew();
+      } else {
+        const msg = d.error === 'too many attempts'
+          ? ('尝试次数过多，请 ' + (d.retry_after || 30) + ' 秒后再试')
+          : (d.error === 'bad login' ? '登录信息不完整' : '用户名或密码错误');
+        pendingLogin = null;
+        $('loginMsg').textContent = msg;
+      }
+    } else if (d.type === 'auth') {
       if (d.ok === true) {
         wsReady = true;
         setChan();
-        stopPolling();
+        wsSync();
       } else if (d.ok === false) {
         clearAuth();
         showLogin();
@@ -529,17 +518,15 @@ function wsConnect() {
   s.onclose = () => {
     ws = null;
     wsReady = false;
+    pendingLogin = null;
     setChan();
-    /* flush any in-flight WS commands via REST so nothing hangs */
+    /* reject any in-flight WS commands so callers don't hang forever */
     wsCmdWaiters.forEach(w => {
       clearTimeout(w.timer);
-      w.runRest().then(w.resolve, w.reject);
+      w.reject(new Error('ws closed'));
     });
     wsCmdWaiters.clear();
-    if (tokenAlive()) {
-      startPollingFallback();
-      scheduleWsRetry();
-    }
+    scheduleWsRetry(); /* reconnect whether logged in or not (login needs WS too) */
   };
   s.onerror = () => { try { s.close(); } catch (e) { /* ignored */ } };
 }
@@ -576,13 +563,6 @@ function applyStatus(s) {
     $('playLatestBtn').disabled = (selectedSeq === null);
     $('playingInfo').textContent = '';
   }
-}
-
-async function refreshStatus() {
-  if (!auth) return;   /* not logged in: no polling */
-  try {
-    applyStatus(await rpc('GET', '/api/status', {}));
-  } catch (e) { /* transient */ }
 }
 
 /* ---------------- frames ---------------- */
@@ -661,21 +641,6 @@ function applyFrame(f) {
   if (frames.length > 200) frames = frames.slice(-200); // UI guard
   renderLatest(f);
   renderHistory();
-}
-
-async function pollFrames() {
-  if (!auth) return;   /* not logged in: no polling */
-  try {
-    const d = await rpc('GET', '/api/frames', { since: lastSeq });
-    if (d.last_seq != null && d.last_seq > lastSeq) lastSeq = d.last_seq;
-    (d.frames || []).forEach(applyFrame);
-    if (d.truncated) {
-      /* backfill exceeded the WS buffer; resync the rest over REST */
-      const r = await restCall('GET', '/api/frames?since=' + lastSeq);
-      if (r.last_seq != null && r.last_seq > lastSeq) lastSeq = r.last_seq;
-      (r.frames || []).forEach(applyFrame);
-    }
-  } catch (e) { /* transient */ }
 }
 
 /* ---------------- actions ---------------- */
@@ -853,12 +818,12 @@ async function saveAuthCfg() {
 
 /* ---------------- init ---------------- */
 if (tokenAlive()) {
-  wsConnect();
   scheduleRenew();
 } else {
   clearAuth();
   showLogin();
 }
+wsConnect(); /* always: needed for login, auth or commands */
 </script>
 </body>
 </html>

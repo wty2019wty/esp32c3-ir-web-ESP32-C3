@@ -134,39 +134,6 @@ bool web_auth_token_ok(const char *token)
     return token && ct_equal(token, s_token);
 }
 
-/* Verify the X-Auth-Token header against the active session token. */
-static bool web_auth_ok(httpd_req_t *req)
-{
-    size_t len = httpd_req_get_hdr_value_len(req, "X-Auth-Token");
-    if (len == 0) {
-        char ua[512] = "";
-        size_t ulen = httpd_req_get_hdr_value_len(req, "User-Agent");
-        if (ulen > 0 && ulen < sizeof(ua)) {
-            httpd_req_get_hdr_value_str(req, "User-Agent", ua, sizeof(ua));
-        }
-        /* requests without a User-Agent are non-browser clients (noise), stay quiet */
-        if (ua[0] != '\0') {
-            ESP_LOGW(TAG, "auth: no token header (UA: %s)", ua);
-        }
-        return false;
-    }
-    if (len > 64) {
-        ESP_LOGW(TAG, "auth: token header too long (%u)", (unsigned)len);
-        return false;
-    }
-    char buf[65];
-    if (httpd_req_get_hdr_value_str(req, "X-Auth-Token", buf, sizeof(buf)) != ESP_OK) {
-        ESP_LOGW(TAG, "auth: header read failed");
-        return false;
-    }
-    if (!web_auth_token_ok(buf)) {
-        ESP_LOGW(TAG, "auth: token mismatch (got \"%.12s...\" len=%u, expect \"%.8s...\")",
-                 buf, (unsigned)strlen(buf), s_token);
-        return false;
-    }
-    return true;
-}
-
 /* Generate a fresh session token (invalidates any previous one). */
 static void token_new(void)
 {
@@ -178,49 +145,32 @@ static void token_new(void)
     s_token_ts = esp_timer_get_time();
 }
 
-/* Require auth; on failure sends 401 and returns false. */
-bool web_require_auth(httpd_req_t *req)
+/* WS login entry (the only unauthenticated operation — REST /api/login is gone).
+ * Returns a malloc'd complete response JSON (with "type":"login"), caller frees.
+ * On success the caller should mark the connection as authenticated. */
+esp_err_t web_auth_login(const char *user, const char *pass, char **out_json)
 {
-    if (web_auth_ok(req)) {
-        return true;
+    if (!out_json) {
+        return ESP_ERR_INVALID_ARG;
     }
-    httpd_resp_set_status(req, "401 Unauthorized");
-    httpd_resp_set_type(req, "application/json");
-    httpd_resp_sendstr(req, "{\"error\":\"unauthorized\"}");
-    return false;
-}
-
-/* POST /api/login {"user":"...","pass":"..."} -> {"ok":true,"token":"..."} */
-static esp_err_t login_handler(httpd_req_t *req)
-{
     int64_t now = esp_timer_get_time();
     if (now < s_login_lock_until) {
         int remain = (int)((s_login_lock_until - now + 999999) / 1000000);
-        char buf[64];
-        snprintf(buf, sizeof(buf), "{\"error\":\"too many attempts\",\"retry_after\":%d}", remain);
-        web_respond_json(req, 429, buf);
-        return ESP_OK;
+        char buf[96];
+        snprintf(buf, sizeof(buf),
+                 "{\"type\":\"login\",\"ok\":false,\"error\":\"too many attempts\",\"retry_after\":%d}",
+                 remain);
+        *out_json = strdup(buf);
+        return ESP_ERR_TIMEOUT;
+    }
+    if (!user || !pass) {
+        *out_json = strdup("{\"type\":\"login\",\"ok\":false,\"error\":\"bad login\"}");
+        return ESP_ERR_INVALID_ARG;
     }
 
-    char *body = web_httpd_read_body(req);
-    if (!body) {
-        web_respond_json(req, 400, "{\"error\":\"bad body\"}");
-        return ESP_OK;
-    }
-    cJSON *root = cJSON_Parse(body);
-    free(body);
-    if (!root) {
-        web_respond_json(req, 400, "{\"error\":\"bad json\"}");
-        return ESP_OK;
-    }
     web_auth_cfg_t cfg;
     web_auth_load(&cfg);
-    cJSON *u = cJSON_GetObjectItem(root, "user");
-    cJSON *p = cJSON_GetObjectItem(root, "pass");
-    bool ok = cJSON_IsString(u) && cJSON_IsString(p) &&
-              ct_equal(u->valuestring, cfg.user) &&
-              ct_equal(p->valuestring, cfg.pass);
-    cJSON_Delete(root);
+    bool ok = ct_equal(user, cfg.user) && ct_equal(pass, cfg.pass);
     if (!ok) {
         s_login_fails++;
         if (s_login_fails >= LOGIN_MAX_FAILS) {
@@ -229,8 +179,8 @@ static esp_err_t login_handler(httpd_req_t *req)
             ESP_LOGW(TAG, "login: too many failures, locked for %lld s",
                      (long long)(LOGIN_LOCK_US / 1000000));
         }
-        web_respond_json(req, 401, "{\"error\":\"bad credentials\"}");
-        return ESP_OK;
+        *out_json = strdup("{\"type\":\"login\",\"ok\":false,\"error\":\"bad credentials\"}");
+        return ESP_FAIL;
     }
     s_login_fails = 0;
     s_login_lock_until = 0;
@@ -244,15 +194,15 @@ static esp_err_t login_handler(httpd_req_t *req)
     }
     bool must_change = creds_are_default(&cfg);
     ESP_LOGI(TAG, "login ok, token issued%s", must_change ? " (default password, must change)" : "");
-    char buf[160];
+    char buf[176];
     snprintf(buf, sizeof(buf),
-             "{\"ok\":true,\"token\":\"%s\",\"expires_in\":%lld,\"must_change_pwd\":%s}",
-             s_token, (long long)(TOKEN_TTL_US / 1000000), must_change ? "true" : "false");
-    web_respond_json(req, 200, buf);
+             "{\"type\":\"login\",\"ok\":true,\"token\":\"%s\",\"expires_in\":%llu,\"must_change_pwd\":%s}",
+             s_token, (unsigned long long)(TOKEN_TTL_US / 1000000), must_change ? "true" : "false");
+    *out_json = strdup(buf);
     return ESP_OK;
 }
 
-/* GET /api/authcfg -> current login user (password is never returned) */
+/* Current login user as a JSON string (password is never returned; caller frees). */
 char *web_authcfg_get_json(void)
 {
     web_auth_cfg_t cfg;
@@ -264,22 +214,6 @@ char *web_authcfg_get_json(void)
     }
     snprintf(buf, cap, "{\"user\":\"%s\"}", cfg.user);
     return buf;
-}
-
-static esp_err_t authcfg_get_handler(httpd_req_t *req)
-{
-    if (!web_require_auth(req)) {
-        return ESP_OK;
-    }
-    char *s = web_authcfg_get_json();
-    if (!s) {
-        web_respond_json(req, 400, "{\"error\":\"oom\"}");
-        return ESP_OK;
-    }
-    httpd_resp_set_type(req, "application/json");
-    httpd_resp_sendstr(req, s);
-    free(s);
-    return ESP_OK;
 }
 
 /* Apply login credential changes from a JSON body; pass empty = keep current.
@@ -309,83 +243,5 @@ esp_err_t web_authcfg_set(cJSON *root, const char **err)
     }
     /* credentials changed: force a fresh login (kills existing WS sessions too) */
     web_auth_invalidate();
-    return ESP_OK;
-}
-
-/* POST /api/authcfg {"user":"...","pass":"..."} — pass empty = keep current */
-static esp_err_t authcfg_post_handler(httpd_req_t *req)
-{
-    if (!web_require_auth(req)) {
-        return ESP_OK;
-    }
-    char *body = web_httpd_read_body(req);
-    if (!body) {
-        web_respond_json(req, 400, "{\"error\":\"bad body\"}");
-        return ESP_OK;
-    }
-    cJSON *root = cJSON_Parse(body);
-    free(body);
-    if (!root) {
-        web_respond_json(req, 400, "{\"error\":\"bad json\"}");
-        return ESP_OK;
-    }
-
-    const char *err = NULL;
-    esp_err_t ret = web_authcfg_set(root, &err);
-    cJSON_Delete(root);
-    if (ret == ESP_OK) {
-        web_respond_ok(req);
-    } else {
-        char buf[64];
-        snprintf(buf, sizeof(buf), "{\"error\":\"%s\"}", err ? err : "invalid");
-        web_respond_json(req, 400, buf);
-    }
-    return ESP_OK;
-}
-
-/* POST /api/logout - invalidate the current session token. */
-static esp_err_t logout_handler(httpd_req_t *req)
-{
-    if (!web_require_auth(req)) {
-        return ESP_OK;
-    }
-    web_auth_invalidate();
-    web_respond_ok(req);
-    return ESP_OK;
-}
-
-/* POST /api/renew - extend the current session for another full TTL. */
-static esp_err_t renew_handler(httpd_req_t *req)
-{
-    if (!web_require_auth(req)) {
-        return ESP_OK;
-    }
-    uint32_t expires_in = 0;
-    esp_err_t ret = web_auth_renew(&expires_in);
-    if (ret != ESP_OK) {
-        web_respond_json(req, 401, "{\"error\":\"unauthorized\"}");
-        return ESP_OK;
-    }
-    char buf[48];
-    snprintf(buf, sizeof(buf), "{\"ok\":true,\"expires_in\":%lu}", (unsigned long)expires_in);
-    web_respond_json(req, 200, buf);
-    return ESP_OK;
-}
-
-esp_err_t web_auth_register(httpd_handle_t server)
-{
-    static const httpd_uri_t uris[] = {
-        {.uri = "/api/login",   .method = HTTP_POST, .handler = login_handler},
-        {.uri = "/api/authcfg", .method = HTTP_GET,  .handler = authcfg_get_handler},
-        {.uri = "/api/authcfg", .method = HTTP_POST, .handler = authcfg_post_handler},
-        {.uri = "/api/logout",  .method = HTTP_POST, .handler = logout_handler},
-        {.uri = "/api/renew",   .method = HTTP_POST, .handler = renew_handler},
-    };
-    for (size_t i = 0; i < sizeof(uris) / sizeof(uris[0]); i++) {
-        if (httpd_register_uri_handler(server, &uris[i]) != ESP_OK) {
-            ESP_LOGE(TAG, "Failed to register URI %s", uris[i].uri);
-            return ESP_FAIL;
-        }
-    }
     return ESP_OK;
 }

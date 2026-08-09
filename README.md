@@ -113,70 +113,70 @@ idf.py menuconfig   # → "IR Web Tool Configuration"
   **擦除一次 flash**（如 `idf.py erase-flash`，或开机 2 秒内按 BOOT 恢复出厂），
   之后设备回到默认配置并触发强制改密流程。
 
-### Web API
+### API（纯 WebSocket，无 REST）
 
-所有 API 需携带 `X-Auth-Token` 请求头（`/api/login` 除外）。
-**前端默认优先通过 WebSocket 调用下列接口（见下文），REST 端点保留作回退与第三方集成。**
+**所有控制与数据全部走 `ws://<IP>/api/ws`**（REST API 已移除）。HTTP 服务器只提供
+静态页面本身（`/`、`/index.html`）。唯一需要 token 引导的操作是 WS 登录。
 
-| 端点 | 方法 | 说明 |
-|------|------|------|
-| `/api/login` | POST | 登录认证，请求体 `{"user":"...","pass":"..."}` ，返回 `{"ok":true,"token":"...","expires_in":86400,"must_change_pwd":bool}`；连续失败会返回 `429` |
-| `/api/logout` | POST | 退出登录，作废当前 token |
-| `/api/renew` | POST | 续期当前会话，返回新的 `expires_in` |
-| `/api/ws` | GET(WS) | WebSocket 端点：认证后推送 status（每秒）与 frame（新信号实时到达） |
-| `/api/status` | GET | 设备状态（WiFi 模式、IP、载波、播放状态等）；WebSocket 推送已取代轮询，此端点保留作回退 |
-| `/api/frames` | GET | 增量拉取帧历史，参数 `?since=N`（N 为已知最大序号）；WebSocket 推送已取代轮询，此端点保留作回退 |
-| `/api/play` | POST | 回放信号，支持三种 type：`hxd`（`{"value":"ED127F80"}`）、`raw`（`{"data":[...]}`）、`frame`（`{"seq":N}`），可选 `freq` |
-| `/api/carrier` | POST | 设置载波频率，`{"freq":38000}` |
-| `/api/rxpause` | POST | 回放时暂停 IR 接收开关，`{"enabled":true/false}` |
-| `/api/wificfg` | GET/POST | 读取/保存 WiFi 配置；密码不回显（`ap_password_set`/`sta_password_set` 标志），POST 中密码字段传 `null` 表示不修改、空字符串表示清除 |
-| `/api/authcfg` | GET/POST | 读取/修改登录凭据（GET 不返回密码） |
+### WebSocket（登录 + 命令 RPC + 推送）
 
-### WebSocket（推送 + 命令 RPC）
+页面加载后即连接 `ws://<IP>/api/ws`，所有 API（含登录）都在这一条连接上进行：
 
-页面登录后自动连接 `ws://<IP>/api/ws`；连接建立并认证成功后，**所有 API 请求自动优先走 WebSocket 命令，失败自动退回 REST**：
-
-- **认证**：连接后第一条消息发送 `{"type":"auth","token":"<session token>"}`；
-  服务端回复 `{"type":"auth","ok":true}`；token 无效或过期则回复 `ok:false` 并断开连接。
-- **命令 RPC（命令类 API 走此通道）**：
-  - 客户端发送 `{"type":"cmd","id":N,"cmd":"play","body":{...}}`
+- **登录**（连接后第一条消息，唯一无需 token 的操作）：
+  - 发送 `{"type":"login","user":"...","pass":"..."}`
+  - 成功回复 `{"type":"login","ok":true,"token":"...","expires_in":86400,"must_change_pwd":bool}`
+    —— **该连接随即成为已认证会话**，后续命令直接可用；
+  - 失败回复 `{"type":"login","ok":false,"error":"bad credentials"}` 或
+    `{"type":"login","ok":false,"error":"too many attempts","retry_after":N}`（连续失败 5 次锁定 30 秒）；
+  - 连续失败 5 次后锁定 30 秒，防止暴力破解。
+- **已有会话**：客户端刷新页面时保存的 token 仍有效，连接后发送
+  `{"type":"auth","token":"<token>"}` 认证（`auth` 消息与 `login` 二选一）；
+  服务端回复 `{"type":"auth","ok":true}`；token 无效或过期则回复 `ok:false` 并断开。
+- **命令 RPC**：
+  - 客户端发送 `{"type":"cmd","id":N,"cmd":cmd,"body":{...}}`
   - 服务端回复 `{"type":"resp","id":N,"ok":true,"data":{...}}` 或
     `{"type":"resp","id":N,"ok":false,"error":"..."}`
-  - `cmd` 取值与 REST 端点一一对应：
-    - `play`（body 同 `/api/play`，如 `{"type":"hxd","value":"ED127F80"}`）
-    - `carrier`（`{"freq":38000}`）、`rxpause`（`{"enabled":true}`）
-    - `status`（body 为空，返回当前状态对象）
-    - `frames`（`{"since":N}`，增量拉取；超过约 48KB 时返回
-      `"truncated":true`，`last_seq` 为实际返回的最后一帧，客户端应退回 REST 补齐）
-    - `wificfg`（body 含配置字段 = 保存并重启，`{"ok":true,"restart":true}`；body 为空 = 读取）
-    - `authcfg`（body 含 `user`/`pass` = 修改凭据；为空 = 读取用户名）
-    - `renew`、`logout`
-  - 前端 `rpc()` 统一封装：WS 可用时走 WS；WS 未连接 / 发送失败 / 6 秒无响应 / 连接断开时，
-    自动改用对应的 REST 请求（`X-Auth-Token`），功能与原来完全一致。
+  - `cmd` 取值（body 均省略 `ok` 包装）：
+    - `play`：`{"type":"hxd","value":"ED127F80"}` / `{"type":"raw","data":[...],"freq":N}` / `{"type":"frame","seq":N}`，可选 `freq`
+    - `carrier`：`{"freq":38000}`
+    - `rxpause`：`{"enabled":true}`
+    - `status`：body 为空，返回当前状态对象
+    - `frames`：`{"since":N}`，增量拉取；超过约 48KB 时返回 `"truncated":true`，
+      `last_seq` 为实际返回的最后一帧，客户端应使用该 `last_seq` 继续拉取直至追平
+    - `wificfg`：body 含配置字段 = 保存并重启（`{"restart":true}`）；body 为空 = 读取
+      （密码不回显，`ap_password_set`/`sta_password_set` 标志；密码传 `null` 表示不修改、空字符串表示清除）
+    - `authcfg`：body 含 `user`/`pass` = 修改凭据（保存后会话失效需重新登录）；为空 = 读取用户名
+    - `renew`：续期会话（`{"expires_in":N}`）
+    - `logout`：退出登录，响应后服务端关闭连接
 - **推送消息**：
-  - `{"type":"status","id":N,"data":{...}}` —— **状态有变化时才推送**（字段同 `/api/status`），
+  - `{"type":"status","id":N,"data":{...}}` —— **状态有变化时才推送**（字段见下），
     携带递增 `id`；客户端收到后需回复 `{"type":"ack","id":N}` 确认抄收，
     未确认的客户端会每秒补发，直到确认或状态再次变化；
     **播放开始/结束时立即推送**（不依赖每秒采样，避免短暂的"播放中"状态被漏掉）
-  - `{"type":"frame","data":{...}}` —— 收到新红外信号时立即推送（字段同 `/api/frames` 中的单帧）
-- **断线回退**：连接断开后前端自动切换回 REST 轮询，并每 10 秒尝试重连 WebSocket；
-  连接恢复后停止轮询。
+  - `{"type":"frame","data":{...}}` —— 收到新红外信号时立即推送（单帧对象，同 `frames` 中元素）
+  - 前端在认证成功后主动请求一次 `status` 与 `frames`（多段拉取直至追平）完成初始同步；
+    连接断开时前端自动重连（10 秒间隔）并重新登录/认证。
 - **鉴权与失效**：命令与推送均要求已认证会话；退出登录或修改登录凭据会使会话
   **代数**递增，已连接的 WebSocket 会话随即失效（命令被拒、推送停止），
   防止退出登录后残留连接仍可操作设备。
+
+`/api/status` 返回的状态字段：`mode`、`ap_ip`、`sta_ip`、`ap_ssid`、`sta_ssid`、
+`sta_ip_mode`、`sta_connected`、`carrier_hz`、`rx_pause_on_play`、`playing`。
+单帧对象字段：`seq`、`ts`、`nec{...}`、`feat{...}`、`freq`、`durs[...]`。
 
 ### HTTPS 反向代理（nginx）部署注意
 
 如果通过 nginx 反代给设备套 HTTPS（浏览器 → HTTPS → nginx → 明文 HTTP → ESP32），注意以下几点：
 
-- **信任边界**：`nginx → 设备` 这一段是明文 HTTP，`X-Auth-Token` 会被原样转发。能嗅探内网的人
-  可以拿到 token（有效期内等于完整管理员权限）。建议把 nginx 与设备放在同一可信网段
+- **信任边界**：`nginx → 设备` 这一段是明文 HTTP。所有控制都走 WebSocket，
+  登录凭据与 session token 在 WS 帧内明文传输。能嗅探内网的人可以截获登录密码/token
+  （有效期内等于完整管理员权限）。建议把 nginx 与设备放在同一可信网段
   （如专用 VLAN、仅允许 nginx 访问设备的 80 端口），或在设备自身启用 HTTPS
   （`esp_https_server` + mbedTLS）以消除明文段。
-- **nginx 日志**：默认 `access_log` 不记录请求头，token 不会落盘；不要自定义 `log_format`
-  打印 `$http_x_auth_token`，否则 token 会写入日志文件。
-- **强制 HTTPS**：配置 HTTP → HTTPS 跳转，避免用户用 `http://` 直接访问导致 token 走明文。
-- **WebSocket 必须走 wss**：页面推送会连接 `ws://<IP>/api/ws`，反代需要转发 Upgrade 头，
+- **nginx 日志**：默认 `access_log` 不记录请求体，登录密码/token 不会落盘；
+  不要自定义 `log_format` 打印请求体。
+- **强制 HTTPS**：配置 HTTP → HTTPS 跳转，避免用户用 `http://` 直接访问导致凭据走明文。
+- **WebSocket 必须走 wss**：页面会连接 `ws://<IP>/api/ws`，反代需要转发 Upgrade 头，
   示例：
 
 ```nginx
@@ -190,7 +190,7 @@ location /api/ws {
 ```
 
 HTTPS 页面下浏览器会自动使用 `wss://`；若反代未转发 Upgrade 头，WebSocket 会连接失败，
-前端将回退到 REST 轮询（可用，但不是实时推送）。
+**整个页面不可用**（无 REST 回退，登录与控制全部依赖 WS）。
 
 ## 工程结构
 

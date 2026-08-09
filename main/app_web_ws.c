@@ -423,7 +423,27 @@ static esp_err_t ws_handler(httpd_req_t *req)
     }
 
     cJSON *type = cJSON_GetObjectItem(root, "type");
-    if (cJSON_IsString(type) && strcmp(type->valuestring, "auth") == 0) {
+    if (cJSON_IsString(type) && strcmp(type->valuestring, "login") == 0) {
+        /* WS login — the only unauthenticated operation (REST /api/login is
+         * gone). On success this connection becomes authenticated immediately. */
+        cJSON *u = cJSON_GetObjectItem(root, "user");
+        cJSON *p = cJSON_GetObjectItem(root, "pass");
+        const char *user = cJSON_IsString(u) ? u->valuestring : NULL;
+        const char *pass = cJSON_IsString(p) ? p->valuestring : NULL;
+        char *out = NULL;
+        esp_err_t lret = web_auth_login(user, pass, &out);
+        if (out) {
+            ws_reply_text(req, out);
+            free(out);
+        }
+        if (lret == ESP_OK) {
+            ws_client_add(fd, true);
+            ESP_LOGI(TAG, "ws: client fd %d logged in", fd);
+            ws_push_status_now(); /* deliver current status immediately */
+        }
+        cJSON_Delete(root);
+        return ESP_OK;
+    } else if (cJSON_IsString(type) && strcmp(type->valuestring, "auth") == 0) {
         cJSON *tok = cJSON_GetObjectItem(root, "token");
         if (cJSON_IsString(tok) && web_auth_token_ok(tok->valuestring)) {
             ws_client_add(fd, true);

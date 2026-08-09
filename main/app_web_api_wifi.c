@@ -82,7 +82,11 @@ static void schedule_restart(void)
     }
 }
 
-/* GET /api/wificfg -> current (NVS) WiFi configuration */
+/* Shared WiFi configuration cores, invoked by the WebSocket RPC dispatcher
+ * (app_web_rpc.c). The REST API has been removed — all control now happens
+ * over the /api/ws command channel. */
+
+/* Current (NVS) WiFi configuration as a JSON string (caller frees). */
 char *web_wificfg_get_json(void)
 {
     wifi_web_config_t cfg;
@@ -107,22 +111,6 @@ char *web_wificfg_get_json(void)
         cfg.sta_dhcp ? "true" : "false", ip, gw, mask, dns);
     (void)n;
     return buf;
-}
-
-static esp_err_t wificfg_get_handler(httpd_req_t *req)
-{
-    if (!web_require_auth(req)) {
-        return ESP_OK;
-    }
-    char *s = web_wificfg_get_json();
-    if (!s) {
-        web_respond_json(req, 400, "{\"error\":\"oom\"}");
-        return ESP_OK;
-    }
-    httpd_resp_set_type(req, "application/json");
-    httpd_resp_sendstr(req, s);
-    free(s);
-    return ESP_OK;
 }
 
 /* Apply a WiFi configuration from a JSON body and schedule a restart.
@@ -204,51 +192,5 @@ esp_err_t web_wificfg_set(cJSON *root, const char **err)
     }
 
     schedule_restart();
-    return ESP_OK;
-}
-
-/* POST /api/wificfg -> save config, respond, restart */
-static esp_err_t wificfg_post_handler(httpd_req_t *req)
-{
-    if (!web_require_auth(req)) {
-        return ESP_OK;
-    }
-    char *body = web_httpd_read_body(req);
-    if (!body) {
-        web_respond_json(req, 400, "{\"error\":\"bad body\"}");
-        return ESP_OK;
-    }
-    cJSON *root = cJSON_Parse(body);
-    free(body);
-    if (!root) {
-        web_respond_json(req, 400, "{\"error\":\"bad json\"}");
-        return ESP_OK;
-    }
-
-    const char *err = NULL;
-    esp_err_t ret = web_wificfg_set(root, &err);
-    cJSON_Delete(root);
-    if (ret == ESP_OK) {
-        web_respond_json(req, 200, "{\"ok\":true,\"restart\":true}");
-    } else {
-        char buf[64];
-        snprintf(buf, sizeof(buf), "{\"error\":\"%s\"}", err ? err : "invalid");
-        web_respond_json(req, 400, buf);
-    }
-    return ESP_OK;
-}
-
-esp_err_t web_api_wifi_register(httpd_handle_t server)
-{
-    static const httpd_uri_t uris[] = {
-        {.uri = "/api/wificfg", .method = HTTP_GET,  .handler = wificfg_get_handler},
-        {.uri = "/api/wificfg", .method = HTTP_POST, .handler = wificfg_post_handler},
-    };
-    for (size_t i = 0; i < sizeof(uris) / sizeof(uris[0]); i++) {
-        if (httpd_register_uri_handler(server, &uris[i]) != ESP_OK) {
-            ESP_LOGE(TAG, "Failed to register URI %s", uris[i].uri);
-            return ESP_FAIL;
-        }
-    }
     return ESP_OK;
 }

@@ -1,28 +1,23 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-api-demo.py - esp32c3-ir-web API 演示脚本
+api-demo.py - esp32c3-ir-web 演示脚本（WebSocket-only，无 REST API）
 
-REST 流程：
-  1. POST /api/login 登录，获取 session token
-  2. GET  /api/status 验证 token 有效（打印设备状态）
-  3. POST /api/play 发送 NEC hxd（默认 ED127F80，载波 38000 Hz）
-
-可选（--ws）：发送后连接 /api/ws，演示 WebSocket 推送协议：
-  - 发送 {"type":"auth","token":...} 认证
-  - 收到 {"type":"status","id":N,...} 后回发 {"type":"ack","id":N} 确认抄收
-  - 打印 status / frame 推送，默认监听 5 秒
-
-可选（--via-ws）：改为通过 WebSocket 命令通道发送红外（优先 WS）：
-  登录后连接 /api/ws 认证，依次发送 {"type":"cmd","id":N,"cmd":...} 命令：
-  status -> play -> 观察推送 -> logout；演示命令 RPC 协议与鉴权
+流程（全部走 ws://<host>/api/ws）：
+  1. 连接 /api/ws，发送 {"type":"login","user":"...","pass":"..."} 登录
+     （REST /api/login 已移除，登录是 WS 上唯一无需 token 的操作；
+     成功后该连接即为已认证会话）
+  2. 通过命令通道执行 status / play：
+     发送 {"type":"cmd","id":N,"cmd":cmd,"body":{...}}
+     收到 {"type":"resp","id":N,"ok":true,"data":{...}}
+  3. 监听 status / frame 推送（收到 status 需回 ack）
+  4. 通过 logout 命令退出（服务端回复后关闭连接）
 
 用法示例：
   python api-demo.py                                  # 默认连 192.168.4.1，admin/admin
   python api-demo.py --host 192.168.1.50 --user admin --password xxxx
   python api-demo.py --hxd ED127F80 --freq 38000
-  python api-demo.py --ws --listen 8                  # 发完信号后观察 WS 推送并 ack
-  python api-demo.py --via-ws --listen 5              # 走 WS 命令通道发送红外并观察推送
+  python api-demo.py --listen 8                       # 发完信号后观察 WS 推送并 ack
   python api-demo.py --raw "Frequency: 38000 Hz
 
 9000, 4500, 560, 560, 1690"
@@ -38,62 +33,6 @@ import socket
 import struct
 import sys
 import time
-import urllib.error
-import urllib.request
-
-
-def http_json(method, url, token=None, body=None, timeout=10):
-    """发起 HTTP JSON 请求，返回 (status, dict)。"""
-    req = urllib.request.Request(url, method=method)
-    req.add_header("Content-Type", "application/json")
-    if token:
-        req.add_header("X-Auth-Token", token)
-    data = json.dumps(body).encode("utf-8") if body is not None else None
-    try:
-        with urllib.request.urlopen(req, data=data, timeout=timeout) as resp:
-            raw = resp.read().decode("utf-8") or "{}"
-            return resp.status, json.loads(raw)
-    except urllib.error.HTTPError as e:
-        try:
-            detail = json.loads(e.read().decode("utf-8") or "{}")
-        except Exception:
-            detail = {}
-        return e.code, detail
-    except urllib.error.URLError as e:
-        print(f"[x] 无法连接设备: {e.reason}")
-        sys.exit(1)
-
-
-def login(base, user, password):
-    print(f"[*] 登录 {base}/api/login (user={user}) ...")
-    status, d = http_json("POST", base + "/api/login",
-                          body={"user": user, "pass": password})
-    if status == 200 and d.get("token"):
-        if d.get("must_change_pwd"):
-            print("[!] 注意：设备仍在使用默认凭据，Web 页面会强制要求修改密码")
-        print("[+] 登录成功，已获取 token")
-        return d["token"]
-    if status == 429:
-        print(f"[x] 登录被限速，请 {d.get('retry_after', 30)} 秒后再试")
-    elif status == 401:
-        print("[x] 用户名或密码错误")
-    else:
-        print(f"[x] 登录失败 HTTP {status}: {d}")
-    sys.exit(1)
-
-
-def show_status(base, token):
-    status, d = http_json("GET", base + "/api/status", token=token)
-    if status != 200:
-        print(f"[x] 获取状态失败 HTTP {status}: {d}")
-        sys.exit(1)
-    mode = d.get("mode", "?")
-    ips = []
-    if d.get("ap_ip"):
-        ips.append(f"AP {d.get('ap_ssid', '')} {d['ap_ip']}")
-    if d.get("sta_ip"):
-        ips.append(f"STA {d.get('sta_ssid', '')} {d['sta_ip']}")
-    print(f"[*] 设备状态: 模式={mode}" + (f", {' / '.join(ips)}" if ips else ""))
 
 
 def parse_raw_text(text):
@@ -110,16 +49,6 @@ def parse_raw_text(text):
             if v.isdigit():
                 nums.append(int(v))
     return freq, nums
-
-
-def send_play(base, token, payload):
-    print(f"[*] 发送 /api/play: {json.dumps(payload, ensure_ascii=False)}")
-    status, d = http_json("POST", base + "/api/play", token=token, body=payload)
-    if status == 200 and d.get("ok"):
-        print("[+] 回放请求已接受")
-    else:
-        print(f"[x] 回放失败 HTTP {status}: {d}")
-        sys.exit(1)
 
 
 # ---------------- WebSocket 客户端（纯标准库） ----------------
@@ -200,10 +129,24 @@ def ws_send_close(sock, code=1000):
     sock.sendall(bytes(header) + mask + masked)
 
 
-# ---------------- WebSocket 命令 RPC（/api/ws 命令通道） ----------------
+def ws_recv_frame(sock):
+    """接收一个完整的服务器帧（服务器帧不掩码），返回 (opcode, payload)。"""
+    b1, b2 = _recv_exact(sock, 2)
+    opcode = b1 & 0x0F
+    length = b2 & 0x7F
+    if length == 126:
+        length = struct.unpack(">H", _recv_exact(sock, 2))[0]
+    elif length == 127:
+        length = struct.unpack(">Q", _recv_exact(sock, 8))[0]
+    mask = _recv_exact(sock, 4) if (b2 & 0x80) else None
+    payload = _recv_exact(sock, length)
+    if mask:
+        payload = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+    return opcode, payload
+
 
 def ws_call(sock, msg, timeout=10):
-    """发送一条 WS 消息并读取下一条响应消息（用于 auth 这类无 id 的应答）。"""
+    """发送一条 WS 消息并读取下一条响应消息（用于 login 这类无 id 的应答）。"""
     ws_send_text(sock, json.dumps(msg))
     sock.settimeout(timeout)
     while True:
@@ -253,58 +196,66 @@ def ws_rpc(sock, cmd, body=None, timeout=10):
             if msg.get("ok"):
                 return msg.get("data", {})
             raise RuntimeError(msg.get("error", "命令失败"))
-        # 其他类型（status/frame 推送）直接跳过
+        # 其他类型（login/status/frame 推送）直接跳过
     raise TimeoutError(f"WS 命令 {cmd} 超时")
 
 
-def ws_command_demo(host, port, token, payload, listen_secs):
-    """连接 /api/ws 认证后，通过命令通道完成 status -> play -> 观察推送 -> logout。"""
-    print(f"[*] 连接 ws://{host}:{port}/api/ws 并认证 ...")
+def ws_only_demo(host, port, user, password, payload, listen_secs):
+    """纯 WS 流程：login -> status -> play -> 监听推送 -> logout。"""
+    print(f"[*] 连接 ws://{host}:{port}/api/ws 并登录 ...")
     sock = ws_connect(host, port)
     try:
-        r = ws_call(sock, {"type": "auth", "token": token})
+        r = ws_call(sock, {"type": "login", "user": user, "pass": password})
         if not r.get("ok"):
-            print(f"[x] WS 认证失败: {r.get('error')}")
+            err = r.get("error", "unknown")
+            if err == "too many attempts":
+                print(f"[x] 登录被限速，请 {r.get('retry_after', 30)} 秒后再试")
+            else:
+                print(f"[x] WS 登录失败: {err}")
             return
-        print("[+] WS 认证成功")
+        token = r.get("token", "")
+        if r.get("must_change_pwd"):
+            print("[!] 注意：设备仍在使用默认凭据，Web 页面会强制要求修改密码")
+        print(f"[+] WS 登录成功，token={token[:8]}...")
 
         st = ws_rpc(sock, "status")
-        print(f"[*] WS status: 模式={st.get('mode')} STA={st.get('sta_ip') or '-'} "
-              f"载波={st.get('carrier_hz')}Hz")
+        print(f"[*] WS status: 模式={st.get('mode')} "
+              f"STA={st.get('sta_ip') or '-'} 载波={st.get('carrier_hz')}Hz")
 
         print(f"[*] WS play: {json.dumps(payload, ensure_ascii=False)}")
         ws_rpc(sock, "play", payload)
         print("[+] WS 回放命令已接受")
 
-        print(f"[*] 监听推送 {listen_secs} 秒（Ctrl+C 结束）...")
-        sock.settimeout(1.0)
-        deadline = time.time() + listen_secs
-        while time.time() < deadline:
-            try:
-                opcode, frame_payload = ws_recv_frame(sock)
-            except socket.timeout:
-                continue
-            except (ConnectionError, OSError) as e:
-                print(f"[*] 连接已断开: {e}")
-                break
-            if opcode == 0x8:
-                print("[*] 服务端发送 CLOSE")
-                break
-            if opcode != 0x1:
-                continue
-            try:
-                msg = json.loads(frame_payload.decode("utf-8"))
-            except Exception:
-                continue
-            t = msg.get("type")
-            if t == "status":
-                sid = msg.get("id")
-                print(f"[*] WS status id={sid}: "
-                      f"播放={'是' if msg.get('data', {}).get('playing') else '否'}")
-                if sid is not None:
-                    ws_send_text(sock, json.dumps({"type": "ack", "id": sid}))
-            elif t == "frame":
-                print(f"[*] WS frame seq={msg.get('data', {}).get('seq')}")
+        if listen_secs > 0:
+            print(f"[*] 监听推送 {listen_secs} 秒（Ctrl+C 结束）...")
+            sock.settimeout(1.0)
+            deadline = time.time() + listen_secs
+            while time.time() < deadline:
+                try:
+                    opcode, frame_payload = ws_recv_frame(sock)
+                except socket.timeout:
+                    continue
+                except (ConnectionError, OSError) as e:
+                    print(f"[*] 连接已断开: {e}")
+                    break
+                if opcode == 0x8:
+                    print("[*] 服务端发送 CLOSE")
+                    break
+                if opcode != 0x1:
+                    continue
+                try:
+                    msg = json.loads(frame_payload.decode("utf-8"))
+                except Exception:
+                    continue
+                t = msg.get("type")
+                if t == "status":
+                    sid = msg.get("id")
+                    print(f"[*] WS status id={sid}: "
+                          f"播放={'是' if msg.get('data', {}).get('playing') else '否'}")
+                    if sid is not None:
+                        ws_send_text(sock, json.dumps({"type": "ack", "id": sid}))
+                elif t == "frame":
+                    print(f"[*] WS frame seq={msg.get('data', {}).get('seq')}")
 
         print("[*] WS logout（响应后服务端关闭连接）...")
         try:
@@ -313,96 +264,17 @@ def ws_command_demo(host, port, token, payload, listen_secs):
         except (RuntimeError, TimeoutError, ConnectionError, OSError) as e:
             print(f"[*] logout 后连接关闭: {e}")
     except (RuntimeError, TimeoutError, ConnectionError, OSError) as e:
-        print(f"[x] WS 命令失败: {e}")
+        print(f"[x] WS 失败: {e}")
     finally:
         try:
             ws_send_close(sock)
-        except OSError:
-            pass
-        sock.close()
-
-
-def ws_recv_frame(sock):
-    """接收一个完整的服务器帧（服务器帧不掩码），返回 (opcode, payload)。"""
-    b1, b2 = _recv_exact(sock, 2)
-    opcode = b1 & 0x0F
-    length = b2 & 0x7F
-    if length == 126:
-        length = struct.unpack(">H", _recv_exact(sock, 2))[0]
-    elif length == 127:
-        length = struct.unpack(">Q", _recv_exact(sock, 8))[0]
-    mask = _recv_exact(sock, 4) if (b2 & 0x80) else None
-    payload = _recv_exact(sock, length)
-    if mask:
-        payload = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
-    return opcode, payload
-
-
-def ws_demo(host, port, token, listen_secs):
-    """连接 /api/ws，认证后监听推送，收到 status 回 ack。"""
-    print(f"[*] 连接 ws://{host}:{port}/api/ws ...")
-    sock = ws_connect(host, port)
-    try:
-        ws_send_text(sock, json.dumps({"type": "auth", "token": token}))
-        print("[*] 已发送认证消息，等待推送（Ctrl+C 结束）...")
-        sock.settimeout(1.0)
-        deadline = time.time() + listen_secs
-        while time.time() < deadline:
-            try:
-                opcode, payload = ws_recv_frame(sock)
-            except socket.timeout:
-                continue
-            except (ConnectionError, OSError) as e:
-                print(f"[*] 连接已断开: {e}")
-                break
-            if opcode == 0x8:  # CLOSE
-                print("[*] 服务端发送 CLOSE")
-                break
-            if opcode != 0x1:  # 只处理文本帧
-                continue
-            try:
-                msg = json.loads(payload.decode("utf-8"))
-            except Exception:
-                continue
-            t = msg.get("type")
-            if t == "auth":
-                if msg.get("ok"):
-                    print("[*] WS 认证成功")
-                else:
-                    print(f"[x] WS 认证失败: {msg.get('error')}")
-                    break
-            elif t == "status":
-                sid = msg.get("id")
-                data = msg.get("data", {})
-                print(f"[*] WS status id={sid}: 模式={data.get('mode')} "
-                      f"STA={data.get('sta_ip') or '-'} "
-                      f"载波={data.get('carrier_hz')}Hz "
-                      f"播放={'是' if data.get('playing') else '否'}")
-                if sid is not None:
-                    ws_send_text(sock, json.dumps({"type": "ack", "id": sid}))
-            elif t == "frame":
-                print(f"[*] WS frame seq={msg.get('data', {}).get('seq')}")
-    except KeyboardInterrupt:
-        print("\n[*] 用户中断")
-    finally:
-        try:
-            # 标准断开：先发 CLOSE，等服务端回复后再关 TCP
-            ws_send_close(sock)
-            sock.settimeout(1.0)
-            try:
-                while True:
-                    opcode, _ = ws_recv_frame(sock)
-                    if opcode == 0x8:
-                        break
-            except (socket.timeout, ConnectionError, OSError):
-                pass
         except OSError:
             pass
         sock.close()
 
 
 def main():
-    parser = argparse.ArgumentParser(description="esp32c3-ir-web API 演示（登录 + 发送红外 + WS 推送）")
+    parser = argparse.ArgumentParser(description="esp32c3-ir-web 演示（WS 登录 + 发送红外 + WS 推送，无 REST）")
     parser.add_argument("--host", default="192.168.4.1", help="设备地址（默认 192.168.4.1）")
     parser.add_argument("--port", type=int, default=80, help="HTTP 端口（默认 80）")
     parser.add_argument("--user", default="admin", help="登录用户名（默认 admin）")
@@ -411,20 +283,13 @@ def main():
     parser.add_argument("--freq", type=int, default=38000, help="载波频率 Hz（默认 38000）")
     parser.add_argument("--raw", default=None,
                         help="原始数据文本（Frequency: ... 行 + 逗号序列），与 --hxd 二选一，优先于 --hxd")
-    parser.add_argument("--ws", action="store_true", help="发送后连接 WebSocket 演示推送与 ack")
-    parser.add_argument("--via-ws", action="store_true",
-                        help="改为通过 WebSocket 命令通道发送红外（优先 WS，演示命令 RPC）")
-    parser.add_argument("--listen", type=int, default=5, help="--ws/--via-ws 模式下监听秒数（默认 5）")
-    parser.add_argument("--timeout", type=int, default=10, help="HTTP 超时秒数（默认 10）")
+    parser.add_argument("--listen", type=int, default=5, help="发完信号后监听推送秒数（默认 5，0 = 不监听）")
+    parser.add_argument("--timeout", type=int, default=10, help="WS 超时秒数（默认 10）")
     args = parser.parse_args()
 
     host = args.host
     if host.startswith("http://"):
         host = host[len("http://"):]
-    base = f"http://{host}:{args.port}"
-
-    token = login(base, args.user, args.password)
-    show_status(base, token)
 
     if args.raw is not None:
         freq, nums = parse_raw_text(args.raw)
@@ -438,12 +303,7 @@ def main():
             sys.exit(1)
         payload = {"type": "hxd", "value": args.hxd.upper(), "freq": args.freq}
 
-    if args.via_ws:
-        ws_command_demo(host, args.port, token, payload, args.listen)
-    else:
-        send_play(base, token, payload)
-        if args.ws:
-            ws_demo(host, args.port, token, args.listen)
+    ws_only_demo(host, args.port, args.user, args.password, payload, args.listen)
     print("[+] 完成")
 
 
