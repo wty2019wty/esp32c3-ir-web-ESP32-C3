@@ -66,6 +66,7 @@ idf.py menuconfig   # → "IR Web Tool Configuration"
 |SoftAP max connections|4|热点最大连接数|
 |Station SSID / password|空|连接的路由器凭据（Web 设置页修改；非空则自动切 STA 模式）|
 |STA timeout|10000 ms|STA 连接超时后降级为 SoftAP|
+|Max STA TX power|15 dBm|STA 最大发射功率（部分 C3 板默认 20 dBm 开放认证失败，调低可稳定连接）|
 |DHCP hostname|ir-web|路由器客户端列表中显示的主机名|
 |HTTP port|80|Web 服务端口|
 |History depth|8|RAM 历史帧条数（每帧约 4.2KB，8 帧 ≈ 34KB）|
@@ -159,9 +160,10 @@ idf.py menuconfig   # → "IR Web Tool Configuration"
       `last_seq` 为实际返回的最后一帧，客户端应使用该 `last_seq` 继续拉取直至追平
     - `wificfg`：body 含配置字段 = 保存并重启（`{"restart":true}`）；body 为空 = 读取
       （密码不回显，`ap_password_set`/`sta_password_set` 标志；密码传 `null` 表示不修改、空字符串表示清除）
-    - `authcfg`：body 含 `user`/`pass` = 修改凭据（保存后会话失效需重新登录）；
-      含 `single_session`（bool）= 设置"单设备登录"开关（默认开启）；body 为空 = 读取
-      （`{"user":...,"single_session":bool}`）
+    - `authcfg`：body 含 `user`/`pass`/`single_session` 任一字段 = 保存设置，body 为空 = 读取
+      （`{"user":...,"single_session":bool}`）。是否"变更"由服务端与已保存值比较判定：
+      **只有 `user`/`pass` 实际发生变化才作废会话、需要重新登录**（前端会在改用户名后提示重登）；
+      重复提交相同值、或只切换 `single_session` 均不会踢掉当前会话
     - `renew`：续期会话（`{"expires_in":N}`）
     - `logout`：退出登录，响应后服务端关闭连接
     - `webcfg`：body 含 `web_ui`（bool）= 设置"启用内置 Web 界面"开关并重启
@@ -172,11 +174,13 @@ idf.py menuconfig   # → "IR Web Tool Configuration"
     未确认的客户端会每秒补发，直到确认或状态再次变化；
     **播放开始/结束时立即推送**（不依赖每秒采样，避免短暂的"播放中"状态被漏掉）
   - `{"type":"frame","data":{...}}` —— 收到新红外信号时立即推送（单帧对象，同 `frames` 中元素）
-  - 前端在认证成功后主动请求一次 `status` 与 `frames`（多段拉取直至追平）完成初始同步；
-    连接断开时前端自动重连（10 秒间隔）并重新登录/认证。
+- 前端在认证成功后主动请求一次 `status` 与 `frames`（多段拉取直至追平，最多重试 8 次）
+  完成初始同步；连接断开时前端自动重连（10 秒间隔）并重新登录/认证。
 - **连接保活**：即使状态无变化，服务端也**每 20 秒**推送一次 status 心跳，
   让空闲连接穿过家用路由器/AP 的 NAT 会话回收（此前常表现为 `104 ECONNRESET` 掉线）；
-  前端另有**假死看门狗**：45 秒内未收到任何服务器消息（心跳/推送/响应）即主动重连。
+  前端另有**假死看门狗**：45 秒内未收到任何服务器消息（心跳/推送/响应）即主动重连，
+  并**每 15 秒**主动拉取一次 `status` 校验连接存活、刷新界面（被动推送无法区分
+  "连接静默死亡"与"设备确实无变化"）。
 - **并发安全与背压**：所有服务端→客户端帧都在 httpd 任务内**串行发送**（经
   `httpd_ws_send_data_async` 入队），避免多任务并发写同一 socket 造成字节交错、
   客户端解析出 "Invalid frame header"。每连接发送队列有上限（约 4 帧），
@@ -196,9 +200,11 @@ idf.py menuconfig   # → "IR Web Tool Configuration"
 Content-Security-Policy 已放行任意 `ws:`/`wss:` 源（`connect-src 'self' ws: wss:`），
 WebSocket 不受 CORS 限制，因此从任意域名加载页面都能连接设备。此时：
 
-- 页面加载后不会自动连接，**登录框内需先手动填写设备地址**（支持
+- 页面加载后只会连接 **localStorage 中保存的设备地址**（无保存值时按当前页面域名，
+  对分离部署而言通常是无效地址、连接失败后每 10 秒重试）；因此首次使用时
+  **登录框内需先手动填写设备地址**（支持
   `ws://192.168.0.145:80`、`wss://ir.example.com` 或省略协议只填 `host:port`，
-  HTTPS 页面下省略协议默认 `wss://`）；地址保存在浏览器 localStorage，下次自动填入。
+  HTTPS 页面下省略协议默认 `wss://`）；地址保存在浏览器 localStorage，下次自动填入并自动连接。
 - 若设备关闭了"启用内置 Web 界面"（`webcfg` 的 `web_ui=false`），`/` 与 `/index.html` 返回 404，
   外部前端仍可通过 `/api/ws` 完整控制（登录、命令、推送）。
 - **HTTPS 页面必须用 `wss://`**：HTTPS（如 CF Pages 的 `*.pages.dev`）页面里连接明文
@@ -272,8 +278,10 @@ HTTPS 页面下浏览器会使用 `wss://`；若反代未转发 Upgrade 头，We
 ```text
 esp32c3-IR/
 ├── CMakeLists.txt
-├── sdkconfig.defaults        # esp32c3 / 4MB flash / 自定义分区
+├── sdkconfig.defaults        # esp32c3 / 4MB flash / 自定义分区 / NVS 加密 / WS 支持
 ├── partitions.csv            # nvs + phy_init + factory（约 3.9MB app 区）
+├── api-demo.py               # Python 示例脚本：WS 登录 + 回放/监听（WebSocket-only）
+├── .github/workflows/        # deploy-pages.yml：前端部署到 CF Pages
 └── main/
     ├── CMakeLists.txt        # EMBED_TXTFILES 内嵌 index.html
     ├── idf_component.yml     # 依赖 espressif/cjson
@@ -283,7 +291,7 @@ esp32c3-IR/
     ├── app_ir_nec.c          # NEC 协议解码
     ├── app_ir_play.c         # hxd/raw 回放编码
     ├── app_ir_store.c        # 帧存储 + 历史环形缓冲 + 回调
-    ├── app_wifi.c            # AP/STA/APSTA 三模式 + 超时降级
+    ├── app_wifi.c            # AP/STA 互斥 + 超时降级
     ├── app_web.c             # HTTP server 初始化（仅静态页面 + WS 端点）
     ├── app_web_api_ir.c      # IR 命令核心（play/carrier/rxpause，WS-only）
     ├── app_web_api_wifi.c    # WiFi 配置核心（wificfg 读写，WS-only）
@@ -292,6 +300,7 @@ esp32c3-IR/
     ├── app_web_ws.c          # WebSocket /api/ws：登录认证、命令 RPC、推送（串行发送 + 心跳）
     ├── app_web_util.c        # JSON 序列化 + HTTP 工具函数
     ├── web/index.html        # 前端单页（内嵌，无需文件系统）
+    ├── web/run.bat           # 本地静态服务器（python -m http.server 80），前后端分离调试用
     └── include/              # 各模块头文件
 ```
 
