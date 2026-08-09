@@ -27,10 +27,10 @@
 
 ## 硬件连接
 
-| 功能 | GPIO | 说明 |
-|------|------|------|
-| IR 接收 | GPIO4 | VS1838B OUT（解调后基带信号，空闲为高电平） |
-| IR 发射 | GPIO3 | 需外接三极管驱动红外发光二极管 |
+|功能|GPIO|说明|
+|----|----|----|
+|IR 接收|GPIO4|VS1838B OUT（解调后基带信号，空闲为高电平）|
+|IR 发射|GPIO3|需外接三极管驱动红外发光二极管|
 
 所有引脚可在 `idf.py menuconfig` → "IR Web Tool Configuration" 中修改。
 
@@ -55,22 +55,22 @@ idf.py -p <PORT> flash monitor   # 例如 -p COM7
 idf.py menuconfig   # → "IR Web Tool Configuration"
 ```
 
-| 配置项 | 默认值 | 说明 |
-|--------|--------|------|
-| IR receiver GPIO | 4 | VS1838B OUT |
-| IR transmitter GPIO | 3 | 三极管驱动 IR LED |
-| Default IR carrier | 38000 Hz | 初始载波，Web 可改并持久化 |
-| Carrier duty cycle | 33% | 载波占空比 |
-| SoftAP SSID / password | ESP32C3-IR / 空 | 热点名称/密码（空 = 开放网络；可在 Web 设置页修改） |
-| SoftAP channel | 1 | 热点信道 |
-| SoftAP max connections | 4 | 热点最大连接数 |
-| Station SSID / password | 空 | 连接的路由器凭据（Web 设置页修改；非空则自动切 STA 模式） |
-| STA timeout | 10000 ms | STA 连接超时后降级为 SoftAP |
-| DHCP hostname | ir-web | 路由器客户端列表中显示的主机名 |
-| HTTP port | 80 | Web 服务端口 |
-| History depth | 8 | RAM 历史帧条数（每帧约 4.2KB，8 帧 ≈ 34KB） |
-| Max RX segments | 1024 | 每帧最大交替段数（空调协议常超 300 段） |
-| Max TX symbols | 2048 | 原始数据回放的最大 RMT 符号数 |
+|配置项|默认值|说明|
+|------|------|----|
+|IR receiver GPIO|4|VS1838B OUT|
+|IR transmitter GPIO|3|三极管驱动 IR LED|
+|Default IR carrier|38000 Hz|初始载波，Web 可改并持久化|
+|Carrier duty cycle|33%|载波占空比|
+|SoftAP SSID / password|ESP32C3-IR / 空|热点名称/密码（空 = 开放网络；可在 Web 设置页修改）|
+|SoftAP channel|1|热点信道|
+|SoftAP max connections|4|热点最大连接数|
+|Station SSID / password|空|连接的路由器凭据（Web 设置页修改；非空则自动切 STA 模式）|
+|STA timeout|10000 ms|STA 连接超时后降级为 SoftAP|
+|DHCP hostname|ir-web|路由器客户端列表中显示的主机名|
+|HTTP port|80|Web 服务端口|
+|History depth|8|RAM 历史帧条数（每帧约 4.2KB，8 帧 ≈ 34KB）|
+|Max RX segments|1024|每帧最大交替段数（空调协议常超 300 段）|
+|Max TX symbols|2048|原始数据回放的最大 RMT 符号数|
 
 > 工作模式自动互斥：配置了 STA SSID 则设备只连接路由器（不开热点）；STA SSID 为空则只开热点。
 > 两者不会同时开启。
@@ -213,11 +213,14 @@ WebSocket 不受 CORS 限制，因此从任意域名加载页面都能连接设�
 2. 给设备套 **Cloudflare Tunnel**，把设备的 `/api/ws` 暴露成 `wss://ir.example.com/api/ws`
    （Tunnel 自动带 HTTPS，无需 VPS/证书）：
    - 在局域网一台常开主机（树莓派/NAS）安装并登录 `cloudflared`：
+
      ```bash
      cloudflared tunnel create ir-web
      cloudflared tunnel route dns ir-web ir.example.com
      ```
+
    - 配置文件 `~/.cloudflared/config.yml`：
+
      ```yaml
      tunnel: ir-web
      credentials-file: /root/.cloudflared/<tunnel-id>.json
@@ -227,6 +230,7 @@ WebSocket 不受 CORS 限制，因此从任意域名加载页面都能连接设�
          service: http://192.168.0.145:80
        - service: http_status:404
      ```
+
    - 运行 `cloudflared tunnel run ir-web`。注意：Tunnel 到设备这一段是局域网明文 HTTP，
      登录凭据/token 会在 `ir.example.com` 与设备之间以明文传输，建议只允许 cloudflared
      主机访问设备（同一可信网段），并在 Cloudflare Access 上给该域名加访问策略。
@@ -265,7 +269,7 @@ HTTPS 页面下浏览器会使用 `wss://`；若反代未转发 Upgrade 头，We
 
 ## 工程结构
 
-```
+```text
 esp32c3-IR/
 ├── CMakeLists.txt
 ├── sdkconfig.defaults        # esp32c3 / 4MB flash / 自定义分区
