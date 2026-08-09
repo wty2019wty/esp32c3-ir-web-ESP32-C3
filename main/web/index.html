@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src 'self' data:; connect-src 'self' ws: wss:; object-src 'none'; base-uri 'self'; form-action 'self'">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ccircle cx='8' cy='8' r='7' fill='%232f6fed'/%3E%3C/svg%3E">
 <title>IR-web 红外监视器</title>
 <style>
@@ -37,6 +37,8 @@
   .badge.ap { background: #1f5c2e; color: #7ee08a; }
   .badge.sta { background: #1f4a6e; color: #7ec4e0; }
   .badge.off { background: #5c1f1f; color: #e07e7e; }
+  .badge.ws { background: #1f4a6e; color: #7ec4e0; }
+  .badge.con { background: #3a3f4a; color: #9aa3b3; }
   .tabbtn { background: #232936; color: #d7dae0; border: 1px solid #2a2f3a; }
   .tabbtn.active { background: #2f6fed; color: #fff; border-color: #2f6fed; }
   .formgrid { display: grid; grid-template-columns: 190px 1fr; gap: 9px 12px; align-items: center; }
@@ -61,7 +63,7 @@
 </style>
 </head>
 <body>
-<h1>esp32c3-ir-web 红外信号监视器</h1>
+<h1>IR-web 红外信号监视器 <span id="chanBadge" class="badge con">连接中...</span></h1>
 
 <div class="row" style="margin-bottom: 12px;">
   <button id="tabMonBtn" class="tabbtn active" onclick="showTab('mon')">实时监视</button>
@@ -181,6 +183,24 @@
   </div>
 
   <div class="card">
+    <h2>服务模式</h2>
+    <div style="font-size:12px; color:#8a93a3; margin-bottom:10px;">
+      取消勾选后，设备重启将<b style="color:#ffd479;">停止提供内置 Web 页面</b>，
+      只保留 <span class="mono">ws://&lt;IP&gt;/api/ws</span> 供外部前端连接
+      （前后端分离场景）。保存后设备 2 秒自动重启生效，请用外部前端继续访问。
+    </div>
+    <div class="row">
+      <label style="display:flex;align-items:center;gap:8px;cursor:pointer;">
+        <input type="checkbox" id="cfgWebUi"> 启用内置 Web 界面
+      </label>
+    </div>
+    <div class="row" style="margin-top:12px;">
+      <button onclick="saveWebUi()">保存并重启</button>
+      <span id="webUiStatus"></span>
+    </div>
+  </div>
+
+  <div class="card">
     <h2>Web 登录</h2>
     <div style="font-size:12px; color:#8a93a3; margin-bottom:10px;">默认 admin / admin，首次登录会强制修改。修改后需用新账号重新登录。</div>
     <div class="formgrid">
@@ -201,7 +221,10 @@
 <div id="loginOverlay">
   <div class="card">
     <h2>登录</h2>
-    <div style="font-size:12px; color:#8a93a3; margin-bottom:10px;">默认账号 admin / admin，首次登录将强制修改密码。</div>
+    <div style="font-size:12px; color:#8a93a3; margin-bottom:10px;">默认账号 admin / admin，首次登录将强制修改密码。<br>
+      请先填写设备 WebSocket 地址（支持 ws:// 或 wss://），再输入账号密码连接。</div>
+    <input type="text" id="wsInput" placeholder="ws://192.168.0.145:80 或 wss://ir.example.com" autocomplete="off"
+           onkeydown="if(event.key==='Enter')doLogin()">
     <input type="text" id="loginUser" placeholder="用户名" autocomplete="username">
     <input type="password" id="loginPass" placeholder="密码" autocomplete="current-password" onkeydown="if(event.key==='Enter')doLogin()">
     <button style="width:100%;" onclick="doLogin()">登录</button>
@@ -235,20 +258,45 @@ function esc(s) {
   return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
 
-/* ---- auth (token from /api/login, saved in sessionStorage) ---- */
+/* ---- auth (token via WS login, saved in sessionStorage) ---- */
 const TOKEN_TTL_MS = 24 * 60 * 60 * 1000;
 let auth = sessionStorage.getItem('auth') || '';
 let authExpires = Number(sessionStorage.getItem('authExpires') || 0);
 if (auth && !authExpires) authExpires = Date.now() + TOKEN_TTL_MS; /* sessions from older firmware */
-function authHeaders() { return auth ? { 'X-Auth-Token': auth } : {}; }
 function tokenAlive() { return auth && authExpires && Date.now() < authExpires; }
 function clearAuth() {
   auth = '';
   authExpires = 0;
+  wsReady = false;
+  setChan();
   sessionStorage.removeItem('auth');
   sessionStorage.removeItem('authExpires');
 }
-function showLogin() { $('loginOverlay').style.display = 'flex'; $('loginUser').focus(); }
+
+/* ---- device WebSocket address (front/back separation: page may be hosted
+ *      elsewhere than the device, so the user selects the ws(s) endpoint) ---- */
+let wsAddr = localStorage.getItem('wsAddr') || '';
+function defaultWsAddr() {
+  return (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host;
+}
+function parseWsAddr(raw) {
+  let s = String(raw || '').trim();
+  if (!s) return null;
+  if (!/^wss?:\/\//i.test(s)) s = (location.protocol === 'https:' ? 'wss://' : 'ws://') + s;
+  return s.replace(/\/+$/, '');
+}
+
+function showLogin() {
+  $('loginOverlay').style.display = 'flex';
+  if (!wsAddr) {
+    wsAddr = defaultWsAddr();
+    $('wsInput').value = wsAddr;
+    $('wsInput').focus();
+  } else {
+    $('wsInput').value = wsAddr;
+    $('loginUser').focus();
+  }
+}
 function hideLogin() { $('loginOverlay').style.display = 'none'; }
 function showPwdChange() {
   $('pwdOverlay').style.display = 'flex';
@@ -259,36 +307,35 @@ function showPwdChange() {
   $('pwdUser').focus();
 }
 
-async function doLogin() {
+/* Login over the WS command channel (REST /api/login is gone). The server
+ * replies with {"type":"login",...}; handled in wsConnect().onmessage. */
+let pendingLogin = null;
+
+function doLogin() {
   const u = $('loginUser').value;
   const p = $('loginPass').value;
+  const addr = parseWsAddr($('wsInput').value);
   if (!u) { $('loginMsg').textContent = '请输入用户名'; return; }
+  if (!addr) { $('loginMsg').textContent = '请填写设备 WebSocket 地址，如 ws://192.168.0.145:80'; return; }
+  localStorage.setItem('wsAddr', addr);
+  pendingLogin = { user: u, pass: p };
+  if (ws && ws.readyState === WebSocket.OPEN && wsAddr === addr) {
+    sendLogin();
+  } else {
+    wsAddr = addr;
+    closeSocket();
+    $('loginMsg').textContent = '正在连接 ' + addr + ' ...';
+    wsConnect();
+  }
+}
+
+function sendLogin() {
+  if (!pendingLogin || !ws || ws.readyState !== WebSocket.OPEN) return;
   try {
-    const r = await fetch('/api/login', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ user: u, pass: p })
-    });
-    const d = await r.json();
-    if (r.status === 200 && d.token) {
-      auth = d.token;
-      authExpires = Date.now() + (d.expires_in || 86400) * 1000;
-      sessionStorage.setItem('auth', auth);
-      sessionStorage.setItem('authExpires', String(authExpires));
-      $('loginMsg').textContent = '';
-      hideLogin();
-      if (d.must_change_pwd) {
-        showPwdChange();
-        return;
-      }
-      location.reload();
-    } else if (r.status === 429) {
-      $('loginMsg').textContent = '尝试次数过多，请 ' + (d.retry_after || 30) + ' 秒后再试';
-    } else {
-      $('loginMsg').textContent = '用户名或密码错误';
-    }
+    ws.send(JSON.stringify({ type: 'login', user: pendingLogin.user, pass: pendingLogin.pass }));
   } catch (e) {
-    $('loginMsg').textContent = '请求失败';
+    pendingLogin = null;
+    $('loginMsg').textContent = '发送失败';
   }
 }
 
@@ -300,12 +347,7 @@ async function saveForcedPwd() {
   if (p.length < 4) { $('pwdMsg').textContent = '密码至少 4 位'; return; }
   if (p !== p2) { $('pwdMsg').textContent = '两次输入的密码不一致'; return; }
   try {
-    const r = await fetch('/api/authcfg', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'X-Auth-Token': auth },
-      body: JSON.stringify({ user: u, pass: p })
-    });
-    const d = await r.json();
+    const d = await rpc('authcfg', { user: u, pass: p });
     if (d.ok) {
       clearAuth(); /* server invalidated the old token */
       $('loginUser').value = u;
@@ -317,33 +359,48 @@ async function saveForcedPwd() {
       $('pwdMsg').textContent = '保存失败：' + (d.error || '未知错误');
     }
   } catch (e) {
-    $('pwdMsg').textContent = '保存请求失败';
+    $('pwdMsg').textContent = '保存失败：' + ((e.payload && e.payload.error) || e.message || '请求失败');
   }
 }
 
 async function doLogout() {
   try {
-    await apiFetch('/api/logout', { method: 'POST' });
+    await rpc('logout');
   } catch (e) { /* token may already be invalid */ }
   clearAuth();
   location.reload();
 }
 
-async function apiFetch(url, opts) {
-  opts = opts || {};
+/* WebSocket command access — the only API surface (no REST). Commands are
+ * sent as {"type":"cmd","id":N,"cmd":cmd,"body":body}; the server replies with
+ * a matching {"type":"resp",...}. Rejects if the WS channel is not up. */
+function rpc(cmd, body) {
   if (!tokenAlive()) {
     clearAuth();
     showLogin();
-    throw new Error('unauthorized');
+    return Promise.reject(new Error('unauthorized'));
   }
-  opts.headers = Object.assign({}, opts.headers, authHeaders());
-  const r = await fetch(url, opts);
-  if (r.status === 401) {
-    clearAuth();
-    showLogin();
-    throw new Error('unauthorized');
+  if (!wsReady || !ws || ws.readyState !== WebSocket.OPEN) {
+    return Promise.reject(new Error('ws offline'));
   }
-  return r;
+  return new Promise((resolve, reject) => {
+    const id = ++wsCmdId;
+    const waiter = {
+      resolve, reject,
+      timer: setTimeout(() => {
+        wsCmdWaiters.delete(id);
+        reject(new Error('ws cmd timeout'));
+      }, WS_CMD_TIMEOUT_MS)
+    };
+    wsCmdWaiters.set(id, waiter);
+    try {
+      ws.send(JSON.stringify({ type: 'cmd', id, cmd, body: body || {} }));
+    } catch (e) {
+      clearTimeout(waiter.timer);
+      wsCmdWaiters.delete(id);
+      reject(e);
+    }
+  });
 }
 
 function scheduleRenew() {
@@ -351,13 +408,12 @@ function scheduleRenew() {
   setTimeout(async () => {
     if (!tokenAlive()) return;
     try {
-      const r = await apiFetch('/api/renew', { method: 'POST' });
-      if (r.status === 200) {
-        const d = await r.json();
-        authExpires = Date.now() + (d.expires_in || 86400) * 1000;
+      const d = await rpc('renew');
+      if (d && d.expires_in) {
+        authExpires = Date.now() + d.expires_in * 1000;
         sessionStorage.setItem('authExpires', String(authExpires));
       }
-    } catch (e) { /* 401 handled inside apiFetch */ }
+    } catch (e) { /* 401 handled inside rpc */ }
     scheduleRenew();
   }, delay);
 }
@@ -366,53 +422,157 @@ function scheduleRenew() {
 
 let ws = null;
 let wsRetryTimer = null;
-let pollTimers = [];
+let wsReady = false;      /* WS connected AND authenticated */
+let wsCmdId = 0;
+const wsCmdWaiters = new Map();
+const WS_CMD_TIMEOUT_MS = 6000;
 
-function stopPolling() {
-  if (!pollTimers.length) return;
-  pollTimers.forEach(clearInterval);
-  pollTimers = [];
-}
-
-function startPollingFallback() {
-  if (pollTimers.length) return;
-  refreshStatus();
-  pollFrames();
-  pollTimers.push(setInterval(pollFrames, 500));
-  pollTimers.push(setInterval(refreshStatus, 3000));
+/* Reflect the WS channel state in the header badge (WS is the only API
+ * channel now — no REST fallback). */
+function setChan() {
+  const b = $('chanBadge');
+  if (wsReady) {
+    b.className = 'badge ws';
+    b.textContent = 'WS实时';
+  } else if (ws && ws.readyState === WebSocket.OPEN) {
+    b.className = 'badge con';
+    b.textContent = 'WS认证中...';
+  } else if (ws && (ws.readyState === WebSocket.CONNECTING)) {
+    b.className = 'badge con';
+    b.textContent = 'WS连接中...';
+  } else {
+    b.className = 'badge off';
+    b.textContent = 'WS离线(重连中...)';
+  }
 }
 
 function scheduleWsRetry() {
-  if (!tokenAlive()) return;
   clearTimeout(wsRetryTimer);
   wsRetryTimer = setTimeout(wsConnect, 10000);
 }
 
-function wsConnect() {
-  if (!tokenAlive()) return;
+/* Tear down the current socket and pending command waiters. */
+function closeSocket() {
+  if (ws) {
+    clearInterval(ws.watchdog);
+    try { ws.close(); } catch (e) { /* ignored */ }
+    ws = null;
+  }
+  wsReady = false;
   clearTimeout(wsRetryTimer);
   wsRetryTimer = null;
+  wsCmdWaiters.forEach(w => { clearTimeout(w.timer); w.reject(new Error('ws closed')); });
+  wsCmdWaiters.clear();
+  setChan();
+}
+
+function wsUrl() {
+  const a = wsAddr || defaultWsAddr();
+  return a + '/api/ws';
+}
+
+/* Initial sync over WS after auth: current status + frame history backfill
+ * (frames may be truncated by the WS buffer; re-request with the returned
+ * last_seq until caught up). */
+async function wsSync() {
+  try {
+    applyStatus(await rpc('status'));
+  } catch (e) { /* the 1s status push will fill it in */ }
+  for (let i = 0; i < 8; i++) {
+    let d;
+    try {
+      d = await rpc('frames', { since: lastSeq });
+    } catch (e) {
+      break;
+    }
+    if (d.last_seq != null && d.last_seq > lastSeq) lastSeq = d.last_seq;
+    (d.frames || []).forEach(applyFrame);
+    if (!d.truncated) break;
+  }
+}
+
+function wsConnect() {
+  clearTimeout(wsRetryTimer);
+  wsRetryTimer = null;
+  if (ws && (ws.readyState === WebSocket.CONNECTING || ws.readyState === WebSocket.OPEN)) return;
   let s;
   try {
-    s = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/api/ws');
+    s = new WebSocket(wsUrl());
   } catch (e) {
     scheduleWsRetry();
     return;
   }
   ws = s;
+  s.lastMsgAt = Date.now();
+  /* watchdog: if the server goes silent (dead NAT hole, network drop that
+   * doesn't fire onclose), force a reconnect */
+  s.watchdog = setInterval(() => {
+    if (Date.now() - s.lastMsgAt > 45000) {
+      try { s.close(); } catch (e) { /* ignored */ }
+    }
+  }, 5000);
+  setChan();
   s.onopen = () => {
-    try { s.send(JSON.stringify({ type: 'auth', token: auth })); } catch (e) { /* ignored */ }
+    s.lastMsgAt = Date.now();
+    setChan();
+    if (pendingLogin) {
+      sendLogin(); /* user just submitted credentials on this connection */
+    } else if (tokenAlive()) {
+      /* existing session: authenticate with the stored token */
+      try { s.send(JSON.stringify({ type: 'auth', token: auth })); } catch (e) { /* ignored */ }
+    }
+    /* no token and no pending login: wait for the user to submit the form */
   };
   s.onmessage = (ev) => {
+    s.lastMsgAt = Date.now();
     let d;
     try { d = JSON.parse(ev.data); } catch (e) { return; }
-    if (d.type === 'auth') {
+    if (d.type === 'login') {
       if (d.ok === true) {
-        stopPolling();
+        auth = d.token;
+        authExpires = Date.now() + (d.expires_in || 86400) * 1000;
+        sessionStorage.setItem('auth', auth);
+        sessionStorage.setItem('authExpires', String(authExpires));
+        wsReady = true;
+        pendingLogin = null;
+        setChan();
+        $('loginMsg').textContent = '';
+        hideLogin();
+        if (d.must_change_pwd) {
+          showPwdChange();
+          return;
+        }
+        wsSync();
+        scheduleRenew();
+      } else {
+        const msg = d.error === 'too many attempts'
+          ? ('尝试次数过多，请 ' + (d.retry_after || 30) + ' 秒后再试')
+          : (d.error === 'bad login' ? '登录信息不完整' : '用户名或密码错误');
+        pendingLogin = null;
+        $('loginMsg').textContent = msg;
+      }
+    } else if (d.type === 'auth') {
+      if (d.ok === true) {
+        wsReady = true;
+        setChan();
+        wsSync();
       } else if (d.ok === false) {
         clearAuth();
         showLogin();
         try { s.close(); } catch (e) { /* ignored */ }
+      }
+    } else if (d.type === 'resp') {
+      const w = wsCmdWaiters.get(d.id);
+      if (!w) return;
+      clearTimeout(w.timer);
+      wsCmdWaiters.delete(d.id);
+      if (d.ok) {
+        w.resolve(Object.assign({ ok: true }, d.data || {}));
+      } else {
+        const e = new Error(d.error || 'failed');
+        e.status = 400;
+        e.payload = d;
+        w.reject(e);
       }
     } else if (d.type === 'status' && d.data) {
       applyStatus(d.data);
@@ -424,11 +584,18 @@ function wsConnect() {
     }
   };
   s.onclose = () => {
+    clearInterval(s.watchdog);
     ws = null;
-    if (tokenAlive()) {
-      startPollingFallback();
-      scheduleWsRetry();
-    }
+    wsReady = false;
+    pendingLogin = null;
+    setChan();
+    /* reject any in-flight WS commands so callers don't hang forever */
+    wsCmdWaiters.forEach(w => {
+      clearTimeout(w.timer);
+      w.reject(new Error('ws closed'));
+    });
+    wsCmdWaiters.clear();
+    scheduleWsRetry(); /* reconnect whether logged in or not (login needs WS too) */
   };
   s.onerror = () => { try { s.close(); } catch (e) { /* ignored */ } };
 }
@@ -438,15 +605,6 @@ function toast(msg) {
   t.textContent = msg;
   t.style.opacity = 1;
   setTimeout(() => { t.style.opacity = 0; }, 1800);
-}
-
-async function postJSON(url, body) {
-  const r = await apiFetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body)
-  });
-  return r.json();
 }
 
 /* ---------------- status ---------------- */
@@ -474,14 +632,6 @@ function applyStatus(s) {
     $('playLatestBtn').disabled = (selectedSeq === null);
     $('playingInfo').textContent = '';
   }
-}
-
-async function refreshStatus() {
-  if (!auth) return;   /* not logged in: no polling */
-  try {
-    const s = await (await apiFetch('/api/status')).json();
-    applyStatus(s);
-  } catch (e) { /* transient */ }
 }
 
 /* ---------------- frames ---------------- */
@@ -562,15 +712,6 @@ function applyFrame(f) {
   renderHistory();
 }
 
-async function pollFrames() {
-  if (!auth) return;   /* not logged in: no polling */
-  try {
-    const d = await (await apiFetch('/api/frames?since=' + lastSeq)).json();
-    if (d.last_seq != null && d.last_seq > lastSeq) lastSeq = d.last_seq;
-    (d.frames || []).forEach(applyFrame);
-  } catch (e) { /* transient */ }
-}
-
 /* ---------------- actions ---------------- */
 
 function playLatest() {
@@ -606,27 +747,25 @@ function playRaw() {
 
 async function play(body) {
   try {
-    const d = await postJSON('/api/play', body);
-    if (d.ok) toast('回放已开始');
-    else toast('回放失败：参数错误');
-  } catch (e) { toast('回放请求失败'); }
+    await rpc('play', body);
+    toast('回放已开始');
+  } catch (e) { toast('回放失败：' + (e.message || '参数错误')); }
 }
 
 async function setCarrier() {
   const freq = parseInt($('carrierInput').value, 10);
   if (!(freq >= 1000 && freq <= 1000000)) { toast('载波范围 1000 - 1000000 Hz'); return; }
   try {
-    const d = await postJSON('/api/carrier', { freq });
-    if (d.ok) { $('carrierStatus').textContent = '已设置 ' + d.freq + ' Hz'; toast('载波已更新'); }
-    else toast('载波设置失败');
+    const d = await rpc('carrier', { freq });
+    $('carrierStatus').textContent = '已设置 ' + d.freq + ' Hz';
+    toast('载波已更新');
   } catch (e) { toast('载波请求失败'); }
 }
 
 async function setRxPause(enabled) {
   try {
-    const d = await postJSON('/api/rxpause', { enabled });
-    if (d.ok) toast(enabled ? '已开启：回放时暂停接收' : '已关闭：回放时允许自环');
-    else toast('设置失败');
+    await rpc('rxpause', { enabled });
+    toast(enabled ? '已开启：回放时暂停接收' : '已关闭：回放时允许自环');
   } catch (e) { toast('设置请求失败'); }
 }
 
@@ -643,7 +782,7 @@ function showTab(t) {
 async function loadWifiCfg() {
   $('cfgStatus').textContent = '';
   try {
-    const c = await (await apiFetch('/api/wificfg')).json();
+    const c = await rpc('wificfg');
     $('cfgApSsid').value = c.ap_ssid;
     $('cfgApPwd').value = '';
     $('cfgApPwd').placeholder = c.ap_password_set ? '已设置（留空 = 不修改）' : '留空 = 开放网络';
@@ -660,7 +799,11 @@ async function loadWifiCfg() {
     $('cfgStaGw').value = c.sta_gw;
     $('cfgStaDns').value = c.sta_dns;
     try {
-      const a = await (await apiFetch('/api/authcfg')).json();
+      const w = await rpc('webcfg');
+      $('cfgWebUi').checked = !!w.web_ui;
+    } catch (e) { /* ignore */ }
+    try {
+      const a = await rpc('authcfg');
       $('cfgAuthUser').value = a.user;
     } catch (e) { /* ignore */ }
   } catch (e) {
@@ -710,19 +853,30 @@ async function saveWifiCfg() {
     sta_dns: dnsV
   };
   try {
-    const d = await postJSON('/api/wificfg', body);
+    const d = await rpc('wificfg', body);
     if (d.ok && d.restart) {
       $('cfgStatus').textContent = '已保存，设备 2 秒后重启，请稍候重新连接...';
       $('cfgSaveBtn').disabled = true;
-    } else {
-      $('cfgStatus').textContent = '保存失败：' + (d.error || '未知错误');
     }
   } catch (e) {
-    $('cfgStatus').textContent = '保存请求失败';
+    $('cfgStatus').textContent = '保存失败：' + ((e.payload && e.payload.error) || e.message || '请求失败');
   }
 }
 
 /* ---------------- auth settings ---------------- */
+
+async function saveWebUi() {
+  $('webUiStatus').textContent = '';
+  try {
+    const d = await rpc('webcfg', { web_ui: $('cfgWebUi').checked });
+    if (d.ok && d.restart) {
+      $('webUiStatus').textContent = '已保存，设备 2 秒后重启生效。'
+        + ($('cfgWebUi').checked ? '' : ' 内置页面将关闭，请改用外部前端连接 ws://<IP>/api/ws ...');
+    }
+  } catch (e) {
+    $('webUiStatus').textContent = '保存失败：' + ((e.payload && e.payload.error) || e.message || '请求失败');
+  }
+}
 
 async function saveAuthCfg() {
   const u = $('cfgAuthUser').value.trim();
@@ -734,7 +888,7 @@ async function saveAuthCfg() {
   const body = { user: u };
   if (p !== '') body.pass = p;
   try {
-    const d = await postJSON('/api/authcfg', body);
+    const d = await rpc('authcfg', body);
     if (d.ok) {
       $('authStatus').textContent = '已保存';
       $('cfgAuthPass').value = '';
@@ -742,20 +896,20 @@ async function saveAuthCfg() {
       toast('登录设置已保存，请重新登录');
       clearAuth();
       showLogin();
-    } else {
-      $('authStatus').textContent = '保存失败：' + (d.error || '未知错误');
     }
-  } catch (e) { $('authStatus').textContent = '保存请求失败'; }
+  } catch (e) {
+    $('authStatus').textContent = '保存失败：' + ((e.payload && e.payload.error) || e.message || '请求失败');
+  }
 }
 
 /* ---------------- init ---------------- */
 if (tokenAlive()) {
-  wsConnect();
   scheduleRenew();
 } else {
   clearAuth();
   showLogin();
 }
+wsConnect(); /* always: needed for login, auth or commands */
 </script>
 </body>
 </html>
