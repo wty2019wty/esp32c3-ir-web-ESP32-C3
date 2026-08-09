@@ -82,12 +82,13 @@ static void schedule_restart(void)
     }
 }
 
-/* GET /api/wificfg -> current (NVS) WiFi configuration */
-static esp_err_t wificfg_get_handler(httpd_req_t *req)
+/* Shared WiFi configuration cores, invoked by the WebSocket RPC dispatcher
+ * (app_web_rpc.c). The REST API has been removed — all control now happens
+ * over the /api/ws command channel. */
+
+/* Current (NVS) WiFi configuration as a JSON string (caller frees). */
+char *web_wificfg_get_json(void)
 {
-    if (!web_require_auth(req)) {
-        return ESP_OK;
-    }
     wifi_web_config_t cfg;
     wifi_web_config_load(&cfg);
     char ip[16], gw[16], mask[16], dns[16];
@@ -96,14 +97,11 @@ static esp_err_t wificfg_get_handler(httpd_req_t *req)
     format_ipv4(cfg.sta_mask, mask, sizeof(mask));
     format_ipv4(cfg.sta_dns, dns, sizeof(dns));
 
-    char *buf = NULL;
-    size_t cap = 1024;
-    buf = malloc(cap);
+    char *buf = malloc(1024);
     if (!buf) {
-        web_respond_json(req, 400, "{\"error\":\"oom\"}");
-        return ESP_OK;
+        return NULL;
     }
-    int n = snprintf(buf, cap,
+    int n = snprintf(buf, 1024,
         "{\"ap_ssid\":\"%s\",\"ap_password\":\"\",\"ap_password_set\":%s,"
         "\"sta_ssid\":\"%s\",\"sta_password\":\"\",\"sta_password_set\":%s,"
         "\"sta_dhcp\":%s,\"sta_ip\":\"%s\",\"sta_gw\":\"%s\","
@@ -111,31 +109,14 @@ static esp_err_t wificfg_get_handler(httpd_req_t *req)
         cfg.ap_ssid, cfg.ap_password[0] ? "true" : "false",
         cfg.sta_ssid, cfg.sta_password[0] ? "true" : "false",
         cfg.sta_dhcp ? "true" : "false", ip, gw, mask, dns);
-    httpd_resp_set_type(req, "application/json");
-    httpd_resp_sendstr(req, buf);
     (void)n;
-    free(buf);
-    return ESP_OK;
+    return buf;
 }
 
-/* POST /api/wificfg -> save config, respond, restart */
-static esp_err_t wificfg_post_handler(httpd_req_t *req)
+/* Apply a WiFi configuration from a JSON body and schedule a restart.
+ * On success the device reboots ~2s later to apply the new settings. */
+esp_err_t web_wificfg_set(cJSON *root, const char **err)
 {
-    if (!web_require_auth(req)) {
-        return ESP_OK;
-    }
-    char *body = web_httpd_read_body(req);
-    if (!body) {
-        web_respond_json(req, 400, "{\"error\":\"bad body\"}");
-        return ESP_OK;
-    }
-    cJSON *root = cJSON_Parse(body);
-    free(body);
-    if (!root) {
-        web_respond_json(req, 400, "{\"error\":\"bad json\"}");
-        return ESP_OK;
-    }
-
     wifi_web_config_t cfg;
     wifi_web_config_load(&cfg); /* start from current values */
 
@@ -148,9 +129,8 @@ static esp_err_t wificfg_post_handler(httpd_req_t *req)
     j = cJSON_GetObjectItem(root, "ap_password");
     if (cJSON_IsString(j)) {
         if (strlen(j->valuestring) >= sizeof(cfg.ap_password)) {
-            cJSON_Delete(root);
-            web_respond_json(req, 400, "{\"error\":\"ap_password too long\"}");
-            return ESP_OK;
+            *err = "ap_password too long";
+            return ESP_ERR_INVALID_ARG;
         }
         strlcpy(cfg.ap_password, j->valuestring, sizeof(cfg.ap_password));
     }
@@ -162,9 +142,8 @@ static esp_err_t wificfg_post_handler(httpd_req_t *req)
     j = cJSON_GetObjectItem(root, "sta_password");
     if (cJSON_IsString(j)) {
         if (strlen(j->valuestring) >= sizeof(cfg.sta_password)) {
-            cJSON_Delete(root);
-            web_respond_json(req, 400, "{\"error\":\"sta_password too long\"}");
-            return ESP_OK;
+            *err = "sta_password too long";
+            return ESP_ERR_INVALID_ARG;
         }
         strlcpy(cfg.sta_password, j->valuestring, sizeof(cfg.sta_password));
     }
@@ -174,12 +153,10 @@ static esp_err_t wificfg_post_handler(httpd_req_t *req)
         cfg.sta_dhcp = cJSON_IsTrue(j);
     }
     /* static IP fields (only used when sta_dhcp=false) */
-    const char *ip_str = NULL;
     uint32_t tmp;
     j = cJSON_GetObjectItem(root, "sta_ip");
     if (cJSON_IsString(j) && parse_ipv4(j->valuestring, &tmp)) {
         cfg.sta_ip = tmp;
-        ip_str = j->valuestring;
     }
     j = cJSON_GetObjectItem(root, "sta_gw");
     if (cJSON_IsString(j) && parse_ipv4(j->valuestring, &tmp)) {
@@ -196,45 +173,24 @@ static esp_err_t wificfg_post_handler(httpd_req_t *req)
 
     /* validation */
     if (cfg.ap_ssid[0] == '\0') {
-        cJSON_Delete(root);
-        web_respond_json(req, 400, "{\"error\":\"ap_ssid empty\"}");
-        return ESP_OK;
+        *err = "ap_ssid empty";
+        return ESP_ERR_INVALID_ARG;
     }
     if (cfg.ap_password[0] != '\0' && strlen(cfg.ap_password) < 8) {
-        cJSON_Delete(root);
-        web_respond_json(req, 400, "{\"error\":\"ap_password needs >=8 chars or empty\"}");
-        return ESP_OK;
+        *err = "ap_password needs >=8 chars or empty";
+        return ESP_ERR_INVALID_ARG;
     }
     if (!cfg.sta_dhcp && (cfg.sta_ip == 0 || cfg.sta_ip == 0xFFFFFFFFU)) {
-        cJSON_Delete(root);
-        web_respond_json(req, 400, "{\"error\":\"invalid static ip\"}");
-        return ESP_OK;
-    }
-    (void)ip_str;
-
-    esp_err_t err = wifi_web_config_save(&cfg);
-    cJSON_Delete(root);
-    if (err != ESP_OK) {
-        web_respond_json(req, 400, "{\"error\":\"nvs write failed\"}");
-        return ESP_OK;
+        *err = "invalid static ip";
+        return ESP_ERR_INVALID_ARG;
     }
 
-    web_respond_json(req, 200, "{\"ok\":true,\"restart\":true}");
+    esp_err_t ret = wifi_web_config_save(&cfg);
+    if (ret != ESP_OK) {
+        *err = "nvs write failed";
+        return ret;
+    }
+
     schedule_restart();
-    return ESP_OK;
-}
-
-esp_err_t web_api_wifi_register(httpd_handle_t server)
-{
-    static const httpd_uri_t uris[] = {
-        {.uri = "/api/wificfg", .method = HTTP_GET,  .handler = wificfg_get_handler},
-        {.uri = "/api/wificfg", .method = HTTP_POST, .handler = wificfg_post_handler},
-    };
-    for (size_t i = 0; i < sizeof(uris) / sizeof(uris[0]); i++) {
-        if (httpd_register_uri_handler(server, &uris[i]) != ESP_OK) {
-            ESP_LOGE(TAG, "Failed to register URI %s", uris[i].uri);
-            return ESP_FAIL;
-        }
-    }
     return ESP_OK;
 }

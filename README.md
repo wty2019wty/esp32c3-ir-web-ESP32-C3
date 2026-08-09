@@ -18,14 +18,19 @@
 - **回放暂停接收**：回放时可自动暂停 IR 接收，避免自环帧干扰，开关持久化到 NVS
 - **WiFi 自动互斥**：配置了连接 WiFi 则只连路由器（不开热点）；未配置则只开热点（SoftAP）；
   STA 连接超时自动降级 SoftAP，保证 Web 始终可达
-- **Web 登录认证**：默认 admin / admin，session token 认证，可在 Web 设置页修改账号密码
+- **Web 登录认证**：默认 admin / admin，通过 WebSocket 登录并管理 session token，
+  可在 Web 设置页修改账号密码
+- **单设备登录（默认开启）**：开启后每次登录都会签发全新 token 并踢出所有旧会话，
+  防止他人用相同账号在别处登录；可在 Web 设置页关闭（关闭后同账号多端共享会话）
+- **前后端分离（可选）**：登录前可手动填写设备 ws(s) 地址；设置页的"启用内置 Web 界面"
+  开关可让设备**不提供页面、仅保留 `/api/ws`**，供外部前端连接
 
 ## 硬件连接
 
-| 功能 | GPIO | 说明 |
-|------|------|------|
-| IR 接收 | GPIO4 | VS1838B OUT（解调后基带信号，空闲为高电平） |
-| IR 发射 | GPIO3 | 需外接三极管驱动红外发光二极管 |
+|功能|GPIO|说明|
+|----|----|----|
+|IR 接收|GPIO4|VS1838B OUT（解调后基带信号，空闲为高电平）|
+|IR 发射|GPIO3|需外接三极管驱动红外发光二极管|
 
 所有引脚可在 `idf.py menuconfig` → "IR Web Tool Configuration" 中修改。
 
@@ -35,10 +40,10 @@
 
 ```powershell
 & 'D:\esp\v6.0.2\esp-idf\export.ps1'
-cd G:\esp32s3\esp32c3-IR
+cd G:\esp32s3\esp32c3-ir-web-ESP32-C3
 idf.py set-target esp32c3
 idf.py build
-idf.py flash monitor
+idf.py -p <PORT> flash monitor   # 例如 -p COM7
 ```
 
 > 首次构建时组件管理器自动下载 `espressif/cjson` 依赖（无需手动操作）。
@@ -50,22 +55,23 @@ idf.py flash monitor
 idf.py menuconfig   # → "IR Web Tool Configuration"
 ```
 
-| 配置项 | 默认值 | 说明 |
-|--------|--------|------|
-| IR receiver GPIO | 4 | VS1838B OUT |
-| IR transmitter GPIO | 3 | 三极管驱动 IR LED |
-| Default IR carrier | 38000 Hz | 初始载波，Web 可改并持久化 |
-| Carrier duty cycle | 33% | 载波占空比 |
-| SoftAP SSID / password | ESP32C3-IR / 空 | 热点名称/密码（空 = 开放网络；可在 Web 设置页修改） |
-| SoftAP channel | 1 | 热点信道 |
-| SoftAP max connections | 4 | 热点最大连接数 |
-| Station SSID / password | 空 | 连接的路由器凭据（Web 设置页修改；非空则自动切 STA 模式） |
-| STA timeout | 10000 ms | STA 连接超时后降级为 SoftAP |
-| DHCP hostname | ir-web | 路由器客户端列表中显示的主机名 |
-| HTTP port | 80 | Web 服务端口 |
-| History depth | 8 | RAM 历史帧条数（每帧约 4.2KB，8 帧 ≈ 34KB） |
-| Max RX segments | 1024 | 每帧最大交替段数（空调协议常超 300 段） |
-| Max TX symbols | 2048 | 原始数据回放的最大 RMT 符号数 |
+|配置项|默认值|说明|
+|------|------|----|
+|IR receiver GPIO|4|VS1838B OUT|
+|IR transmitter GPIO|3|三极管驱动 IR LED|
+|Default IR carrier|38000 Hz|初始载波，Web 可改并持久化|
+|Carrier duty cycle|33%|载波占空比|
+|SoftAP SSID / password|ESP32C3-IR / 空|热点名称/密码（空 = 开放网络；可在 Web 设置页修改）|
+|SoftAP channel|1|热点信道|
+|SoftAP max connections|4|热点最大连接数|
+|Station SSID / password|空|连接的路由器凭据（Web 设置页修改；非空则自动切 STA 模式）|
+|STA timeout|10000 ms|STA 连接超时后降级为 SoftAP|
+|Max STA TX power|15 dBm|STA 最大发射功率（部分 C3 板默认 20 dBm 开放认证失败，调低可稳定连接）|
+|DHCP hostname|ir-web|路由器客户端列表中显示的主机名|
+|HTTP port|80|Web 服务端口|
+|History depth|8|RAM 历史帧条数（每帧约 4.2KB，8 帧 ≈ 34KB）|
+|Max RX segments|1024|每帧最大交替段数（空调协议常超 300 段）|
+|Max TX symbols|2048|原始数据回放的最大 RMT 符号数|
 
 > 工作模式自动互斥：配置了 STA SSID 则设备只连接路由器（不开热点）；STA SSID 为空则只开热点。
 > 两者不会同时开启。
@@ -83,25 +89,34 @@ idf.py menuconfig   # → "IR Web Tool Configuration"
 ### 设置页面与恢复出厂
 
 - 页面顶部切换到 **设置** 页，可配置：热点名称/密码、连接的路由器 WiFi、
-  STA 地址获取方式（DHCP / 静态 IP、掩码、网关、DNS）、Web 登录账号密码。保存后设备 2 秒自动重启生效。
+  STA 地址获取方式（DHCP / 静态 IP、掩码、网关、DNS）、Web 登录账号密码、
+  **单设备登录开关**（默认开启）。
+  **服务模式**："启用内置 Web 界面"默认勾选；取消勾选后设备重启将**不再提供内置页面**，
+  仅保留 `ws://<IP>/api/ws`（前后端分离场景，需用外部前端连接）。保存后设备 2 秒自动重启生效。
 - **恢复出厂**：开机后 **2 秒内按住 BOOT 键**（GPIO9）约 50ms，
   设备会擦除全部配置（NVS）并重启，回到默认的**无密码热点**（SSID `ESP32C3-IR`、
-  开放网络、DHCP、38kHz 载波、回放暂停接收开启）。
+  开放网络、DHCP、38kHz 载波、回放暂停接收开启、Web 页面开启）。
   注意：上电瞬间就按住 BOOT 会进入 ROM 下载模式（固件不运行），恢复出厂需在
   固件启动后的 2 秒窗口内按下。
 
 ### Web 登录认证
 
 - 默认账号 **admin / admin**，存 NVS；**首次用默认凭据登录会强制修改密码**
-  （登录接口返回 `must_change_pwd`，前端弹出强制改密对话框，保存后自动重新登录）。
-- 访问 Web 页面时会弹出登录框，输入用户名密码后获得 session token，
-  后续请求通过 `X-Auth-Token` 请求头携带 token 认证；token 有效期为 **24 小时**，
-  前端会自动续期（`/api/renew`），过期后需重新登录。
-- 登录连续失败 **5 次** 后锁定 **30 秒**（返回 `429`），防止暴力破解。
-- 支持退出登录（`/api/logout`），服务端立即作废当前 token。
+  （WS 登录返回 `must_change_pwd`，前端弹出强制改密对话框，保存后自动重新登录）。
+- 访问页面时浏览器自动连接 `ws://<IP>/api/ws` 并弹出登录框，输入用户名密码后
+  通过 **WS 登录**获得 session token（**该连接随即成为已认证会话**）；token 有效期为 **24 小时**，
+  前端会自动续期（`renew` 命令），过期后需重新登录。
+- 登录连续失败 **5 次** 后锁定 **30 秒**（`login` 回复 `error:"too many attempts","retry_after":N`），
+  防止暴力破解。
+- 支持退出登录（`logout` 命令），服务端立即作废当前 token 并关闭该连接。
+- **单设备登录**：设置页"Web 登录"卡片提供**单设备登录**开关（**默认开启**）。开启时，
+  只要设备上已有活跃会话，任何一次新登录都会**生成全新 token 并递增会话代数**，
+  此前所有已认证的 WebSocket 连接随即被踢下线（命令被拒、推送停止），从而防止
+  多个设备/浏览器同时在线；关闭后回到原来的行为：同账号多端共享同一 token、
+  互不踢下线（便于多标签页同时使用）。
 - WiFi 密码（热点/路由器）**不再回显明文**，设置页只显示"已设置"，留空表示不修改，
-  勾选"清除"才会删除；`GET /api/wificfg` 仅返回 `ap_password_set` / `sta_password_set` 标志。
-- 修改登录凭据后会强制注销，需用新账号重新登录。
+  勾选"清除"才会删除；`wificfg` 读取仅返回 `ap_password_set` / `sta_password_set` 标志。
+- 修改登录凭据后会强制注销，需用新账号重新登录（仅切换单设备登录开关不强制重新登录）。
 
 ### NVS 加密
 
@@ -113,51 +128,136 @@ idf.py menuconfig   # → "IR Web Tool Configuration"
   **擦除一次 flash**（如 `idf.py erase-flash`，或开机 2 秒内按 BOOT 恢复出厂），
   之后设备回到默认配置并触发强制改密流程。
 
-### Web API
+### API（纯 WebSocket，无 REST）
 
-所有 API 需携带 `X-Auth-Token` 请求头（`/api/login` 除外）。
+**所有控制与数据全部走 `ws://<IP>/api/ws`**（REST API 已移除）。HTTP 服务器只提供
+静态页面本身（`/`、`/index.html`）。唯一需要 token 引导的操作是 WS 登录。
 
-| 端点 | 方法 | 说明 |
-|------|------|------|
-| `/api/login` | POST | 登录认证，请求体 `{"user":"...","pass":"..."}` ，返回 `{"ok":true,"token":"...","expires_in":86400,"must_change_pwd":bool}`；连续失败会返回 `429` |
-| `/api/logout` | POST | 退出登录，作废当前 token |
-| `/api/renew` | POST | 续期当前会话，返回新的 `expires_in` |
-| `/api/ws` | GET(WS) | WebSocket 端点：认证后推送 status（每秒）与 frame（新信号实时到达） |
-| `/api/status` | GET | 设备状态（WiFi 模式、IP、载波、播放状态等）；WebSocket 推送已取代轮询，此端点保留作回退 |
-| `/api/frames` | GET | 增量拉取帧历史，参数 `?since=N`（N 为已知最大序号）；WebSocket 推送已取代轮询，此端点保留作回退 |
-| `/api/play` | POST | 回放信号，支持三种 type：`hxd`（`{"value":"ED127F80"}`）、`raw`（`{"data":[...]}`）、`frame`（`{"seq":N}`），可选 `freq` |
-| `/api/carrier` | POST | 设置载波频率，`{"freq":38000}` |
-| `/api/rxpause` | POST | 回放时暂停 IR 接收开关，`{"enabled":true/false}` |
-| `/api/wificfg` | GET/POST | 读取/保存 WiFi 配置；密码不回显（`ap_password_set`/`sta_password_set` 标志），POST 中密码字段传 `null` 表示不修改、空字符串表示清除 |
-| `/api/authcfg` | GET/POST | 读取/修改登录凭据（GET 不返回密码） |
+### WebSocket（登录 + 命令 RPC + 推送）
 
-### WebSocket 推送（状态 / 帧）
+页面加载后即连接 `ws://<IP>/api/ws`，所有 API（含登录）都在这一条连接上进行：
 
-页面登录后自动连接 `ws://<IP>/api/ws`，替代 `/api/status` 与 `/api/frames` 的轮询：
-
-- **认证**：连接后第一条消息发送 `{"type":"auth","token":"<session token>"}`；
-  服务端回复 `{"type":"auth","ok":true}`；token 无效或过期则回复 `ok:false` 并断开连接。
+- **登录**（连接后第一条消息，唯一无需 token 的操作）：
+  - 发送 `{"type":"login","user":"...","pass":"..."}`
+  - 成功回复 `{"type":"login","ok":true,"token":"...","expires_in":86400,"must_change_pwd":bool}`
+    —— **该连接随即成为已认证会话**，后续命令直接可用；
+  - 失败回复 `{"type":"login","ok":false,"error":"bad credentials"}` 或
+    `{"type":"login","ok":false,"error":"too many attempts","retry_after":N}`（连续失败 5 次锁定 30 秒）；
+  - 连续失败 5 次后锁定 30 秒，防止暴力破解。
+- **已有会话**：客户端刷新页面时保存的 token 仍有效，连接后发送
+  `{"type":"auth","token":"<token>"}` 认证（`auth` 消息与 `login` 二选一）；
+  服务端回复 `{"type":"auth","ok":true}`；token 无效或过期则回复 `ok:false` 并断开。
+- **命令 RPC**：
+  - 客户端发送 `{"type":"cmd","id":N,"cmd":cmd,"body":{...}}`
+  - 服务端回复 `{"type":"resp","id":N,"ok":true,"data":{...}}` 或
+    `{"type":"resp","id":N,"ok":false,"error":"..."}`
+  - `cmd` 取值（body 均省略 `ok` 包装）：
+    - `play`：`{"type":"hxd","value":"ED127F80"}` / `{"type":"raw","data":[...],"freq":N}` / `{"type":"frame","seq":N}`，可选 `freq`
+    - `carrier`：`{"freq":38000}`
+    - `rxpause`：`{"enabled":true}`
+    - `status`：body 为空，返回当前状态对象
+    - `frames`：`{"since":N}`，增量拉取；超过约 48KB 时返回 `"truncated":true`，
+      `last_seq` 为实际返回的最后一帧，客户端应使用该 `last_seq` 继续拉取直至追平
+    - `wificfg`：body 含配置字段 = 保存并重启（`{"restart":true}`）；body 为空 = 读取
+      （密码不回显，`ap_password_set`/`sta_password_set` 标志；密码传 `null` 表示不修改、空字符串表示清除）
+    - `authcfg`：body 含 `user`/`pass`/`single_session` 任一字段 = 保存设置，body 为空 = 读取
+      （`{"user":...,"single_session":bool}`）。是否"变更"由服务端与已保存值比较判定：
+      **只有 `user`/`pass` 实际发生变化才作废会话、需要重新登录**（前端会在改用户名后提示重登）；
+      重复提交相同值、或只切换 `single_session` 均不会踢掉当前会话
+    - `renew`：续期会话（`{"expires_in":N}`）
+    - `logout`：退出登录，响应后服务端关闭连接
+    - `webcfg`：body 含 `web_ui`（bool）= 设置"启用内置 Web 界面"开关并重启
+      （`{"restart":true}`）；body 为空 = 读取（`{"web_ui":bool}`）
 - **推送消息**：
-  - `{"type":"status","id":N,"data":{...}}` —— **状态有变化时才推送**（字段同 `/api/status`），
+  - `{"type":"status","id":N,"data":{...}}` —— **状态有变化时才推送**（字段见下），
     携带递增 `id`；客户端收到后需回复 `{"type":"ack","id":N}` 确认抄收，
     未确认的客户端会每秒补发，直到确认或状态再次变化；
     **播放开始/结束时立即推送**（不依赖每秒采样，避免短暂的"播放中"状态被漏掉）
-  - `{"type":"frame","data":{...}}` —— 收到新红外信号时立即推送（字段同 `/api/frames` 中的单帧）
-- **断线回退**：连接断开后前端自动切换回 REST 轮询，并每 10 秒尝试重连 WebSocket；
-  连接恢复后停止轮询。
+  - `{"type":"frame","data":{...}}` —— 收到新红外信号时立即推送（单帧对象，同 `frames` 中元素）
+- 前端在认证成功后主动请求一次 `status` 与 `frames`（多段拉取直至追平，最多重试 8 次）
+  完成初始同步；连接断开时前端自动重连（10 秒间隔）并重新登录/认证。
+- **连接保活**：即使状态无变化，服务端也**每 20 秒**推送一次 status 心跳，
+  让空闲连接穿过家用路由器/AP 的 NAT 会话回收（此前常表现为 `104 ECONNRESET` 掉线）；
+  前端另有**假死看门狗**：45 秒内未收到任何服务器消息（心跳/推送/响应）即主动重连，
+  并**每 15 秒**主动拉取一次 `status` 校验连接存活、刷新界面（被动推送无法区分
+  "连接静默死亡"与"设备确实无变化"）。
+- **并发安全与背压**：所有服务端→客户端帧都在 httpd 任务内**串行发送**（经
+  `httpd_ws_send_data_async` 入队），避免多任务并发写同一 socket 造成字节交错、
+  客户端解析出 "Invalid frame header"。每连接发送队列有上限（约 4 帧），
+  高频回放 / 连续 IR 事件导致积压时丢弃多余帧，客户端可再用 `frames` 命令补齐。
+- **鉴权与失效**：命令与推送均要求已认证会话；退出登录或修改登录凭据会使会话
+  **代数**递增，已连接的 WebSocket 会话随即失效（命令被拒、推送停止），
+  防止退出登录后残留连接仍可操作设备。开启**单设备登录**（默认）时，新登录同样
+  递增会话代数，令所有旧会话立即失效。
+
+`status` 推送（及 `status` 命令）中的 `data` 字段：`mode`、`ap_ip`、`sta_ip`、`ap_ssid`、
+`sta_ssid`、`sta_ip_mode`、`sta_connected`、`carrier_hz`、`rx_pause_on_play`、`playing`。
+单帧对象字段：`seq`、`ts`、`nec{...}`、`feat{...}`、`freq`、`durs[...]`。
+
+### 前后端分离
+
+页面可与设备分离部署（如托管在 CF Pages / 任意静态服务器）。页面内置的
+Content-Security-Policy 已放行任意 `ws:`/`wss:` 源（`connect-src 'self' ws: wss:`），
+WebSocket 不受 CORS 限制，因此从任意域名加载页面都能连接设备。此时：
+
+- 页面加载后只会连接 **localStorage 中保存的设备地址**（无保存值时按当前页面域名，
+  对分离部署而言通常是无效地址、连接失败后每 10 秒重试）；因此首次使用时
+  **登录框内需先手动填写设备地址**（支持
+  `ws://192.168.0.145:80`、`wss://ir.example.com` 或省略协议只填 `host:port`，
+  HTTPS 页面下省略协议默认 `wss://`）；地址保存在浏览器 localStorage，下次自动填入并自动连接。
+- 若设备关闭了"启用内置 Web 界面"（`webcfg` 的 `web_ui=false`），`/` 与 `/index.html` 返回 404，
+  外部前端仍可通过 `/api/ws` 完整控制（登录、命令、推送）。
+- **HTTPS 页面必须用 `wss://`**：HTTPS（如 CF Pages 的 `*.pages.dev`）页面里连接明文
+  `ws://` 会被浏览器按**混合内容**拦截（`Mixed Content`），这是连接失败最常见的原因。
+  设备自身只提供明文 `ws://`，需要借助反向代理/隧道把它变成 `wss://` 端点，见下。
+
+#### 部署到 Cloudflare Pages
+
+把 `main/web/index.html` 直接推到 CF Pages（或任意静态托管）即可作为前端：
+
+1. 前端页面部署到 `https://<your-pages>.pages.dev`（自动 HTTPS）。
+2. 给设备套 **Cloudflare Tunnel**，把设备的 `/api/ws` 暴露成 `wss://ir.example.com/api/ws`
+   （Tunnel 自动带 HTTPS，无需 VPS/证书）：
+   - 在局域网一台常开主机（树莓派/NAS）安装并登录 `cloudflared`：
+
+     ```bash
+     cloudflared tunnel create ir-web
+     cloudflared tunnel route dns ir-web ir.example.com
+     ```
+
+   - 配置文件 `~/.cloudflared/config.yml`：
+
+     ```yaml
+     tunnel: ir-web
+     credentials-file: /root/.cloudflared/<tunnel-id>.json
+
+     ingress:
+       - hostname: ir.example.com
+         service: http://192.168.0.145:80
+       - service: http_status:404
+     ```
+
+   - 运行 `cloudflared tunnel run ir-web`。注意：Tunnel 到设备这一段是局域网明文 HTTP，
+     登录凭据/token 会在 `ir.example.com` 与设备之间以明文传输，建议只允许 cloudflared
+     主机访问设备（同一可信网段），并在 Cloudflare Access 上给该域名加访问策略。
+3. 浏览器打开 `https://<your-pages>.pages.dev`，登录框填
+   `wss://ir.example.com` + 账号密码即可远程控制（也可在设备设置页关闭内置页面）。
+
+> 也可用 nginx/VPS 反向代理产生 `wss://`（见下节），原理相同。
 
 ### HTTPS 反向代理（nginx）部署注意
 
 如果通过 nginx 反代给设备套 HTTPS（浏览器 → HTTPS → nginx → 明文 HTTP → ESP32），注意以下几点：
 
-- **信任边界**：`nginx → 设备` 这一段是明文 HTTP，`X-Auth-Token` 会被原样转发。能嗅探内网的人
-  可以拿到 token（有效期内等于完整管理员权限）。建议把 nginx 与设备放在同一可信网段
+- **信任边界**：`nginx → 设备` 这一段是明文 HTTP。所有控制都走 WebSocket，
+  登录凭据与 session token 在 WS 帧内明文传输。能嗅探内网的人可以截获登录密码/token
+  （有效期内等于完整管理员权限）。建议把 nginx 与设备放在同一可信网段
   （如专用 VLAN、仅允许 nginx 访问设备的 80 端口），或在设备自身启用 HTTPS
   （`esp_https_server` + mbedTLS）以消除明文段。
-- **nginx 日志**：默认 `access_log` 不记录请求头，token 不会落盘；不要自定义 `log_format`
-  打印 `$http_x_auth_token`，否则 token 会写入日志文件。
-- **强制 HTTPS**：配置 HTTP → HTTPS 跳转，避免用户用 `http://` 直接访问导致 token 走明文。
-- **WebSocket 必须走 wss**：页面推送会连接 `ws://<IP>/api/ws`，反代需要转发 Upgrade 头，
+- **nginx 日志**：默认 `access_log` 不记录请求体，登录密码/token 不会落盘；
+  不要自定义 `log_format` 打印请求体。
+- **强制 HTTPS**：配置 HTTP → HTTPS 跳转，避免用户用 `http://` 直接访问导致凭据走明文。
+- **WebSocket 必须走 wss**：外部前端（HTTPS 页面）需连接 `wss://<host>/api/ws`，反代需要转发 Upgrade 头，
   示例：
 
 ```nginx
@@ -170,16 +270,18 @@ location /api/ws {
 }
 ```
 
-HTTPS 页面下浏览器会自动使用 `wss://`；若反代未转发 Upgrade 头，WebSocket 会连接失败，
-前端将回退到 REST 轮询（可用，但不是实时推送）。
+HTTPS 页面下浏览器会使用 `wss://`；若反代未转发 Upgrade 头，WebSocket 会连接失败，
+**整个页面不可用**（无 REST 回退，登录与控制全部依赖 WS）。
 
 ## 工程结构
 
-```
+```text
 esp32c3-IR/
 ├── CMakeLists.txt
-├── sdkconfig.defaults        # esp32c3 / 4MB flash / 自定义分区
+├── sdkconfig.defaults        # esp32c3 / 4MB flash / 自定义分区 / NVS 加密 / WS 支持
 ├── partitions.csv            # nvs + phy_init + factory（约 3.9MB app 区）
+├── api-demo.py               # Python 示例脚本：WS 登录 + 回放/监听（WebSocket-only）
+├── .github/workflows/        # deploy-pages.yml：前端部署到 CF Pages
 └── main/
     ├── CMakeLists.txt        # EMBED_TXTFILES 内嵌 index.html
     ├── idf_component.yml     # 依赖 espressif/cjson
@@ -189,14 +291,16 @@ esp32c3-IR/
     ├── app_ir_nec.c          # NEC 协议解码
     ├── app_ir_play.c         # hxd/raw 回放编码
     ├── app_ir_store.c        # 帧存储 + 历史环形缓冲 + 回调
-    ├── app_wifi.c            # AP/STA/APSTA 三模式 + 超时降级
-    ├── app_web.c             # HTTP server 初始化
-    ├── app_web_api_ir.c      # /api/status, /api/frames, /api/play, /api/carrier, /api/rxpause
-    ├── app_web_api_wifi.c    # /api/wificfg
-    ├── app_web_auth.c        # /api/login, /api/logout, /api/renew, /api/authcfg
-    ├── app_web_ws.c          # WebSocket /api/ws 推送
+    ├── app_wifi.c            # AP/STA 互斥 + 超时降级
+    ├── app_web.c             # HTTP server 初始化（仅静态页面 + WS 端点）
+    ├── app_web_api_ir.c      # IR 命令核心（play/carrier/rxpause，WS-only）
+    ├── app_web_api_wifi.c    # WiFi 配置核心（wificfg 读写，WS-only）
+    ├── app_web_auth.c        # WS 登录 / token 认证 / 会话代数 / 凭据管理
+    ├── app_web_rpc.c         # 命令分发（WS cmd → 各模块）+ 帧历史 JSON 构建
+    ├── app_web_ws.c          # WebSocket /api/ws：登录认证、命令 RPC、推送（串行发送 + 心跳）
     ├── app_web_util.c        # JSON 序列化 + HTTP 工具函数
     ├── web/index.html        # 前端单页（内嵌，无需文件系统）
+    ├── web/run.bat           # 本地静态服务器（python -m http.server 80），前后端分离调试用
     └── include/              # 各模块头文件
 ```
 
@@ -214,5 +318,16 @@ esp32c3-IR/
   任务处理前检查符号数量阈值 `num > (IR_RAW_MAX_SEGS + 1) / 2`，
   超出则丢弃帧以避免 `ir_analyze` 截断导致解码错误；
   回放结束恢复 RX 时清除溢出标志
-- **Web 数据流**：前端通过 WebSocket（`/api/ws`）接收状态（每秒）与新帧（实时）推送；
-  REST `/api/frames?since=N` 保留作断线回退，服务端 chunked 输出
+- **Web 数据流**：前端通过单条 WebSocket（`/api/ws`）完成登录、认证、命令与推送，
+  **REST API 已移除**。服务器所有帧经 httpd 任务串行发送（入队异步发送 + 每连接队列上限），
+  空闲时每 20 秒推送 status 心跳维持连接，前端 45 秒无数据即重连；
+   命令与推送均要求已认证会话，登出/改密会立即使已连接会话失效。
+
+## 项目地址与开源许可
+
+- **项目地址**：<https://github.com/wty2019wty/esp32c3-ir-web-ESP32-C3/>
+- **开源许可证**：[GPL-3.0](LICENSE)（GNU General Public License v3.0）
+
+本项目基于 GPL-3.0 许可证开源。你可以自由使用、修改和分发本项目的代码，
+但基于本项目代码的任何衍生作品也必须以 GPL-3.0 协议开源，并保留原始版权声明。
+详见根目录 [LICENSE](LICENSE) 文件。
