@@ -161,9 +161,10 @@ idf.py menuconfig   # → "IR Web Tool Configuration"
     - `wificfg`：body 含配置字段 = 保存并重启（`{"restart":true}`）；body 为空 = 读取
       （密码不回显，`ap_password_set`/`sta_password_set` 标志；密码传 `null` 表示不修改、空字符串表示清除）
     - `authcfg`：body 含 `user`/`pass`/`single_session` 任一字段 = 保存设置，body 为空 = 读取
-      （`{"user":...,"single_session":bool}`）。是否"变更"由服务端与已保存值比较判定：
-      **只有 `user`/`pass` 实际发生变化才作废会话、需要重新登录**（前端会在改用户名后提示重登）；
-      重复提交相同值、或只切换 `single_session` 均不会踢掉当前会话
+      （`{"user":...,"single_session":bool}`）。保存返回 `{"invalidated":bool}`：是否
+      "变更"由服务端与已保存值比较判定，**只有 `user`/`pass` 实际发生变化才作废会话、
+      需要重新登录**（`invalidated:true`，前端据此提示重登）；
+      重复提交相同值、或只切换 `single_session` 均返回 `invalidated:false` 且不会踢掉任何会话
     - `renew`：续期会话（`{"expires_in":N}`）
     - `logout`：退出登录，响应后服务端关闭连接
     - `webcfg`：body 含 `web_ui`（bool）= 设置"启用内置 Web 界面"开关并重启
@@ -281,7 +282,7 @@ esp32c3-IR/
 ├── sdkconfig.defaults        # esp32c3 / 4MB flash / 自定义分区 / NVS 加密 / WS 支持
 ├── partitions.csv            # nvs + phy_init + factory（约 3.9MB app 区）
 ├── api-demo.py               # Python 示例脚本：WS 登录 + 回放/监听（WebSocket-only）
-├── .github/workflows/        # deploy-pages.yml：前端部署到 CF Pages
+├── .github/workflows/        # deploy-pages.yml：前端部署到 GitHub Pages
 └── main/
     ├── CMakeLists.txt        # EMBED_TXTFILES 内嵌 index.html
     ├── idf_component.yml     # 依赖 espressif/cjson

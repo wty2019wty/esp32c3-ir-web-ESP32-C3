@@ -29,6 +29,7 @@ typedef struct {
     uint32_t gen;        /* session generation the client authenticated against */
     uint32_t acked_id;   /* last status id confirmed by this client (0 = none) */
     int pending;         /* queued async sends, for back-pressure */
+    uint32_t seq;        /* bumped each time the slot is (re)assigned to a client */
 } ws_client_t;
 
 static httpd_handle_t s_ws_server = NULL;
@@ -70,6 +71,9 @@ static void ws_client_add(int fd, bool authed)
             s_ws_clients[i].gen = authed ? web_auth_get_gen() : 0;
             s_ws_clients[i].acked_id = 0;
             s_ws_clients[i].pending = 0;
+            if (++s_ws_clients[i].seq == 0) {
+                s_ws_clients[i].seq = 1;
+            }
             xSemaphoreGive(s_ws_mutex);
             return;
         }
@@ -81,6 +85,9 @@ static void ws_client_add(int fd, bool authed)
             s_ws_clients[i].gen = authed ? web_auth_get_gen() : 0;
             s_ws_clients[i].acked_id = 0;
             s_ws_clients[i].pending = 0; /* slot reuse must not inherit stale counts */
+            if (++s_ws_clients[i].seq == 0) {
+                s_ws_clients[i].seq = 1;
+            }
             break;
         }
     }
@@ -176,37 +183,36 @@ static bool ws_has_authed_clients(void)
 
 typedef struct {
     int fd;
+    int slot;        /* client slot the send was queued for */
+    uint32_t seq;    /* slot generation at queue time (see ws_client_t.seq) */
     char *payload;
 } ws_async_msg_t;
 
 static void ws_async_send_done(esp_err_t err, int socket, void *arg)
 {
     ws_async_msg_t *m = arg;
-    if (err != ESP_OK) {
-        /* Runs in the httpd task (s_ws_mutex not held). Remove the client only
-         * if it still has this queued send outstanding; if the slot was already
-         * freed (close) or reused (fd value recycled for a new client, pending
-         * reset to 0), leave the current occupant alone. */
-        ESP_LOGD(TAG, "ws: async send to fd %d failed: %s", socket, esp_err_to_name(err));
-        if (m && s_ws_mutex && xSemaphoreTake(s_ws_mutex, portMAX_DELAY) == pdTRUE) {
-            for (int i = 0; i < WS_MAX_CLIENTS; i++) {
-                if (s_ws_clients[i].fd == m->fd && s_ws_clients[i].pending > 0) {
-                    s_ws_clients[i].fd = -1;
-                    s_ws_clients[i].authed = false;
-                    s_ws_clients[i].pending = 0;
-                    break;
-                }
-            }
-            xSemaphoreGive(s_ws_mutex);
-        }
-    } else if (m && s_ws_mutex && xSemaphoreTake(s_ws_mutex, portMAX_DELAY) == pdTRUE) {
-        for (int i = 0; i < WS_MAX_CLIENTS; i++) {
-            if (s_ws_clients[i].fd == m->fd && s_ws_clients[i].pending > 0) {
-                s_ws_clients[i].pending--;
-                break;
+    /* Runs in the httpd task. The slot + seq recorded at queue time only match
+     * the CURRENT occupant when it is the same client that queued the send. A
+     * freed slot (fd == -1) or a recycled fd that was re-assigned to a new
+     * client (seq bumped in ws_client_add) no longer matches, so a stale
+     * callback can never evict or decrement a stranger. The ownership check and
+     * the mutation both run under s_ws_mutex so they stay atomic. */
+    if (m && m->slot >= 0 && m->slot < WS_MAX_CLIENTS &&
+        s_ws_mutex && xSemaphoreTake(s_ws_mutex, portMAX_DELAY) == pdTRUE) {
+        if (s_ws_clients[m->slot].fd == m->fd &&
+            s_ws_clients[m->slot].seq == m->seq) {
+            if (err != ESP_OK) {
+                s_ws_clients[m->slot].fd = -1;
+                s_ws_clients[m->slot].authed = false;
+                s_ws_clients[m->slot].pending = 0;
+            } else if (s_ws_clients[m->slot].pending > 0) {
+                s_ws_clients[m->slot].pending--;
             }
         }
         xSemaphoreGive(s_ws_mutex);
+    }
+    if (err != ESP_OK) {
+        ESP_LOGD(TAG, "ws: async send to fd %d failed: %s", socket, esp_err_to_name(err));
     }
     if (m) {
         free(m->payload);
@@ -238,9 +244,13 @@ static void ws_async_send_text_locked(int fd, const char *json)
         return;
     }
     m->fd = fd;
+    m->slot = -1;
+    m->seq = 0;
     m->payload = dup;
     for (int i = 0; i < WS_MAX_CLIENTS; i++) {
         if (s_ws_clients[i].fd == fd) {
+            m->slot = i;
+            m->seq = s_ws_clients[i].seq;
             s_ws_clients[i].pending++;
             break;
         }
