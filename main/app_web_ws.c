@@ -276,7 +276,7 @@ static void ws_frame_push_cb(const ir_frame_t *fr, void *arg)
     if (!ws_has_authed_clients()) {
         return;
     }
-    size_t cap = 4096 + 64;
+    size_t cap = 16384 + 64; /* enough for IR_RAW_MAX_SEGS (1024) durations */
     char *buf = malloc(cap);
     if (!buf) {
         return;

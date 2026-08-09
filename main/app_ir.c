@@ -21,7 +21,12 @@
 #define IR_RESOLUTION_HZ    500000U    /* 1 RMT tick = 2 us */
 #define IR_RX_GPIO          CONFIG_IR_TOOL_IR_RX_GPIO
 #define IR_TX_GPIO          CONFIG_IR_TOOL_IR_TX_GPIO
-#define IR_RX_BUF_SYMBOLS   96         /* 2 mem blocks of 48; NEC frame fits */
+#define IR_RX_BUF_SYMBOLS   IR_RAW_MAX_SEGS  /* user-side RX buffer; a symbol holds 2 segments, so this covers
+                                              * IR_RAW_MAX_SEGS segments with headroom (4KB SRAM at 1024) */
+#define IR_RX_MEM_SYMBOLS   96         /* max HW memory a single RX channel can own on ESP32-C3: the group has
+                                        * 4 blocks x 48 symbols, RX candidates are blocks 2-3 only, so 2 blocks
+                                        * max. The driver ping-pongs 48-symbol halves and copies chunks into the
+                                        * large user buffer (IR_RX_BUF_SYMBOLS), which is what lifts the limit. */
 #define IR_TX_BUF_SYMBOLS   96
 #define IR_RX_MIN_PULSE_NS  1000U      /* glitches < 1 us are ignored */
 #define IR_RX_TIMEOUT_NS    50000000U  /* idle gap > 50 ms ends the frame */
@@ -68,6 +73,13 @@ static bool ir_rx_done_cb(rmt_channel_handle_t ch, const rmt_rx_done_event_data_
 {
     (void)ch;
     (void)udata;
+    /* With en_partial_rx the driver may notify mid-frame chunks when the user
+     * buffer is nearly full. We ignore those: the final is_last event carries
+     * the complete accumulated frame (frames within IR_RAW_MAX_SEGS never
+     * overflow the buffer). */
+    if (!edata->flags.is_last) {
+        return false;
+    }
     s_rx_data = *edata;
     s_rx_done = true;
     return true; /* request context switch so ir_task wakes immediately */
@@ -226,7 +238,7 @@ esp_err_t ir_init(void)
         .gpio_num = IR_RX_GPIO,
         .clk_src = RMT_CLK_SRC_DEFAULT,
         .resolution_hz = IR_RESOLUTION_HZ,
-        .mem_block_symbols = IR_RX_BUF_SYMBOLS,
+        .mem_block_symbols = IR_RX_MEM_SYMBOLS,
         .intr_priority = 0,
         .flags = {
             .invert_in = false,
@@ -244,7 +256,10 @@ esp_err_t ir_init(void)
 
     s_rx_cfg.signal_range_min_ns = IR_RX_MIN_PULSE_NS;
     s_rx_cfg.signal_range_max_ns = IR_RX_TIMEOUT_NS;
-    s_rx_cfg.flags.en_partial_rx = 0;
+    /* long-frame capture: with a large user buffer the driver accumulates
+     * ping-pong chunks in the ISR and reports the whole frame on idle timeout.
+     * Without this the frame would be truncated at 192 symbols on ESP32-C3. */
+    s_rx_cfg.flags.en_partial_rx = 1;
 
     /* Configure RMT TX channel (no DMA; copy encoder segments long payloads) */
     rmt_tx_channel_config_t tx_ch_cfg = {
@@ -274,8 +289,9 @@ esp_err_t ir_init(void)
 
     ESP_RETURN_ON_ERROR(rmt_enable(s_tx_ch), TAG, "enable RMT TX");
 
-    /* create IR receive task */
-    if (xTaskCreate(ir_task, "ir_task", 4096, NULL, 6, NULL) != pdPASS) {
+    /* create IR receive task (stack must fit one ir_frame_t, ~4.2KB at
+     * 1024 segments, plus the analysis call chain) */
+    if (xTaskCreate(ir_task, "ir_task", 8192, NULL, 6, NULL) != pdPASS) {
         return ESP_ERR_NO_MEM;
     }
     /* create playback task */
