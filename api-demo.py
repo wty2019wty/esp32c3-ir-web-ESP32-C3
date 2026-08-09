@@ -13,11 +13,15 @@ api-demo.py - esp32c3-ir-web 演示脚本（WebSocket-only，无 REST API）
   3. 监听 status / frame 推送（收到 status 需回 ack）
   4. 通过 logout 命令退出（服务端回复后关闭连接）
 
+说明：服务端在状态无变化时每 20 秒也会推送一次 status 心跳（仍需回 ack），
+  因此长时间监听不会因 NAT 空闲回收而掉线；若 45 秒内收不到任何消息说明连接已死。
+
 用法示例：
   python api-demo.py                                  # 默认连 192.168.4.1，admin/admin
   python api-demo.py --host 192.168.1.50 --user admin --password xxxx
   python api-demo.py --hxd ED127F80 --freq 38000
   python api-demo.py --listen 8                       # 发完信号后观察 WS 推送并 ack
+  python api-demo.py --listen 0                       # 发完信号后立即退出
   python api-demo.py --raw "Frequency: 38000 Hz
 
 9000, 4500, 560, 560, 1690"
@@ -196,7 +200,9 @@ def ws_rpc(sock, cmd, body=None, timeout=10):
             if msg.get("ok"):
                 return msg.get("data", {})
             raise RuntimeError(msg.get("error", "命令失败"))
-        # 其他类型（login/status/frame 推送）直接跳过
+        # 其他类型（status/frame 推送）：顺手 ack status，避免服务端每秒补发
+        if msg.get("type") == "status" and msg.get("id") is not None:
+            ws_send_text(sock, json.dumps({"type": "ack", "id": msg["id"]}))
     raise TimeoutError(f"WS 命令 {cmd} 超时")
 
 

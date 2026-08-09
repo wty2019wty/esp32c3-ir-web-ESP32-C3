@@ -18,7 +18,8 @@
 - **回放暂停接收**：回放时可自动暂停 IR 接收，避免自环帧干扰，开关持久化到 NVS
 - **WiFi 自动互斥**：配置了连接 WiFi 则只连路由器（不开热点）；未配置则只开热点（SoftAP）；
   STA 连接超时自动降级 SoftAP，保证 Web 始终可达
-- **Web 登录认证**：默认 admin / admin，session token 认证，可在 Web 设置页修改账号密码
+- **Web 登录认证**：默认 admin / admin，通过 WebSocket 登录并管理 session token，
+  可在 Web 设置页修改账号密码
 
 ## 硬件连接
 
@@ -35,10 +36,10 @@
 
 ```powershell
 & 'D:\esp\v6.0.2\esp-idf\export.ps1'
-cd G:\esp32s3\esp32c3-IR
+cd G:\esp32s3\esp32c3-ir-web-ESP32-C3
 idf.py set-target esp32c3
 idf.py build
-idf.py flash monitor
+idf.py -p <PORT> flash monitor   # 例如 -p COM7
 ```
 
 > 首次构建时组件管理器自动下载 `espressif/cjson` 依赖（无需手动操作）。
@@ -93,14 +94,15 @@ idf.py menuconfig   # → "IR Web Tool Configuration"
 ### Web 登录认证
 
 - 默认账号 **admin / admin**，存 NVS；**首次用默认凭据登录会强制修改密码**
-  （登录接口返回 `must_change_pwd`，前端弹出强制改密对话框，保存后自动重新登录）。
-- 访问 Web 页面时会弹出登录框，输入用户名密码后获得 session token，
-  后续请求通过 `X-Auth-Token` 请求头携带 token 认证；token 有效期为 **24 小时**，
-  前端会自动续期（`/api/renew`），过期后需重新登录。
-- 登录连续失败 **5 次** 后锁定 **30 秒**（返回 `429`），防止暴力破解。
-- 支持退出登录（`/api/logout`），服务端立即作废当前 token。
+  （WS 登录返回 `must_change_pwd`，前端弹出强制改密对话框，保存后自动重新登录）。
+- 访问页面时浏览器自动连接 `ws://<IP>/api/ws` 并弹出登录框，输入用户名密码后
+  通过 **WS 登录**获得 session token（**该连接随即成为已认证会话**）；token 有效期为 **24 小时**，
+  前端会自动续期（`renew` 命令），过期后需重新登录。
+- 登录连续失败 **5 次** 后锁定 **30 秒**（`login` 回复 `error:"too many attempts","retry_after":N`），
+  防止暴力破解。
+- 支持退出登录（`logout` 命令），服务端立即作废当前 token 并关闭该连接。
 - WiFi 密码（热点/路由器）**不再回显明文**，设置页只显示"已设置"，留空表示不修改，
-  勾选"清除"才会删除；`GET /api/wificfg` 仅返回 `ap_password_set` / `sta_password_set` 标志。
+  勾选"清除"才会删除；`wificfg` 读取仅返回 `ap_password_set` / `sta_password_set` 标志。
 - 修改登录凭据后会强制注销，需用新账号重新登录。
 
 ### NVS 加密
@@ -156,6 +158,13 @@ idf.py menuconfig   # → "IR Web Tool Configuration"
   - `{"type":"frame","data":{...}}` —— 收到新红外信号时立即推送（单帧对象，同 `frames` 中元素）
   - 前端在认证成功后主动请求一次 `status` 与 `frames`（多段拉取直至追平）完成初始同步；
     连接断开时前端自动重连（10 秒间隔）并重新登录/认证。
+- **连接保活**：即使状态无变化，服务端也**每 20 秒**推送一次 status 心跳，
+  让空闲连接穿过家用路由器/AP 的 NAT 会话回收（此前常表现为 `104 ECONNRESET` 掉线）；
+  前端另有**假死看门狗**：45 秒内未收到任何服务器消息（心跳/推送/响应）即主动重连。
+- **并发安全与背压**：所有服务端→客户端帧都在 httpd 任务内**串行发送**（经
+  `httpd_ws_send_data_async` 入队），避免多任务并发写同一 socket 造成字节交错、
+  客户端解析出 "Invalid frame header"。每连接发送队列有上限（约 4 帧），
+  高频回放 / 连续 IR 事件导致积压时丢弃多余帧，客户端可再用 `frames` 命令补齐。
 - **鉴权与失效**：命令与推送均要求已认证会话；退出登录或修改登录凭据会使会话
   **代数**递增，已连接的 WebSocket 会话随即失效（命令被拒、推送停止），
   防止退出登录后残留连接仍可操作设备。
@@ -209,12 +218,12 @@ esp32c3-IR/
     ├── app_ir_play.c         # hxd/raw 回放编码
     ├── app_ir_store.c        # 帧存储 + 历史环形缓冲 + 回调
     ├── app_wifi.c            # AP/STA/APSTA 三模式 + 超时降级
-    ├── app_web.c             # HTTP server 初始化
-    ├── app_web_api_ir.c      # /api/status, /api/frames, /api/play, /api/carrier, /api/rxpause
-    ├── app_web_api_wifi.c    # /api/wificfg
-    ├── app_web_auth.c        # /api/login, /api/logout, /api/renew, /api/authcfg
-    ├── app_web_rpc.c         # 命令分发（REST 与 WebSocket 共用）+ 帧历史 JSON 构建
-    ├── app_web_ws.c          # WebSocket /api/ws 推送 + 命令 RPC
+    ├── app_web.c             # HTTP server 初始化（仅静态页面 + WS 端点）
+    ├── app_web_api_ir.c      # IR 命令核心（play/carrier/rxpause，WS-only）
+    ├── app_web_api_wifi.c    # WiFi 配置核心（wificfg 读写，WS-only）
+    ├── app_web_auth.c        # WS 登录 / token 认证 / 会话代数 / 凭据管理
+    ├── app_web_rpc.c         # 命令分发（WS cmd → 各模块）+ 帧历史 JSON 构建
+    ├── app_web_ws.c          # WebSocket /api/ws：登录认证、命令 RPC、推送（串行发送 + 心跳）
     ├── app_web_util.c        # JSON 序列化 + HTTP 工具函数
     ├── web/index.html        # 前端单页（内嵌，无需文件系统）
     └── include/              # 各模块头文件
@@ -234,5 +243,7 @@ esp32c3-IR/
   任务处理前检查符号数量阈值 `num > (IR_RAW_MAX_SEGS + 1) / 2`，
   超出则丢弃帧以避免 `ir_analyze` 截断导致解码错误；
   回放结束恢复 RX 时清除溢出标志
-- **Web 数据流**：前端通过 WebSocket（`/api/ws`）接收状态（每秒）与新帧（实时）推送；
-  REST `/api/frames?since=N` 保留作断线回退，服务端 chunked 输出
+- **Web 数据流**：前端通过单条 WebSocket（`/api/ws`）完成登录、认证、命令与推送，
+  **REST API 已移除**。服务器所有帧经 httpd 任务串行发送（入队异步发送 + 每连接队列上限），
+  空闲时每 20 秒推送 status 心跳维持连接，前端 45 秒无数据即重连；
+  命令与推送均要求已认证会话，登出/改密会立即使已连接会话失效。
