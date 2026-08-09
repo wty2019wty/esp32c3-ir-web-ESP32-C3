@@ -268,6 +268,7 @@ function clearAuth() {
   auth = '';
   authExpires = 0;
   wsReady = false;
+  stopStatusPoll();
   setChan();
   sessionStorage.removeItem('auth');
   sessionStorage.removeItem('authExpires');
@@ -427,13 +428,21 @@ let wsCmdId = 0;
 const wsCmdWaiters = new Map();
 const WS_CMD_TIMEOUT_MS = 6000;
 
+/* Active status probe: the server pushes status on change plus a 20s heartbeat,
+ * but passive pushes can't tell a silently-dead socket from a quiet device.
+ * Poll "status" periodically so the page actively verifies the connection and
+ * refreshes the UI even when nothing changed. */
+const STATUS_POLL_MS = 15000;
+let statusPollTimer = null;
+let lastStatusAt = 0; /* last successful active check (ms epoch) */
+
 /* Reflect the WS channel state in the header badge (WS is the only API
  * channel now — no REST fallback). */
 function setChan() {
   const b = $('chanBadge');
   if (wsReady) {
     b.className = 'badge ws';
-    b.textContent = 'WS实时';
+    b.textContent = 'WS实时' + (lastStatusAt ? ' · ' + new Date(lastStatusAt).toLocaleTimeString() : '');
   } else if (ws && ws.readyState === WebSocket.OPEN) {
     b.className = 'badge con';
     b.textContent = 'WS认证中...';
@@ -443,6 +452,35 @@ function setChan() {
   } else {
     b.className = 'badge off';
     b.textContent = 'WS离线(重连中...)';
+  }
+}
+
+function startStatusPoll() {
+  clearInterval(statusPollTimer);
+  statusPollTimer = setInterval(pollStatus, STATUS_POLL_MS);
+}
+
+function stopStatusPoll() {
+  clearInterval(statusPollTimer);
+  statusPollTimer = null;
+}
+
+/* Actively fetch the current status to verify the WS channel is alive and to
+ * refresh the UI even when the server has nothing new to push. On failure the
+ * socket is torn down so the reconnect path (badge + retry) takes over. */
+async function pollStatus() {
+  if (!wsReady || !tokenAlive()) return;
+  try {
+    const s = await rpc('status');
+    lastStatusAt = Date.now();
+    if (ws) ws.lastMsgAt = Date.now(); /* feed the watchdog */
+    applyStatus(s);
+    setChan();
+  } catch (e) {
+    /* dead/blocked socket: tear it down so the retry logic takes over */
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      try { ws.close(); } catch (e2) { /* ignored */ }
+    }
   }
 }
 
@@ -459,6 +497,7 @@ function closeSocket() {
     ws = null;
   }
   wsReady = false;
+  stopStatusPoll();
   clearTimeout(wsRetryTimer);
   wsRetryTimer = null;
   wsCmdWaiters.forEach(w => { clearTimeout(w.timer); w.reject(new Error('ws closed')); });
@@ -544,6 +583,7 @@ function wsConnect() {
         }
         wsSync();
         scheduleRenew();
+        startStatusPoll();
       } else {
         const msg = d.error === 'too many attempts'
           ? ('尝试次数过多，请 ' + (d.retry_after || 30) + ' 秒后再试')
@@ -556,6 +596,7 @@ function wsConnect() {
         wsReady = true;
         setChan();
         wsSync();
+        startStatusPoll();
       } else if (d.ok === false) {
         clearAuth();
         showLogin();
@@ -587,6 +628,7 @@ function wsConnect() {
     clearInterval(s.watchdog);
     ws = null;
     wsReady = false;
+    stopStatusPoll();
     pendingLogin = null;
     setChan();
     /* reject any in-flight WS commands so callers don't hang forever */
