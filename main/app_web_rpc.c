@@ -257,6 +257,23 @@ char *web_rpc_exec(const char *cmd, cJSON *body, const char **err)
         return xstrdup("{}");
     }
 
+    if (strcmp(cmd, "webcfg") == 0) {
+        /* present web_ui => set; otherwise => get */
+        cJSON *j = cJSON_GetObjectItem(body, "web_ui");
+        if (cJSON_IsBool(j)) {
+            const char *e = NULL;
+            if (web_ui_enabled_set(cJSON_IsTrue(j), &e) != ESP_OK) {
+                *err = e ? e : "invalid";
+                return NULL;
+            }
+            return xstrdup("{\"restart\":true}");
+        }
+        char buf[32];
+        snprintf(buf, sizeof(buf), "{\"web_ui\":%s}",
+                 web_ui_enabled_get() ? "true" : "false");
+        return xstrdup(buf);
+    }
+
     *err = "unknown cmd";
     return NULL;
 }

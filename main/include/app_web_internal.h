@@ -39,6 +39,10 @@ esp_err_t web_auth_renew(uint32_t *expires_in);
  * must then mark the connection as authenticated. */
 esp_err_t web_auth_login(const char *user, const char *pass, char **out_json);
 
+/* ---- app_web.c (HTTP server bootstrap + web UI toggle) ---- */
+bool web_ui_enabled_get(void);                        /* true = serve embedded page (default) */
+esp_err_t web_ui_enabled_set(bool enabled, const char **err); /* saves to NVS + schedules restart */
+
 /* ---- app_web_rpc.c (shared REST/WebSocket command execution) ---- */
 /* Execute a command on a parsed JSON body and return the REST-equivalent
  * response JSON (caller frees), or NULL with *err set to a short message. */

@@ -20,6 +20,8 @@
   STA 连接超时自动降级 SoftAP，保证 Web 始终可达
 - **Web 登录认证**：默认 admin / admin，通过 WebSocket 登录并管理 session token，
   可在 Web 设置页修改账号密码
+- **前后端分离（可选）**：登录前可手动填写设备 ws(s) 地址；设置页的"启用内置 Web 界面"
+  开关可让设备**不提供页面、仅保留 `/api/ws`**，供外部前端连接
 
 ## 硬件连接
 
@@ -84,10 +86,12 @@ idf.py menuconfig   # → "IR Web Tool Configuration"
 ### 设置页面与恢复出厂
 
 - 页面顶部切换到 **设置** 页，可配置：热点名称/密码、连接的路由器 WiFi、
-  STA 地址获取方式（DHCP / 静态 IP、掩码、网关、DNS）、Web 登录账号密码。保存后设备 2 秒自动重启生效。
+  STA 地址获取方式（DHCP / 静态 IP、掩码、网关、DNS）、Web 登录账号密码。
+  **服务模式**："启用内置 Web 界面"默认勾选；取消勾选后设备重启将**不再提供内置页面**，
+  仅保留 `ws://<IP>/api/ws`（前后端分离场景，需用外部前端连接）。保存后设备 2 秒自动重启生效。
 - **恢复出厂**：开机后 **2 秒内按住 BOOT 键**（GPIO9）约 50ms，
   设备会擦除全部配置（NVS）并重启，回到默认的**无密码热点**（SSID `ESP32C3-IR`、
-  开放网络、DHCP、38kHz 载波、回放暂停接收开启）。
+  开放网络、DHCP、38kHz 载波、回放暂停接收开启、Web 页面开启）。
   注意：上电瞬间就按住 BOOT 会进入 ROM 下载模式（固件不运行），恢复出厂需在
   固件启动后的 2 秒窗口内按下。
 
@@ -150,6 +154,8 @@ idf.py menuconfig   # → "IR Web Tool Configuration"
     - `authcfg`：body 含 `user`/`pass` = 修改凭据（保存后会话失效需重新登录）；为空 = 读取用户名
     - `renew`：续期会话（`{"expires_in":N}`）
     - `logout`：退出登录，响应后服务端关闭连接
+    - `webcfg`：body 含 `web_ui`（bool）= 设置"启用内置 Web 界面"开关并重启
+      （`{"restart":true}`）；body 为空 = 读取（`{"web_ui":bool}`）
 - **推送消息**：
   - `{"type":"status","id":N,"data":{...}}` —— **状态有变化时才推送**（字段见下），
     携带递增 `id`；客户端收到后需回复 `{"type":"ack","id":N}` 确认抄收，
@@ -172,6 +178,17 @@ idf.py menuconfig   # → "IR Web Tool Configuration"
 `/api/status` 返回的状态字段：`mode`、`ap_ip`、`sta_ip`、`ap_ssid`、`sta_ssid`、
 `sta_ip_mode`、`sta_connected`、`carrier_hz`、`rx_pause_on_play`、`playing`。
 单帧对象字段：`seq`、`ts`、`nec{...}`、`feat{...}`、`freq`、`durs[...]`。
+
+### 前后端分离
+
+页面可与设备分离部署（如托管在 CF Pages / 任意静态服务器）。此时：
+
+- 页面加载后不会自动连接，**登录框内需先手动填写设备地址**（支持
+  `ws://192.168.0.145:80`、`wss://ir.example.com` 或省略协议只填 `host:port`，
+  HTTPS 页面下省略协议默认 `wss://`）；地址保存在浏览器 localStorage，下次自动填入。
+- 若设备关闭了"启用内置 Web 界面"（`webcfg` 的 `web_ui=false`），`/` 与 `/index.html` 返回 404，
+  外部前端仍可通过 `/api/ws` 完整控制（登录、命令、推送）。
+- HTTPS 页面连接明文 `ws://` 可能被浏览器当作混合内容拦截，请使用 `wss://`。
 
 ### HTTPS 反向代理（nginx）部署注意
 
