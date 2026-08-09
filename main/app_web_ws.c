@@ -17,6 +17,12 @@
 
 #define WS_MAX_CLIENTS 6
 
+/* Idle connections get reaped by consumer-router NAT timeouts, which shows up
+ * as ECONNRESET (104) on the next send. Push a status heartbeat this often even
+ * when nothing changed so the path stays warm (choose a value comfortably below
+ * typical home-router NAT idle timeouts). */
+#define WS_HEARTBEAT_INTERVAL_US (20LL * 1000000)
+
 typedef struct {
     int fd;
     bool authed;
@@ -29,6 +35,7 @@ static ws_client_t s_ws_clients[WS_MAX_CLIENTS];
 static SemaphoreHandle_t s_ws_mutex = NULL;
 static uint32_t s_status_id = 0;    /* bumped on every status change */
 static char *s_status_inner = NULL; /* cached status payload (data part) */
+static int64_t s_last_forced_push_us = 0; /* last heartbeat/forced status push (us) */
 
 static void ws_client_remove(int fd)
 {
@@ -263,6 +270,7 @@ static void ws_push_status_now(void)
     if (s_status_id == 0) {
         s_status_id = 1;
     }
+    s_last_forced_push_us = esp_timer_get_time();
     ws_send_status_locked(dead, &ndead);
     xSemaphoreGive(s_ws_mutex);
     for (int i = 0; i < ndead; i++) {
@@ -288,14 +296,20 @@ static void ws_status_timer_cb(void *arg)
         return;
     }
 
-    /* only push when the status actually changed */
+    /* only push when the status actually changed, or as a periodic heartbeat
+     * to keep idle connections alive through NAT idle timeouts */
     bool changed = !s_status_inner || strcmp(s_status_inner, inner) != 0;
-    if (changed) {
+    int64_t now = esp_timer_get_time();
+    bool heartbeat = !changed && (now - s_last_forced_push_us >= WS_HEARTBEAT_INTERVAL_US);
+    if (changed || heartbeat) {
         free(s_status_inner);
         s_status_inner = inner;
         s_status_id++;
         if (s_status_id == 0) {
             s_status_id = 1; /* skip 0 so "not acked yet" stays distinguishable */
+        }
+        if (heartbeat) {
+            s_last_forced_push_us = now;
         }
     } else {
         free(inner);

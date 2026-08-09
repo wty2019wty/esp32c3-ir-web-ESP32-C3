@@ -447,8 +447,17 @@ function wsConnect() {
     return;
   }
   ws = s;
+  s.lastMsgAt = Date.now();
+  /* watchdog: if the server goes silent (dead NAT hole, network drop that
+   * doesn't fire onclose), force a reconnect */
+  s.watchdog = setInterval(() => {
+    if (Date.now() - s.lastMsgAt > 45000) {
+      try { s.close(); } catch (e) { /* ignored */ }
+    }
+  }, 5000);
   setChan();
   s.onopen = () => {
+    s.lastMsgAt = Date.now();
     setChan();
     if (tokenAlive()) {
       /* existing session: authenticate with the stored token */
@@ -457,6 +466,7 @@ function wsConnect() {
     /* no token: wait for the user to login via the login command */
   };
   s.onmessage = (ev) => {
+    s.lastMsgAt = Date.now();
     let d;
     try { d = JSON.parse(ev.data); } catch (e) { return; }
     if (d.type === 'login') {
@@ -516,6 +526,7 @@ function wsConnect() {
     }
   };
   s.onclose = () => {
+    clearInterval(s.watchdog);
     ws = null;
     wsReady = false;
     pendingLogin = null;
