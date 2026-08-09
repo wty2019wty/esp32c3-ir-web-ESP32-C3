@@ -216,6 +216,11 @@
       <label>确认新密码</label>
       <input type="password" id="cfgAuthPass2" maxlength="63">
     </div>
+    <div class="row" style="margin-top:10px;">
+      <label style="display:flex;align-items:center;gap:8px;cursor:pointer;">
+        <input type="checkbox" id="cfgAuthSingle"> 单设备登录（新登录将踢出其他设备）
+      </label>
+    </div>
     <div class="row" style="margin-top:12px;">
       <button onclick="saveAuthCfg()">保存登录设置</button>
       <span id="authStatus"></span>
@@ -887,6 +892,7 @@ async function loadWifiCfg() {
     try {
       const a = await rpc('authcfg');
       $('cfgAuthUser').value = a.user;
+      $('cfgAuthSingle').checked = !!a.single_session;
     } catch (e) { /* ignore */ }
   } catch (e) {
     $('cfgStatus').textContent = '读取配置失败';
@@ -967,17 +973,22 @@ async function saveAuthCfg() {
   if (!u) { $('authStatus').textContent = '用户名不能为空'; return; }
   if (p !== p2) { $('authStatus').textContent = '两次输入的密码不一致'; return; }
   if (p !== '' && p.length < 4) { $('authStatus').textContent = '密码至少 4 位'; return; }
-  const body = { user: u };
-  if (p !== '') body.pass = p;
+  const credsChanged = p !== '';
+  const body = { user: u, single_session: $('cfgAuthSingle').checked };
+  if (credsChanged) body.pass = p;
   try {
     const d = await rpc('authcfg', body);
     if (d.ok) {
       $('authStatus').textContent = '已保存';
       $('cfgAuthPass').value = '';
       $('cfgAuthPass2').value = '';
-      toast('登录设置已保存，请重新登录');
-      clearAuth();
-      showLogin();
+      if (credsChanged) {
+        toast('登录设置已保存，请重新登录');
+        clearAuth();
+        showLogin();
+      } else {
+        toast('设置已保存');
+      }
     }
   } catch (e) {
     $('authStatus').textContent = '保存失败：' + ((e.payload && e.payload.error) || e.message || '请求失败');

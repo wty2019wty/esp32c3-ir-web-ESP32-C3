@@ -20,6 +20,8 @@
   STA 连接超时自动降级 SoftAP，保证 Web 始终可达
 - **Web 登录认证**：默认 admin / admin，通过 WebSocket 登录并管理 session token，
   可在 Web 设置页修改账号密码
+- **单设备登录（默认开启）**：开启后每次登录都会签发全新 token 并踢出所有旧会话，
+  防止他人用相同账号在别处登录；可在 Web 设置页关闭（关闭后同账号多端共享会话）
 - **前后端分离（可选）**：登录前可手动填写设备 ws(s) 地址；设置页的"启用内置 Web 界面"
   开关可让设备**不提供页面、仅保留 `/api/ws`**，供外部前端连接
 
@@ -86,7 +88,8 @@ idf.py menuconfig   # → "IR Web Tool Configuration"
 ### 设置页面与恢复出厂
 
 - 页面顶部切换到 **设置** 页，可配置：热点名称/密码、连接的路由器 WiFi、
-  STA 地址获取方式（DHCP / 静态 IP、掩码、网关、DNS）、Web 登录账号密码。
+  STA 地址获取方式（DHCP / 静态 IP、掩码、网关、DNS）、Web 登录账号密码、
+  **单设备登录开关**（默认开启）。
   **服务模式**："启用内置 Web 界面"默认勾选；取消勾选后设备重启将**不再提供内置页面**，
   仅保留 `ws://<IP>/api/ws`（前后端分离场景，需用外部前端连接）。保存后设备 2 秒自动重启生效。
 - **恢复出厂**：开机后 **2 秒内按住 BOOT 键**（GPIO9）约 50ms，
@@ -105,9 +108,14 @@ idf.py menuconfig   # → "IR Web Tool Configuration"
 - 登录连续失败 **5 次** 后锁定 **30 秒**（`login` 回复 `error:"too many attempts","retry_after":N`），
   防止暴力破解。
 - 支持退出登录（`logout` 命令），服务端立即作废当前 token 并关闭该连接。
+- **单设备登录**：设置页"Web 登录"卡片提供**单设备登录**开关（**默认开启**）。开启时，
+  只要设备上已有活跃会话，任何一次新登录都会**生成全新 token 并递增会话代数**，
+  此前所有已认证的 WebSocket 连接随即被踢下线（命令被拒、推送停止），从而防止
+  多个设备/浏览器同时在线；关闭后回到原来的行为：同账号多端共享同一 token、
+  互不踢下线（便于多标签页同时使用）。
 - WiFi 密码（热点/路由器）**不再回显明文**，设置页只显示"已设置"，留空表示不修改，
   勾选"清除"才会删除；`wificfg` 读取仅返回 `ap_password_set` / `sta_password_set` 标志。
-- 修改登录凭据后会强制注销，需用新账号重新登录。
+- 修改登录凭据后会强制注销，需用新账号重新登录（仅切换单设备登录开关不强制重新登录）。
 
 ### NVS 加密
 
@@ -151,7 +159,9 @@ idf.py menuconfig   # → "IR Web Tool Configuration"
       `last_seq` 为实际返回的最后一帧，客户端应使用该 `last_seq` 继续拉取直至追平
     - `wificfg`：body 含配置字段 = 保存并重启（`{"restart":true}`）；body 为空 = 读取
       （密码不回显，`ap_password_set`/`sta_password_set` 标志；密码传 `null` 表示不修改、空字符串表示清除）
-    - `authcfg`：body 含 `user`/`pass` = 修改凭据（保存后会话失效需重新登录）；为空 = 读取用户名
+    - `authcfg`：body 含 `user`/`pass` = 修改凭据（保存后会话失效需重新登录）；
+      含 `single_session`（bool）= 设置"单设备登录"开关（默认开启）；body 为空 = 读取
+      （`{"user":...,"single_session":bool}`）
     - `renew`：续期会话（`{"expires_in":N}`）
     - `logout`：退出登录，响应后服务端关闭连接
     - `webcfg`：body 含 `web_ui`（bool）= 设置"启用内置 Web 界面"开关并重启
@@ -173,7 +183,8 @@ idf.py menuconfig   # → "IR Web Tool Configuration"
   高频回放 / 连续 IR 事件导致积压时丢弃多余帧，客户端可再用 `frames` 命令补齐。
 - **鉴权与失效**：命令与推送均要求已认证会话；退出登录或修改登录凭据会使会话
   **代数**递增，已连接的 WebSocket 会话随即失效（命令被拒、推送停止），
-  防止退出登录后残留连接仍可操作设备。
+  防止退出登录后残留连接仍可操作设备。开启**单设备登录**（默认）时，新登录同样
+  递增会话代数，令所有旧会话立即失效。
 
 `status` 推送（及 `status` 命令）中的 `data` 字段：`mode`、`ap_ip`、`sta_ip`、`ap_ssid`、
 `sta_ssid`、`sta_ip_mode`、`sta_connected`、`carrier_hz`、`rx_pause_on_play`、`playing`。
