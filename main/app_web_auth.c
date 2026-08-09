@@ -4,7 +4,6 @@
 #include "app_web_internal.h"
 #include "esp_http_server.h"
 #include "esp_log.h"
-#include "esp_check.h"
 #include "esp_timer.h"
 #include "esp_random.h"
 #include "nvs_flash.h"
@@ -62,7 +61,7 @@ uint32_t web_auth_get_gen(void)
 
 /* Single-session mode: every login issues a brand-new token and bumps the
  * session generation, so logging in on another device/tab kicks out all
- * previously authenticated sessions. Persisted in NVS (default: off). */
+ * previously authenticated sessions. Persisted in NVS (default: on). */
 bool web_auth_single_session_get(void)
 {
     uint8_t v = 1; /* default: single-session on */
@@ -76,22 +75,40 @@ bool web_auth_single_session_get(void)
     return v != 0;
 }
 
-esp_err_t web_auth_single_session_set(bool enabled, const char **err)
+/* Persist credentials and/or the single-session policy through one NVS handle
+ * and a single commit, so a partial failure cannot leave the two settings out
+ * of sync. Pass NULL for a field that must be left untouched. */
+static esp_err_t web_auth_save_all(const web_auth_cfg_t *cfg, const bool *single_session,
+                                   const char **err)
 {
     nvs_handle_t h;
-    if (nvs_open(AUTH_NS, NVS_READWRITE, &h) != ESP_OK) {
-        *err = "nvs open failed";
-        return ESP_FAIL;
+    esp_err_t e = nvs_open(AUTH_NS, NVS_READWRITE, &h);
+    if (e != ESP_OK) {
+        if (err) *err = "nvs open failed";
+        return e;
     }
-    esp_err_t e = nvs_set_u8(h, AUTH_KEY_SINGLE, enabled ? 1 : 0);
+    if (cfg) {
+        e = nvs_set_str(h, AUTH_KEY_USER, cfg->user);
+        if (e == ESP_OK) {
+            e = nvs_set_str(h, AUTH_KEY_PASS, cfg->pass);
+        }
+    }
+    if (e == ESP_OK && single_session) {
+        e = nvs_set_u8(h, AUTH_KEY_SINGLE, *single_session ? 1 : 0);
+    }
     if (e == ESP_OK) {
         e = nvs_commit(h);
     }
     nvs_close(h);
-    if (e != ESP_OK) {
+    if (e != ESP_OK && err) {
         *err = "nvs write failed";
     }
     return e;
+}
+
+esp_err_t web_auth_single_session_set(bool enabled, const char **err)
+{
+    return web_auth_save_all(NULL, &enabled, err);
 }
 
 /* Extend the current session for another full TTL; fails if no session is active. */
@@ -124,17 +141,6 @@ static void web_auth_load(web_auth_cfg_t *cfg)
         strlcpy(cfg->pass, AUTH_DEF_PASS, sizeof(cfg->pass));
     }
     nvs_close(h);
-}
-
-static esp_err_t web_auth_save(const web_auth_cfg_t *cfg)
-{
-    nvs_handle_t h;
-    ESP_RETURN_ON_ERROR(nvs_open(AUTH_NS, NVS_READWRITE, &h), TAG, "open nvs");
-    esp_err_t err = nvs_set_str(h, AUTH_KEY_USER, cfg->user);
-    if (err == ESP_OK) err = nvs_set_str(h, AUTH_KEY_PASS, cfg->pass);
-    if (err == ESP_OK) err = nvs_commit(h);
-    nvs_close(h);
-    return err;
 }
 
 /* Constant-time equality; returns false on length mismatch. */
@@ -278,8 +284,10 @@ esp_err_t web_authcfg_set(cJSON *root, const char **err)
     bool creds_changed = false;
     cJSON *j = cJSON_GetObjectItem(root, "user");
     if (cJSON_IsString(j) && j->valuestring[0] != '\0') {
-        strlcpy(cfg.user, j->valuestring, sizeof(cfg.user));
-        creds_changed = true;
+        if (strcmp(j->valuestring, cfg.user) != 0) {
+            strlcpy(cfg.user, j->valuestring, sizeof(cfg.user));
+            creds_changed = true;
+        }
     }
     j = cJSON_GetObjectItem(root, "pass");
     if (cJSON_IsString(j) && j->valuestring[0] != '\0') {
@@ -287,23 +295,26 @@ esp_err_t web_authcfg_set(cJSON *root, const char **err)
             *err = "pass must be 4-63 chars";
             return ESP_ERR_INVALID_ARG;
         }
-        strlcpy(cfg.pass, j->valuestring, sizeof(cfg.pass));
-        creds_changed = true;
+        if (strcmp(j->valuestring, cfg.pass) != 0) {
+            strlcpy(cfg.pass, j->valuestring, sizeof(cfg.pass));
+            creds_changed = true;
+        }
     }
 
     cJSON *s = cJSON_GetObjectItem(root, "single_session");
-    if (cJSON_IsBool(s)) {
-        if (web_auth_single_session_set(cJSON_IsTrue(s), err) != ESP_OK) {
-            return ESP_FAIL;
+    bool single_present = cJSON_IsBool(s);
+
+    if (creds_changed || single_present) {
+        bool single_val = cJSON_IsTrue(s);
+        esp_err_t ret = web_auth_save_all(creds_changed ? &cfg : NULL,
+                                          single_present ? &single_val : NULL,
+                                          err);
+        if (ret != ESP_OK) {
+            return ret;
         }
     }
 
     if (creds_changed) {
-        esp_err_t ret = web_auth_save(&cfg);
-        if (ret != ESP_OK) {
-            *err = "nvs write failed";
-            return ret;
-        }
         /* credentials changed: force a fresh login (kills existing WS sessions too) */
         web_auth_invalidate();
     }

@@ -272,6 +272,7 @@ function esc(s) {
 const TOKEN_TTL_MS = 24 * 60 * 60 * 1000;
 let auth = sessionStorage.getItem('auth') || '';
 let authExpires = Number(sessionStorage.getItem('authExpires') || 0);
+let cfgAuthUserLoaded = ''; /* current login user reported by the server (auth settings change detection) */
 if (auth && !authExpires) authExpires = Date.now() + TOKEN_TTL_MS; /* sessions from older firmware */
 function tokenAlive() { return auth && authExpires && Date.now() < authExpires; }
 function clearAuth() {
@@ -891,6 +892,7 @@ async function loadWifiCfg() {
     } catch (e) { /* ignore */ }
     try {
       const a = await rpc('authcfg');
+      cfgAuthUserLoaded = a.user;
       $('cfgAuthUser').value = a.user;
       $('cfgAuthSingle').checked = !!a.single_session;
     } catch (e) { /* ignore */ }
@@ -973,15 +975,19 @@ async function saveAuthCfg() {
   if (!u) { $('authStatus').textContent = '用户名不能为空'; return; }
   if (p !== p2) { $('authStatus').textContent = '两次输入的密码不一致'; return; }
   if (p !== '' && p.length < 4) { $('authStatus').textContent = '密码至少 4 位'; return; }
-  const credsChanged = p !== '';
-  const body = { user: u, single_session: $('cfgAuthSingle').checked };
-  if (credsChanged) body.pass = p;
+  const userChanged = u !== cfgAuthUserLoaded;
+  const passChanged = p !== '';
+  const credsChanged = userChanged || passChanged;
+  const body = { single_session: $('cfgAuthSingle').checked };
+  if (userChanged) body.user = u;
+  if (passChanged) body.pass = p;
   try {
     const d = await rpc('authcfg', body);
     if (d.ok) {
       $('authStatus').textContent = '已保存';
       $('cfgAuthPass').value = '';
       $('cfgAuthPass2').value = '';
+      cfgAuthUserLoaded = u;
       if (credsChanged) {
         toast('登录设置已保存，请重新登录');
         clearAuth();
