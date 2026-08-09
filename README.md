@@ -61,10 +61,11 @@ idf.py menuconfig   # → "IR Web Tool Configuration"
 | SoftAP max connections | 4 | 热点最大连接数 |
 | Station SSID / password | 空 | 连接的路由器凭据（Web 设置页修改；非空则自动切 STA 模式） |
 | STA timeout | 10000 ms | STA 连接超时后降级为 SoftAP |
-| DHCP hostname | esp32c3-ir-web | 路由器客户端列表中显示的主机名 |
+| DHCP hostname | ir-web | 路由器客户端列表中显示的主机名 |
 | HTTP port | 80 | Web 服务端口 |
-| History depth | 32 | RAM 历史帧条数 |
-| Max RMT symbols | 2048 | 原始数据回放的最大 RMT 符号数 |
+| History depth | 8 | RAM 历史帧条数（每帧约 4.2KB，8 帧 ≈ 34KB） |
+| Max RX segments | 1024 | 每帧最大交替段数（空调协议常超 300 段） |
+| Max TX symbols | 2048 | 原始数据回放的最大 RMT 符号数 |
 
 > 工作模式自动互斥：配置了 STA SSID 则设备只连接路由器（不开热点）；STA SSID 为空则只开热点。
 > 两者不会同时开启。
@@ -184,9 +185,17 @@ esp32c3-IR/
     ├── idf_component.yml     # 依赖 espressif/cjson
     ├── Kconfig.projbuild     # 引脚/载波/WiFi/HTTP/认证配置项
     ├── app_main.c            # NVS → IR → WiFi → Web
-    ├── app_ir.c              # RMT RX/TX + NEC 解码 + hxd/raw 回放 + 载波 + RAM 历史
+    ├── app_ir.c              # RMT RX/TX 核心 + 载波 + RAM 历史
+    ├── app_ir_nec.c          # NEC 协议解码
+    ├── app_ir_play.c         # hxd/raw 回放编码
+    ├── app_ir_store.c        # 帧存储 + 历史环形缓冲 + 回调
     ├── app_wifi.c            # AP/STA/APSTA 三模式 + 超时降级
-    ├── app_web.c             # HTTP server + JSON API + 登录认证
+    ├── app_web.c             # HTTP server 初始化
+    ├── app_web_api_ir.c      # /api/status, /api/frames, /api/play, /api/carrier, /api/rxpause
+    ├── app_web_api_wifi.c    # /api/wificfg
+    ├── app_web_auth.c        # /api/login, /api/logout, /api/renew, /api/authcfg
+    ├── app_web_ws.c          # WebSocket /api/ws 推送
+    ├── app_web_util.c        # JSON 序列化 + HTTP 工具函数
     ├── web/index.html        # 前端单页（内嵌，无需文件系统）
     └── include/              # 各模块头文件
 ```
@@ -194,10 +203,16 @@ esp32c3-IR/
 ## 实现要点
 
 - **C3 无 RMT DMA**：RX/TX 各用 96 symbols（2×48 内存块），驱动自动 ping-pong；
-  单帧上限 96 symbols（NEC 完整帧 34 symbols），长原始数据回放由 copy encoder 分段发送
+  单帧上限 96 symbols（NEC 完整帧 34 symbols），长原始数据回放由 copy encoder 分段发送；
+  RX 用户缓冲区按 `Max RX segments`（默认 1024）分配，支持超长帧（如空调协议）
 - **回放极性**：采集自 VS1838B（active-low）的帧在分析时归一化为"首段载波开"的
   逻辑序列，回放/显示直接复用；RMT TX 只在电平 1 时输出载波
 - **载波动态切换**：`rmt_apply_carrier` 无状态限制，回放前可即时重设
-- **内存**：历史帧静态环形缓冲（32 帧 × 约 1.1KB ≈ 36KB），不依赖文件系统
+- **内存**：历史帧静态环形缓冲（8 帧 × 约 4.2KB ≈ 34KB），不依赖文件系统；
+  `ir_task` 栈大小为 `sizeof(ir_frame_t) + 4096`（随 `IR_RAW_MAX_SEGS` 动态调整）
+- **RX 缓冲区溢出保护**：ISR 通过 `s_rx_overflow` 标志追踪部分接收事件，
+  任务处理前检查符号数量阈值 `num > (IR_RAW_MAX_SEGS + 1) / 2`，
+  超出则丢弃帧以避免 `ir_analyze` 截断导致解码错误；
+  回放结束恢复 RX 时清除溢出标志
 - **Web 数据流**：前端通过 WebSocket（`/api/ws`）接收状态（每秒）与新帧（实时）推送；
   REST `/api/frames?since=N` 保留作断线回退，服务端 chunked 输出
