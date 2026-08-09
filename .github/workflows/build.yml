@@ -1,5 +1,5 @@
 # 固件构建 CI：push / PR 时用 Espressif 官方 ESP-IDF Docker 镜像编译固件，
-# 确保代码能通过编译。target = esp32c3，IDF 版本与 README 一致（v6.0.2）。
+# 确保代码能通过编译。target = esp32s3，IDF 版本与 README 一致（v6.0.2）。
 name: Build firmware
 
 on:
@@ -20,11 +20,11 @@ jobs:
         uses: espressif/esp-idf-ci-action@v1
         with:
           esp_idf_version: v6.0.2
-          target: esp32c3
+          target: esp32s3
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: esp32c3-firmware
+          name: esp32s3-firmware
           path: |
             build/*.bin
             build/*.elf
