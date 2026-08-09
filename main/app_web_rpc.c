@@ -229,8 +229,9 @@ char *web_rpc_exec(const char *cmd, cJSON *body, const char **err)
     }
 
     if (strcmp(cmd, "authcfg") == 0) {
-        /* present user/pass fields => set; otherwise => get */
-        if (cJSON_GetObjectItem(body, "user") || cJSON_GetObjectItem(body, "pass")) {
+        /* present user/pass/single_session fields => set; otherwise => get */
+        if (cJSON_GetObjectItem(body, "user") || cJSON_GetObjectItem(body, "pass") ||
+            cJSON_GetObjectItem(body, "single_session")) {
             const char *e = NULL;
             if (web_authcfg_set(body, &e) != ESP_OK) {
                 *err = e ? e : "invalid";

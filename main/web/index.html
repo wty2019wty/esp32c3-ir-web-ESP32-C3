@@ -63,6 +63,13 @@
   .connbtn:hover { background: #2f6fed; }
   #logoutBtn { background: #3a3f4a; }
   #logoutBtn:hover { background: #5c1f1f; }
+  #footer { margin-top: 24px; padding-top: 16px; border-top: 1px solid #2a2f3a;
+            font-size: 13px; color: #9aa3b3; text-align: center; line-height: 1.8; }
+  #footer .footerlink { display: inline-block; background: #1a1d24; border: 1px solid #2f6fed;
+            color: #a6c8ff; border-radius: 8px; padding: 8px 14px; margin: 4px;
+            text-decoration: none; font-weight: 600; word-break: break-all; }
+  #footer .footerlink svg { vertical-align: -3px; margin-right: 4px; }
+  #footer .footerlink:hover { background: #2f6fed; color: #fff; }
 </style>
 </head>
 <body>
@@ -216,6 +223,11 @@
       <label>确认新密码</label>
       <input type="password" id="cfgAuthPass2" maxlength="63">
     </div>
+    <div class="row" style="margin-top:10px;">
+      <label style="display:flex;align-items:center;gap:8px;cursor:pointer;">
+        <input type="checkbox" id="cfgAuthSingle"> 单设备登录（新登录将踢出其他设备）
+      </label>
+    </div>
     <div class="row" style="margin-top:12px;">
       <button onclick="saveAuthCfg()">保存登录设置</button>
       <span id="authStatus"></span>
@@ -251,6 +263,17 @@
 
 <div id="toast"></div>
 
+<div id="footer">
+  <a class="footerlink" href="https://github.com/wty2019wty/esp32c3-ir-web-ESP32-C3/" target="_blank" rel="noopener">
+    <svg viewBox="0 0 20 20" width="16" height="16" fill="currentColor" aria-hidden="true"><g transform="translate(-84, -7399)"><path d="M94,7399 C99.523,7399 104,7403.59 104,7409.253 C104,7413.782 101.138,7417.624 97.167,7418.981 C96.66,7419.082 96.48,7418.762 96.48,7418.489 C96.48,7418.151 96.492,7417.047 96.492,7415.675 C96.492,7414.719 96.172,7414.095 95.813,7413.777 C98.04,7413.523 100.38,7412.656 100.38,7408.718 C100.38,7407.598 99.992,7406.684 99.35,7405.966 C99.454,7405.707 99.797,7404.664 99.252,7403.252 C99.252,7403.252 98.414,7402.977 96.505,7404.303 C95.706,7404.076 94.85,7403.962 94,7403.958 C93.15,7403.962 92.295,7404.076 91.497,7404.303 C89.586,7402.977 88.746,7403.252 88.746,7403.252 C88.203,7404.664 88.546,7405.707 88.649,7405.966 C88.01,7406.684 87.619,7407.598 87.619,7408.718 C87.619,7412.646 89.954,7413.526 92.175,7413.785 C91.889,7414.041 91.63,7414.493 91.54,7415.156 C90.97,7415.418 89.522,7415.871 88.63,7414.304 C88.63,7414.304 88.101,7413.319 87.097,7413.247 C87.097,7413.247 86.122,7413.234 87.029,7413.87 C87.029,7413.87 87.684,7414.185 88.139,7415.37 C88.139,7415.37 88.726,7417.2 91.508,7416.58 C91.513,7417.437 91.522,7418.245 91.522,7418.489 C91.522,7418.76 91.338,7419.077 90.839,7418.982 C86.865,7417.627 84,7413.783 84,7409.253 C84,7403.59 88.478,7399 94,7399"/></g></svg>
+    GitHub 项目地址：esp32c3-ir-web-ESP32-C3
+  </a>
+  ｜
+  <a class="footerlink" href="https://www.gnu.org/licenses/gpl-3.0.html" target="_blank" rel="noopener">
+    开源协议：GPL-3.0
+  </a>
+</div>
+
 <script>
 let lastSeq = 0;
 let frames = [];      // ordered list of frames (oldest -> newest)
@@ -267,6 +290,7 @@ function esc(s) {
 const TOKEN_TTL_MS = 24 * 60 * 60 * 1000;
 let auth = sessionStorage.getItem('auth') || '';
 let authExpires = Number(sessionStorage.getItem('authExpires') || 0);
+let cfgAuthUserLoaded = ''; /* current login user reported by the server (auth settings change detection) */
 if (auth && !authExpires) authExpires = Date.now() + TOKEN_TTL_MS; /* sessions from older firmware */
 function tokenAlive() { return auth && authExpires && Date.now() < authExpires; }
 function clearAuth() {
@@ -479,16 +503,18 @@ function stopStatusPoll() {
  * socket is torn down so the reconnect path (badge + retry) takes over. */
 async function pollStatus() {
   if (!wsReady || !tokenAlive()) return;
+  const target = ws;
   try {
     const s = await rpc('status');
     lastStatusAt = Date.now();
-    if (ws) ws.lastMsgAt = Date.now(); /* feed the watchdog */
+    if (ws === target) target.lastMsgAt = Date.now(); /* feed the watchdog */
     applyStatus(s);
     setChan();
   } catch (e) {
-    /* dead/blocked socket: tear it down so the retry logic takes over */
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      try { ws.close(); } catch (e2) { /* ignored */ }
+    /* dead/blocked socket: tear it down so the retry logic takes over. Only
+     * close the socket this probe used, never a newer replacement. */
+    if (target && ws === target && target.readyState === WebSocket.OPEN) {
+      try { target.close(); } catch (e2) { /* ignored */ }
     }
   }
 }
@@ -511,6 +537,7 @@ function reconnect() {
  * the page stays disconnected until the user reconnects (or reloads). */
 function disconnect() {
   wsManualClosed = true;
+  pendingLogin = null;
   closeSocket();
   setChan();
 }
@@ -571,6 +598,7 @@ function wsConnect() {
     return;
   }
   ws = s;
+  lastStatusAt = 0; /* fresh connection: no verified-alive timestamp yet */
   s.lastMsgAt = Date.now();
   /* watchdog: if the server goes silent (dead NAT hole, network drop that
    * doesn't fire onclose), force a reconnect */
@@ -588,8 +616,12 @@ function wsConnect() {
     } else if (tokenAlive()) {
       /* existing session: authenticate with the stored token */
       try { s.send(JSON.stringify({ type: 'auth', token: auth })); } catch (e) { /* ignored */ }
+    } else {
+      /* expired/missing token (e.g. reconnecting after the token expired while
+       * disconnected): prompt the user to log in again */
+      clearAuth();
+      showLogin();
     }
-    /* no token and no pending login: wait for the user to submit the form */
   };
   s.onmessage = (ev) => {
     s.lastMsgAt = Date.now();
@@ -878,7 +910,9 @@ async function loadWifiCfg() {
     } catch (e) { /* ignore */ }
     try {
       const a = await rpc('authcfg');
+      cfgAuthUserLoaded = a.user;
       $('cfgAuthUser').value = a.user;
+      $('cfgAuthSingle').checked = !!a.single_session;
     } catch (e) { /* ignore */ }
   } catch (e) {
     $('cfgStatus').textContent = '读取配置失败';
@@ -959,17 +993,26 @@ async function saveAuthCfg() {
   if (!u) { $('authStatus').textContent = '用户名不能为空'; return; }
   if (p !== p2) { $('authStatus').textContent = '两次输入的密码不一致'; return; }
   if (p !== '' && p.length < 4) { $('authStatus').textContent = '密码至少 4 位'; return; }
-  const body = { user: u };
-  if (p !== '') body.pass = p;
+  const userChanged = u !== cfgAuthUserLoaded;
+  const passChanged = p !== '';
+  const credsChanged = userChanged || passChanged;
+  const body = { single_session: $('cfgAuthSingle').checked };
+  if (userChanged) body.user = u;
+  if (passChanged) body.pass = p;
   try {
     const d = await rpc('authcfg', body);
     if (d.ok) {
       $('authStatus').textContent = '已保存';
       $('cfgAuthPass').value = '';
       $('cfgAuthPass2').value = '';
-      toast('登录设置已保存，请重新登录');
-      clearAuth();
-      showLogin();
+      cfgAuthUserLoaded = u;
+      if (credsChanged) {
+        toast('登录设置已保存，请重新登录');
+        clearAuth();
+        showLogin();
+      } else {
+        toast('设置已保存');
+      }
     }
   } catch (e) {
     $('authStatus').textContent = '保存失败：' + ((e.payload && e.payload.error) || e.message || '请求失败');

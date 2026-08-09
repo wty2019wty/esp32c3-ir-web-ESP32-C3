@@ -4,7 +4,6 @@
 #include "app_web_internal.h"
 #include "esp_http_server.h"
 #include "esp_log.h"
-#include "esp_check.h"
 #include "esp_timer.h"
 #include "esp_random.h"
 #include "nvs_flash.h"
@@ -14,11 +13,12 @@
 #define TAG "web"
 
 /* web login (token auth; NVS user/pass, default admin/admin) */
-#define AUTH_NS        "ir_tool"
-#define AUTH_KEY_USER  "web_user"
-#define AUTH_KEY_PASS  "web_pass"
-#define AUTH_DEF_USER  "admin"
-#define AUTH_DEF_PASS  "admin"
+#define AUTH_NS         "ir_tool"
+#define AUTH_KEY_USER   "web_user"
+#define AUTH_KEY_PASS   "web_pass"
+#define AUTH_KEY_SINGLE "auth_single"
+#define AUTH_DEF_USER   "admin"
+#define AUTH_DEF_PASS   "admin"
 #define AUTH_TOKEN_LEN 32   /* hex chars */
 #define TOKEN_TTL_US   (24LL * 60 * 60 * 1000000)  /* session validity: 24h */
 #define LOGIN_MAX_FAILS 5
@@ -35,6 +35,15 @@ static int s_login_fails = 0;                  /* consecutive failed logins */
 static int64_t s_login_lock_until = 0;         /* login lockout until this time (us) */
 static uint32_t s_auth_gen = 1;                /* bumped whenever the session is invalidated */
 
+/* Bump the session generation; connected WebSocket sessions authenticated
+ * against an older generation are rejected (see app_web_ws.c). */
+static void web_auth_gen_bump(void)
+{
+    if (++s_auth_gen == 0) {
+        s_auth_gen = 1;
+    }
+}
+
 /* Invalidate the active session token and bump the session generation so that
  * already-connected WebSocket sessions authenticated against the old token are
  * rejected (see app_web_ws.c). */
@@ -42,14 +51,64 @@ void web_auth_invalidate(void)
 {
     s_token[0] = '\0';
     s_token_ts = 0;
-    if (++s_auth_gen == 0) {
-        s_auth_gen = 1;
-    }
+    web_auth_gen_bump();
 }
 
 uint32_t web_auth_get_gen(void)
 {
     return s_auth_gen;
+}
+
+/* Single-session mode: every login issues a brand-new token and bumps the
+ * session generation, so logging in on another device/tab kicks out all
+ * previously authenticated sessions. Persisted in NVS (default: on). */
+bool web_auth_single_session_get(void)
+{
+    uint8_t v = 1; /* default: single-session on */
+    nvs_handle_t h;
+    if (nvs_open(AUTH_NS, NVS_READONLY, &h) == ESP_OK) {
+        if (nvs_get_u8(h, AUTH_KEY_SINGLE, &v) != ESP_OK) {
+            v = 1;
+        }
+        nvs_close(h);
+    }
+    return v != 0;
+}
+
+/* Persist credentials and/or the single-session policy through one NVS handle
+ * and a single commit, so a partial failure cannot leave the two settings out
+ * of sync. Pass NULL for a field that must be left untouched. */
+static esp_err_t web_auth_save_all(const web_auth_cfg_t *cfg, const bool *single_session,
+                                   const char **err)
+{
+    nvs_handle_t h;
+    esp_err_t e = nvs_open(AUTH_NS, NVS_READWRITE, &h);
+    if (e != ESP_OK) {
+        if (err) *err = "nvs open failed";
+        return e;
+    }
+    if (cfg) {
+        e = nvs_set_str(h, AUTH_KEY_USER, cfg->user);
+        if (e == ESP_OK) {
+            e = nvs_set_str(h, AUTH_KEY_PASS, cfg->pass);
+        }
+    }
+    if (e == ESP_OK && single_session) {
+        e = nvs_set_u8(h, AUTH_KEY_SINGLE, *single_session ? 1 : 0);
+    }
+    if (e == ESP_OK) {
+        e = nvs_commit(h);
+    }
+    nvs_close(h);
+    if (e != ESP_OK && err) {
+        *err = "nvs write failed";
+    }
+    return e;
+}
+
+esp_err_t web_auth_single_session_set(bool enabled, const char **err)
+{
+    return web_auth_save_all(NULL, &enabled, err);
 }
 
 /* Extend the current session for another full TTL; fails if no session is active. */
@@ -82,17 +141,6 @@ static void web_auth_load(web_auth_cfg_t *cfg)
         strlcpy(cfg->pass, AUTH_DEF_PASS, sizeof(cfg->pass));
     }
     nvs_close(h);
-}
-
-static esp_err_t web_auth_save(const web_auth_cfg_t *cfg)
-{
-    nvs_handle_t h;
-    ESP_RETURN_ON_ERROR(nvs_open(AUTH_NS, NVS_READWRITE, &h), TAG, "open nvs");
-    esp_err_t err = nvs_set_str(h, AUTH_KEY_USER, cfg->user);
-    if (err == ESP_OK) err = nvs_set_str(h, AUTH_KEY_PASS, cfg->pass);
-    if (err == ESP_OK) err = nvs_commit(h);
-    nvs_close(h);
-    return err;
 }
 
 /* Constant-time equality; returns false on length mismatch. */
@@ -185,11 +233,18 @@ esp_err_t web_auth_login(const char *user, const char *pass, char **out_json)
     s_login_fails = 0;
     s_login_lock_until = 0;
 
-    /* reuse the existing session token if one is active, so multiple tabs
-     * / devices sharing the same credentials do not kick each other out */
     if (s_token[0] == '\0') {
+        /* first login: mint a token */
         token_new();
+    } else if (web_auth_single_session_get()) {
+        /* single-session mode: a fresh login issues a brand-new token and bumps
+         * the session generation, kicking out every previously authenticated
+         * WS session (they hold the old token/gen) */
+        token_new();
+        web_auth_gen_bump();
     } else {
+        /* reuse the existing session token if one is active, so multiple tabs
+         * / devices sharing the same credentials do not kick each other out */
         s_token_ts = esp_timer_get_time(); /* refresh validity for active sessions */
     }
     bool must_change = creds_are_default(&cfg);
@@ -202,30 +257,37 @@ esp_err_t web_auth_login(const char *user, const char *pass, char **out_json)
     return ESP_OK;
 }
 
-/* Current login user as a JSON string (password is never returned; caller frees). */
+/* Current login user + session policy as a JSON string (password is never
+ * returned; caller frees). */
 char *web_authcfg_get_json(void)
 {
     web_auth_cfg_t cfg;
     web_auth_load(&cfg);
-    size_t cap = strlen(cfg.user) + 32;
+    size_t cap = strlen(cfg.user) + 64;
     char *buf = malloc(cap);
     if (!buf) {
         return NULL;
     }
-    snprintf(buf, cap, "{\"user\":\"%s\"}", cfg.user);
+    snprintf(buf, cap, "{\"user\":\"%s\",\"single_session\":%s}",
+             cfg.user, web_auth_single_session_get() ? "true" : "false");
     return buf;
 }
 
-/* Apply login credential changes from a JSON body; pass empty = keep current.
- * On success the session is invalidated (forced re-login). */
+/* Apply login credential / session-policy changes from a JSON body; pass empty
+ * = keep current. When user/pass actually change the session is invalidated
+ * (forced re-login); a pure single_session toggle does not log anyone out. */
 esp_err_t web_authcfg_set(cJSON *root, const char **err)
 {
     web_auth_cfg_t cfg;
     web_auth_load(&cfg);
 
+    bool creds_changed = false;
     cJSON *j = cJSON_GetObjectItem(root, "user");
     if (cJSON_IsString(j) && j->valuestring[0] != '\0') {
-        strlcpy(cfg.user, j->valuestring, sizeof(cfg.user));
+        if (strcmp(j->valuestring, cfg.user) != 0) {
+            strlcpy(cfg.user, j->valuestring, sizeof(cfg.user));
+            creds_changed = true;
+        }
     }
     j = cJSON_GetObjectItem(root, "pass");
     if (cJSON_IsString(j) && j->valuestring[0] != '\0') {
@@ -233,15 +295,28 @@ esp_err_t web_authcfg_set(cJSON *root, const char **err)
             *err = "pass must be 4-63 chars";
             return ESP_ERR_INVALID_ARG;
         }
-        strlcpy(cfg.pass, j->valuestring, sizeof(cfg.pass));
+        if (strcmp(j->valuestring, cfg.pass) != 0) {
+            strlcpy(cfg.pass, j->valuestring, sizeof(cfg.pass));
+            creds_changed = true;
+        }
     }
 
-    esp_err_t ret = web_auth_save(&cfg);
-    if (ret != ESP_OK) {
-        *err = "nvs write failed";
-        return ret;
+    cJSON *s = cJSON_GetObjectItem(root, "single_session");
+    bool single_present = cJSON_IsBool(s);
+
+    if (creds_changed || single_present) {
+        bool single_val = cJSON_IsTrue(s);
+        esp_err_t ret = web_auth_save_all(creds_changed ? &cfg : NULL,
+                                          single_present ? &single_val : NULL,
+                                          err);
+        if (ret != ESP_OK) {
+            return ret;
+        }
     }
-    /* credentials changed: force a fresh login (kills existing WS sessions too) */
-    web_auth_invalidate();
+
+    if (creds_changed) {
+        /* credentials changed: force a fresh login (kills existing WS sessions too) */
+        web_auth_invalidate();
+    }
     return ESP_OK;
 }
