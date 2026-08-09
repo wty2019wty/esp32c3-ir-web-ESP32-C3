@@ -180,6 +180,17 @@ static void ir_task(void *arg)
         if (num > IR_RX_BUF_SYMBOLS) {
             num = IR_RX_BUF_SYMBOLS;
         }
+        if (num == IR_RX_BUF_SYMBOLS) {
+            /* user buffer filled: with en_partial_rx the driver reset the buffer
+             * on overflow, so this event holds only the tail chunk of a frame
+             * longer than IR_RAW_MAX_SEGS. Decoding it would produce garbage,
+             * so drop it. */
+            ESP_LOGW(TAG, "Frame too long for RX buffer (%u symbols), dropped", (unsigned)num);
+            if (!s_rx_paused) {
+                rmt_receive(s_rx_ch, s_rx_buf, sizeof(s_rx_buf), &s_rx_cfg);
+            }
+            continue;
+        }
         ir_analyze(ev.received_symbols, num, &fr);
         fr.valid = true;
         fr.timestamp_ms = (uint32_t)(esp_timer_get_time() / 1000);
@@ -256,9 +267,13 @@ esp_err_t ir_init(void)
 
     s_rx_cfg.signal_range_min_ns = IR_RX_MIN_PULSE_NS;
     s_rx_cfg.signal_range_max_ns = IR_RX_TIMEOUT_NS;
-    /* long-frame capture: with a large user buffer the driver accumulates
-     * ping-pong chunks in the ISR and reports the whole frame on idle timeout.
-     * Without this the frame would be truncated at 192 symbols on ESP32-C3. */
+    /* long-frame capture: the driver ping-pongs HW memory chunks into the
+     * large user buffer (IR_RX_BUF_SYMBOLS) in the ISR and reports the whole
+     * frame on idle timeout. en_partial_rx only changes overflow behavior:
+     * when the user buffer fills, it fires a partial event and reuses the
+     * buffer from offset 0, so the final event then holds only the tail chunk
+     * (dropped in ir_task). In-range frames (<= IR_RAW_MAX_SEGS) never fill
+     * the buffer, so the flag has no effect for them. */
     s_rx_cfg.flags.en_partial_rx = 1;
 
     /* Configure RMT TX channel (no DMA; copy encoder segments long payloads) */
