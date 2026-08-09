@@ -44,6 +44,7 @@
   input.ip { width: 170px; }
   .kv { display: grid; grid-template-columns: 130px 1fr; gap: 4px 10px; font-size: 13.5px; }
   .kv b { color: #8a93a3; font-weight: 500; }
+  .hist-wrap { max-height: 320px; overflow-y: auto; }
   #statusText { font-size: 14px; }
   #toast { position: fixed; top: 14px; right: 14px; background: #2f6fed; color: #fff; padding: 10px 16px;
            border-radius: 8px; font-size: 13px; opacity: 0; transition: opacity .25s; pointer-events: none; }
@@ -102,7 +103,7 @@
 
 <div class="card">
   <h2>原始数据（可直接复制回放）</h2>
-  <pre id="rawText">-</pre>
+  <textarea id="rawText" rows="6" style="width:100%;font-family:monospace;font-size:0.85em;">-</textarea>
 </div>
 
 <div class="card">
@@ -123,10 +124,12 @@
 
 <div class="card">
   <h2>历史记录 <span id="histCount" style="color:#8a93a3;font-weight:400;"></span></h2>
-  <table id="histTable">
-    <thead><tr><th>#</th><th>时间</th><th>类型</th><th>NEC hxd</th><th>段数</th></tr></thead>
-    <tbody></tbody>
-  </table>
+  <div class="hist-wrap">
+    <table id="histTable">
+      <thead><tr><th>#</th><th>时间</th><th>类型</th><th>NEC hxd</th><th>段数</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </div>
 </div>
 
 </div><!-- /viewMon -->
@@ -513,7 +516,7 @@ function renderLatest(f) {
   html += `<b>序号</b><span>${esc(f.seq)}</span>`;
   html += `</div>`;
   $('latest').innerHTML = html;
-  $('rawText').textContent = rawFormat(f);
+  $('rawText').value = rawFormat(f);
   $('playLatestBtn').disabled = false;
   highlightRow(f.seq);
 }

@@ -31,7 +31,7 @@ esp_err_t web_init(void)
 {
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.server_port = HTTP_PORT;
-    cfg.stack_size = 8192;
+    cfg.stack_size = 16384; /* handlers hold one ir_frame_t (~4.2KB at 1024 segments) */
     cfg.max_uri_handlers = 20; /* registered handlers + headroom */
 #if CONFIG_HTTPD_WS_SUPPORT
     cfg.close_fn = web_ws_close_fn;

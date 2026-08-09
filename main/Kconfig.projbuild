@@ -75,7 +75,23 @@ menu "IR Web Tool Configuration"
 
     config IR_TOOL_HISTORY_DEPTH
         int "In-memory frame history depth"
-        default 32
+        default 8
+        help
+            In-memory history ring. Each slot holds one full frame including
+            the raw duration array (IR_TOOL_MAX_RX_SEGS entries, 4 bytes each),
+            so RAM usage = depth x frame size. With 1024 segments one frame is
+            about 4.2 KB; the default 8 slots keep static RAM around 34 KB.
+
+    config IR_TOOL_MAX_RX_SEGS
+        int "Max alternating IR segments per captured frame"
+        default 1024
+        range 192 2048
+        help
+            Number of alternating on/off duration segments a single IR frame
+            can hold (air-conditioner protocols often exceed 300 segments).
+            The RMT RX ping-pong mode accumulates long frames in a RAM buffer,
+            so the limit is memory, not the 192-symbol RMT hardware. Each
+            segment costs 4 bytes inside every history frame slot.
 
     config IR_TOOL_MAX_RAW_SYMBOLS
         int "Max RMT symbols per transmission (raw data replay)"

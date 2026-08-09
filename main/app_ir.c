@@ -21,7 +21,12 @@
 #define IR_RESOLUTION_HZ    500000U    /* 1 RMT tick = 2 us */
 #define IR_RX_GPIO          CONFIG_IR_TOOL_IR_RX_GPIO
 #define IR_TX_GPIO          CONFIG_IR_TOOL_IR_TX_GPIO
-#define IR_RX_BUF_SYMBOLS   96         /* 2 mem blocks of 48; NEC frame fits */
+#define IR_RX_BUF_SYMBOLS   IR_RAW_MAX_SEGS  /* user-side RX buffer; a symbol holds 2 segments, so this covers
+                                              * IR_RAW_MAX_SEGS segments with headroom (4KB SRAM at 1024) */
+#define IR_RX_MEM_SYMBOLS   96         /* max HW memory a single RX channel can own on ESP32-C3: the group has
+                                        * 4 blocks x 48 symbols, RX candidates are blocks 2-3 only, so 2 blocks
+                                        * max. The driver ping-pongs 48-symbol halves and copies chunks into the
+                                        * large user buffer (IR_RX_BUF_SYMBOLS), which is what lifts the limit. */
 #define IR_TX_BUF_SYMBOLS   96
 #define IR_RX_MIN_PULSE_NS  1000U      /* glitches < 1 us are ignored */
 #define IR_RX_TIMEOUT_NS    50000000U  /* idle gap > 50 ms ends the frame */
@@ -62,12 +67,21 @@ static void ir_playback_task(void *arg);
 
 /* Simple flag + copy instead of a FreeRTOS queue in ISR (avoids ISR compatibility issues) */
 static volatile bool s_rx_done = false;
+static volatile bool s_rx_overflow = false; /* a partial (non-last) chunk was reported -> final event is only a tail */
 static rmt_rx_done_event_data_t s_rx_data;
 
 static bool ir_rx_done_cb(rmt_channel_handle_t ch, const rmt_rx_done_event_data_t *edata, void *udata)
 {
     (void)ch;
     (void)udata;
+    /* With en_partial_rx the driver notifies mid-frame chunks once the user
+     * buffer fills, then reuses the buffer from offset 0. The final is_last
+     * event then holds only the tail chunk of an over-limit frame. Remember
+     * the partial event so ir_task drops that tail instead of decoding it. */
+    if (!edata->flags.is_last) {
+        s_rx_overflow = true;
+        return false;
+    }
     s_rx_data = *edata;
     s_rx_done = true;
     return true; /* request context switch so ir_task wakes immediately */
@@ -160,13 +174,27 @@ static void ir_task(void *arg)
         }
         /* read symbol data BEFORE clearing the flag to avoid racing the ISR */
         rmt_rx_done_event_data_t ev = s_rx_data;
+        bool overflow = s_rx_overflow;
         s_rx_done = false;
+        s_rx_overflow = false;
 
         ir_frame_t fr;
         memset(&fr, 0, sizeof(fr));
         size_t num = ev.num_symbols;
-        if (num > IR_RX_BUF_SYMBOLS) {
-            num = IR_RX_BUF_SYMBOLS;
+        /* Two ways a frame can exceed IR_RAW_MAX_SEGS:
+         * - the driver fired a partial event (user buffer filled), so this
+         *   final event only holds the tail chunk of an over-limit frame;
+         * - the symbol count alone already exceeds what IR_RAW_MAX_SEGS
+         *   alternating segments can produce (2 segments per symbol), so the
+         *   frame would be silently truncated by ir_analyze.
+         * Either way decoding would produce garbage/a truncated frame, so
+         * drop it and re-arm the receiver. */
+        if (overflow || num > (IR_RAW_MAX_SEGS + 1) / 2) {
+            ESP_LOGW(TAG, "Frame too long for RX buffer (%u symbols), dropped", (unsigned)num);
+            if (!s_rx_paused) {
+                rmt_receive(s_rx_ch, s_rx_buf, sizeof(s_rx_buf), &s_rx_cfg);
+            }
+            continue;
         }
         ir_analyze(ev.received_symbols, num, &fr);
         fr.valid = true;
@@ -226,7 +254,7 @@ esp_err_t ir_init(void)
         .gpio_num = IR_RX_GPIO,
         .clk_src = RMT_CLK_SRC_DEFAULT,
         .resolution_hz = IR_RESOLUTION_HZ,
-        .mem_block_symbols = IR_RX_BUF_SYMBOLS,
+        .mem_block_symbols = IR_RX_MEM_SYMBOLS,
         .intr_priority = 0,
         .flags = {
             .invert_in = false,
@@ -244,7 +272,14 @@ esp_err_t ir_init(void)
 
     s_rx_cfg.signal_range_min_ns = IR_RX_MIN_PULSE_NS;
     s_rx_cfg.signal_range_max_ns = IR_RX_TIMEOUT_NS;
-    s_rx_cfg.flags.en_partial_rx = 0;
+    /* long-frame capture: the driver ping-pongs HW memory chunks into the
+     * large user buffer (IR_RX_BUF_SYMBOLS) in the ISR and reports the whole
+     * frame on idle timeout. en_partial_rx only changes overflow behavior:
+     * when the user buffer fills, it fires a partial event and reuses the
+     * buffer from offset 0, so the final event then holds only the tail chunk
+     * (dropped in ir_task). In-range frames (<= IR_RAW_MAX_SEGS) never fill
+     * the buffer, so the flag has no effect for them. */
+    s_rx_cfg.flags.en_partial_rx = 1;
 
     /* Configure RMT TX channel (no DMA; copy encoder segments long payloads) */
     rmt_tx_channel_config_t tx_ch_cfg = {
@@ -274,8 +309,10 @@ esp_err_t ir_init(void)
 
     ESP_RETURN_ON_ERROR(rmt_enable(s_tx_ch), TAG, "enable RMT TX");
 
-    /* create IR receive task */
-    if (xTaskCreate(ir_task, "ir_task", 4096, NULL, 6, NULL) != pdPASS) {
+    /* create IR receive task: stack must fit one ir_frame_t (raw_durs scales
+     * with IR_RAW_MAX_SEGS, up to ~8.2KB at 2048) plus the analysis/callback
+     * chain, so derive it from the frame size instead of hardcoding it */
+    if (xTaskCreate(ir_task, "ir_task", sizeof(ir_frame_t) + 4096, NULL, 6, NULL) != pdPASS) {
         return ESP_ERR_NO_MEM;
     }
     /* create playback task */
@@ -283,7 +320,10 @@ esp_err_t ir_init(void)
         return ESP_ERR_NO_MEM;
     }
 
-    /* start receiving */
+    /* start receiving: clear any stale receive flags first (static init is
+     * false, but re-run / reordered init must not carry a leftover state) */
+    s_rx_done = false;
+    s_rx_overflow = false;
     ESP_RETURN_ON_ERROR(rmt_enable(s_rx_ch), TAG, "enable RMT RX");
     ESP_RETURN_ON_ERROR(rmt_receive(s_rx_ch, s_rx_buf, sizeof(s_rx_buf), &s_rx_cfg),
                         TAG, "start RMT receive");
@@ -436,6 +476,9 @@ static void ir_playback_task(void *arg)
 
         /* resume RX once the queue drains */
         if (s_rx_paused && uxQueueMessagesWaiting(s_play_queue) == 0) {
+            /* a receive aborted by rmt_disable() above can leave the partial
+             * flag set; don't let it leak into the next frame */
+            s_rx_overflow = false;
             if (rmt_enable(s_rx_ch) == ESP_OK &&
                 rmt_receive(s_rx_ch, s_rx_buf, sizeof(s_rx_buf), &s_rx_cfg) == ESP_OK) {
                 s_rx_paused = false;
