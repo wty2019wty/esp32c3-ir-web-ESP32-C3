@@ -58,7 +58,10 @@
                 display: none; align-items: center; justify-content: center; }
   #pwdOverlay .card { width: 340px; }
   #pwdOverlay input { width: 100%; margin-bottom: 8px; box-sizing: border-box; }
-  #logoutBtn { margin-left: auto; background: #3a3f4a; }
+  #reconnectBtn { margin-left: auto; }
+  .connbtn { background: #3a3f4a; }
+  .connbtn:hover { background: #2f6fed; }
+  #logoutBtn { background: #3a3f4a; }
   #logoutBtn:hover { background: #5c1f1f; }
 </style>
 </head>
@@ -68,6 +71,8 @@
 <div class="row" style="margin-bottom: 12px;">
   <button id="tabMonBtn" class="tabbtn active" onclick="showTab('mon')">实时监视</button>
   <button id="tabSetBtn" class="tabbtn" onclick="showTab('set')">设置</button>
+  <button id="reconnectBtn" class="connbtn" onclick="reconnect()">重新连接</button>
+  <button id="disconnectBtn" class="connbtn" onclick="disconnect()">断开连接</button>
   <button id="logoutBtn" onclick="doLogout()">退出登录</button>
 </div>
 
@@ -435,12 +440,16 @@ const WS_CMD_TIMEOUT_MS = 6000;
 const STATUS_POLL_MS = 15000;
 let statusPollTimer = null;
 let lastStatusAt = 0; /* last successful active check (ms epoch) */
+let wsManualClosed = false; /* user pressed 断开连接: suppress auto-reconnect */
 
 /* Reflect the WS channel state in the header badge (WS is the only API
  * channel now — no REST fallback). */
 function setChan() {
   const b = $('chanBadge');
-  if (wsReady) {
+  if (wsManualClosed) {
+    b.className = 'badge off';
+    b.textContent = '已断开';
+  } else if (wsReady) {
     b.className = 'badge ws';
     b.textContent = 'WS实时' + (lastStatusAt ? ' · ' + new Date(lastStatusAt).toLocaleTimeString() : '');
   } else if (ws && ws.readyState === WebSocket.OPEN) {
@@ -489,10 +498,30 @@ function scheduleWsRetry() {
   wsRetryTimer = setTimeout(wsConnect, 10000);
 }
 
-/* Tear down the current socket and pending command waiters. */
+/* Manual 重新连接: fully close the current ws, then connect immediately;
+ * the existing token re-auths on open. */
+function reconnect() {
+  wsManualClosed = true;
+  closeSocket();
+  wsManualClosed = false;
+  wsConnect();
+}
+
+/* Manual 断开连接: fully close the ws and stop the auto-reconnect timer so
+ * the page stays disconnected until the user reconnects (or reloads). */
+function disconnect() {
+  wsManualClosed = true;
+  closeSocket();
+  setChan();
+}
+
+/* Fully close the current socket: detach every event handler and the watchdog
+ * first so no late onclose/onmessage from the closing handshake can touch
+ * shared state, then initiate the close handshake and drop the reference. */
 function closeSocket() {
   if (ws) {
     clearInterval(ws.watchdog);
+    ws.onopen = ws.onmessage = ws.onclose = ws.onerror = null;
     try { ws.close(); } catch (e) { /* ignored */ }
     ws = null;
   }
@@ -626,6 +655,7 @@ function wsConnect() {
   };
   s.onclose = () => {
     clearInterval(s.watchdog);
+    if (ws !== s) return; /* stale socket: a newer one replaced it, ignore */
     ws = null;
     wsReady = false;
     stopStatusPoll();
@@ -637,7 +667,9 @@ function wsConnect() {
       w.reject(new Error('ws closed'));
     });
     wsCmdWaiters.clear();
-    scheduleWsRetry(); /* reconnect whether logged in or not (login needs WS too) */
+    if (!wsManualClosed) {
+      scheduleWsRetry(); /* reconnect whether logged in or not (login needs WS too) */
+    }
   };
   s.onerror = () => { try { s.close(); } catch (e) { /* ignored */ } };
 }
