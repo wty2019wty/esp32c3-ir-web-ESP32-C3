@@ -28,11 +28,11 @@ static esp_err_t status_handler(httpd_req_t *req)
 /* One frame as a JSON object, streamed as a single chunk. */
 static esp_err_t send_frame_chunk(httpd_req_t *req, const ir_frame_t *f)
 {
-    char *buf = malloc(4096);
+    char *buf = malloc(16384); /* enough for IR_RAW_MAX_SEGS (1024) durations */
     if (!buf) {
         return httpd_resp_send_chunk(req, "{}", 2);
     }
-    int off = web_frame_to_json(f, buf, 4096);
+    int off = web_frame_to_json(f, buf, 16384);
     if (off < 0) {
         free(buf);
         return httpd_resp_send_chunk(req, "{}", 2);
