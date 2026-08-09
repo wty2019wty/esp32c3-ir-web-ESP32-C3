@@ -13,11 +13,16 @@ REST 流程：
   - 收到 {"type":"status","id":N,...} 后回发 {"type":"ack","id":N} 确认抄收
   - 打印 status / frame 推送，默认监听 5 秒
 
+可选（--via-ws）：改为通过 WebSocket 命令通道发送红外（优先 WS）：
+  登录后连接 /api/ws 认证，依次发送 {"type":"cmd","id":N,"cmd":...} 命令：
+  status -> play -> 观察推送 -> logout；演示命令 RPC 协议与鉴权
+
 用法示例：
   python api-demo.py                                  # 默认连 192.168.4.1，admin/admin
   python api-demo.py --host 192.168.1.50 --user admin --password xxxx
   python api-demo.py --hxd ED127F80 --freq 38000
   python api-demo.py --ws --listen 8                  # 发完信号后观察 WS 推送并 ack
+  python api-demo.py --via-ws --listen 5              # 走 WS 命令通道发送红外并观察推送
   python api-demo.py --raw "Frequency: 38000 Hz
 
 9000, 4500, 560, 560, 1690"
@@ -195,6 +200,128 @@ def ws_send_close(sock, code=1000):
     sock.sendall(bytes(header) + mask + masked)
 
 
+# ---------------- WebSocket 命令 RPC（/api/ws 命令通道） ----------------
+
+def ws_call(sock, msg, timeout=10):
+    """发送一条 WS 消息并读取下一条响应消息（用于 auth 这类无 id 的应答）。"""
+    ws_send_text(sock, json.dumps(msg))
+    sock.settimeout(timeout)
+    while True:
+        opcode, payload = ws_recv_frame(sock)
+        if opcode == 0x8:
+            raise ConnectionError("服务端 CLOSE")
+        if opcode != 0x1:
+            continue
+        try:
+            return json.loads(payload.decode("utf-8"))
+        except Exception:
+            continue
+
+
+_ws_rpc_id = 0
+
+
+def ws_rpc(sock, cmd, body=None, timeout=10):
+    """通过 WebSocket 命令通道执行一个命令，返回响应 data（dict）。
+
+    发送 {"type":"cmd","id":N,"cmd":cmd,"body":body}，等待匹配的
+    {"type":"resp","id":N,...}；中间的 status/frame 推送会被跳过。
+    失败抛 RuntimeError / TimeoutError / ConnectionError。
+    """
+    global _ws_rpc_id
+    _ws_rpc_id += 1
+    rid = _ws_rpc_id
+    ws_send_text(sock, json.dumps({
+        "type": "cmd", "id": rid, "cmd": cmd, "body": body or {},
+    }))
+    sock.settimeout(timeout)
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            opcode, payload = ws_recv_frame(sock)
+        except socket.timeout:
+            break
+        if opcode == 0x8:
+            raise ConnectionError("服务端 CLOSE")
+        if opcode != 0x1:
+            continue
+        try:
+            msg = json.loads(payload.decode("utf-8"))
+        except Exception:
+            continue
+        if msg.get("type") == "resp" and msg.get("id") == rid:
+            if msg.get("ok"):
+                return msg.get("data", {})
+            raise RuntimeError(msg.get("error", "命令失败"))
+        # 其他类型（status/frame 推送）直接跳过
+    raise TimeoutError(f"WS 命令 {cmd} 超时")
+
+
+def ws_command_demo(host, port, token, payload, listen_secs):
+    """连接 /api/ws 认证后，通过命令通道完成 status -> play -> 观察推送 -> logout。"""
+    print(f"[*] 连接 ws://{host}:{port}/api/ws 并认证 ...")
+    sock = ws_connect(host, port)
+    try:
+        r = ws_call(sock, {"type": "auth", "token": token})
+        if not r.get("ok"):
+            print(f"[x] WS 认证失败: {r.get('error')}")
+            return
+        print("[+] WS 认证成功")
+
+        st = ws_rpc(sock, "status")
+        print(f"[*] WS status: 模式={st.get('mode')} STA={st.get('sta_ip') or '-'} "
+              f"载波={st.get('carrier_hz')}Hz")
+
+        print(f"[*] WS play: {json.dumps(payload, ensure_ascii=False)}")
+        ws_rpc(sock, "play", payload)
+        print("[+] WS 回放命令已接受")
+
+        print(f"[*] 监听推送 {listen_secs} 秒（Ctrl+C 结束）...")
+        sock.settimeout(1.0)
+        deadline = time.time() + listen_secs
+        while time.time() < deadline:
+            try:
+                opcode, frame_payload = ws_recv_frame(sock)
+            except socket.timeout:
+                continue
+            except (ConnectionError, OSError) as e:
+                print(f"[*] 连接已断开: {e}")
+                break
+            if opcode == 0x8:
+                print("[*] 服务端发送 CLOSE")
+                break
+            if opcode != 0x1:
+                continue
+            try:
+                msg = json.loads(frame_payload.decode("utf-8"))
+            except Exception:
+                continue
+            t = msg.get("type")
+            if t == "status":
+                sid = msg.get("id")
+                print(f"[*] WS status id={sid}: "
+                      f"播放={'是' if msg.get('data', {}).get('playing') else '否'}")
+                if sid is not None:
+                    ws_send_text(sock, json.dumps({"type": "ack", "id": sid}))
+            elif t == "frame":
+                print(f"[*] WS frame seq={msg.get('data', {}).get('seq')}")
+
+        print("[*] WS logout（响应后服务端关闭连接）...")
+        try:
+            ws_rpc(sock, "logout", timeout=3)
+            print("[+] WS logout 完成")
+        except (RuntimeError, TimeoutError, ConnectionError, OSError) as e:
+            print(f"[*] logout 后连接关闭: {e}")
+    except (RuntimeError, TimeoutError, ConnectionError, OSError) as e:
+        print(f"[x] WS 命令失败: {e}")
+    finally:
+        try:
+            ws_send_close(sock)
+        except OSError:
+            pass
+        sock.close()
+
+
 def ws_recv_frame(sock):
     """接收一个完整的服务器帧（服务器帧不掩码），返回 (opcode, payload)。"""
     b1, b2 = _recv_exact(sock, 2)
@@ -285,7 +412,9 @@ def main():
     parser.add_argument("--raw", default=None,
                         help="原始数据文本（Frequency: ... 行 + 逗号序列），与 --hxd 二选一，优先于 --hxd")
     parser.add_argument("--ws", action="store_true", help="发送后连接 WebSocket 演示推送与 ack")
-    parser.add_argument("--listen", type=int, default=5, help="--ws 模式下监听秒数（默认 5）")
+    parser.add_argument("--via-ws", action="store_true",
+                        help="改为通过 WebSocket 命令通道发送红外（优先 WS，演示命令 RPC）")
+    parser.add_argument("--listen", type=int, default=5, help="--ws/--via-ws 模式下监听秒数（默认 5）")
     parser.add_argument("--timeout", type=int, default=10, help="HTTP 超时秒数（默认 10）")
     args = parser.parse_args()
 
@@ -309,9 +438,12 @@ def main():
             sys.exit(1)
         payload = {"type": "hxd", "value": args.hxd.upper(), "freq": args.freq}
 
-    send_play(base, token, payload)
-    if args.ws:
-        ws_demo(host, args.port, token, args.listen)
+    if args.via_ws:
+        ws_command_demo(host, args.port, token, payload, args.listen)
+    else:
+        send_play(base, token, payload)
+        if args.ws:
+            ws_demo(host, args.port, token, args.listen)
     print("[+] 完成")
 
 

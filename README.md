@@ -116,6 +116,7 @@ idf.py menuconfig   # → "IR Web Tool Configuration"
 ### Web API
 
 所有 API 需携带 `X-Auth-Token` 请求头（`/api/login` 除外）。
+**前端默认优先通过 WebSocket 调用下列接口（见下文），REST 端点保留作回退与第三方集成。**
 
 | 端点 | 方法 | 说明 |
 |------|------|------|
@@ -131,12 +132,27 @@ idf.py menuconfig   # → "IR Web Tool Configuration"
 | `/api/wificfg` | GET/POST | 读取/保存 WiFi 配置；密码不回显（`ap_password_set`/`sta_password_set` 标志），POST 中密码字段传 `null` 表示不修改、空字符串表示清除 |
 | `/api/authcfg` | GET/POST | 读取/修改登录凭据（GET 不返回密码） |
 
-### WebSocket 推送（状态 / 帧）
+### WebSocket（推送 + 命令 RPC）
 
-页面登录后自动连接 `ws://<IP>/api/ws`，替代 `/api/status` 与 `/api/frames` 的轮询：
+页面登录后自动连接 `ws://<IP>/api/ws`；连接建立并认证成功后，**所有 API 请求自动优先走 WebSocket 命令，失败自动退回 REST**：
 
 - **认证**：连接后第一条消息发送 `{"type":"auth","token":"<session token>"}`；
   服务端回复 `{"type":"auth","ok":true}`；token 无效或过期则回复 `ok:false` 并断开连接。
+- **命令 RPC（命令类 API 走此通道）**：
+  - 客户端发送 `{"type":"cmd","id":N,"cmd":"play","body":{...}}`
+  - 服务端回复 `{"type":"resp","id":N,"ok":true,"data":{...}}` 或
+    `{"type":"resp","id":N,"ok":false,"error":"..."}`
+  - `cmd` 取值与 REST 端点一一对应：
+    - `play`（body 同 `/api/play`，如 `{"type":"hxd","value":"ED127F80"}`）
+    - `carrier`（`{"freq":38000}`）、`rxpause`（`{"enabled":true}`）
+    - `status`（body 为空，返回当前状态对象）
+    - `frames`（`{"since":N}`，增量拉取；超过约 48KB 时返回
+      `"truncated":true`，`last_seq` 为实际返回的最后一帧，客户端应退回 REST 补齐）
+    - `wificfg`（body 含配置字段 = 保存并重启，`{"ok":true,"restart":true}`；body 为空 = 读取）
+    - `authcfg`（body 含 `user`/`pass` = 修改凭据；为空 = 读取用户名）
+    - `renew`、`logout`
+  - 前端 `rpc()` 统一封装：WS 可用时走 WS；WS 未连接 / 发送失败 / 6 秒无响应 / 连接断开时，
+    自动改用对应的 REST 请求（`X-Auth-Token`），功能与原来完全一致。
 - **推送消息**：
   - `{"type":"status","id":N,"data":{...}}` —— **状态有变化时才推送**（字段同 `/api/status`），
     携带递增 `id`；客户端收到后需回复 `{"type":"ack","id":N}` 确认抄收，
@@ -145,6 +161,9 @@ idf.py menuconfig   # → "IR Web Tool Configuration"
   - `{"type":"frame","data":{...}}` —— 收到新红外信号时立即推送（字段同 `/api/frames` 中的单帧）
 - **断线回退**：连接断开后前端自动切换回 REST 轮询，并每 10 秒尝试重连 WebSocket；
   连接恢复后停止轮询。
+- **鉴权与失效**：命令与推送均要求已认证会话；退出登录或修改登录凭据会使会话
+  **代数**递增，已连接的 WebSocket 会话随即失效（命令被拒、推送停止），
+  防止退出登录后残留连接仍可操作设备。
 
 ### HTTPS 反向代理（nginx）部署注意
 
@@ -194,7 +213,8 @@ esp32c3-IR/
     ├── app_web_api_ir.c      # /api/status, /api/frames, /api/play, /api/carrier, /api/rxpause
     ├── app_web_api_wifi.c    # /api/wificfg
     ├── app_web_auth.c        # /api/login, /api/logout, /api/renew, /api/authcfg
-    ├── app_web_ws.c          # WebSocket /api/ws 推送
+    ├── app_web_rpc.c         # 命令分发（REST 与 WebSocket 共用）+ 帧历史 JSON 构建
+    ├── app_web_ws.c          # WebSocket /api/ws 推送 + 命令 RPC
     ├── app_web_util.c        # JSON 序列化 + HTTP 工具函数
     ├── web/index.html        # 前端单页（内嵌，无需文件系统）
     └── include/              # 各模块头文件

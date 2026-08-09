@@ -20,7 +20,8 @@
 typedef struct {
     int fd;
     bool authed;
-    uint32_t acked_id; /* last status id confirmed by this client (0 = none) */
+    uint32_t gen;        /* session generation the client authenticated against */
+    uint32_t acked_id;   /* last status id confirmed by this client (0 = none) */
 } ws_client_t;
 
 static httpd_handle_t s_ws_server = NULL;
@@ -57,6 +58,7 @@ static void ws_client_add(int fd, bool authed)
     for (int i = 0; i < WS_MAX_CLIENTS; i++) {
         if (s_ws_clients[i].fd == fd) {
             s_ws_clients[i].authed = authed;
+            s_ws_clients[i].gen = authed ? web_auth_get_gen() : 0;
             s_ws_clients[i].acked_id = 0;
             xSemaphoreGive(s_ws_mutex);
             return;
@@ -66,11 +68,54 @@ static void ws_client_add(int fd, bool authed)
         if (s_ws_clients[i].fd < 0) {
             s_ws_clients[i].fd = fd;
             s_ws_clients[i].authed = authed;
+            s_ws_clients[i].gen = authed ? web_auth_get_gen() : 0;
             s_ws_clients[i].acked_id = 0;
             break;
         }
     }
     xSemaphoreGive(s_ws_mutex);
+}
+
+static bool ws_client_is_authed(int fd)
+{
+    bool a = false;
+    if (!s_ws_mutex || fd < 0) {
+        return false;
+    }
+    if (xSemaphoreTake(s_ws_mutex, portMAX_DELAY) != pdTRUE) {
+        return false;
+    }
+    for (int i = 0; i < WS_MAX_CLIENTS; i++) {
+        if (s_ws_clients[i].fd == fd && s_ws_clients[i].authed) {
+            a = true;
+            break;
+        }
+    }
+    xSemaphoreGive(s_ws_mutex);
+    return a;
+}
+
+/* True when the client authenticated against the current session generation;
+ * false after logout / credential changes invalidate the session. */
+static bool ws_client_gen_ok(int fd)
+{
+    uint32_t cur = web_auth_get_gen();
+    bool ok = false;
+    if (!s_ws_mutex || fd < 0) {
+        return false;
+    }
+    if (xSemaphoreTake(s_ws_mutex, portMAX_DELAY) != pdTRUE) {
+        return false;
+    }
+    for (int i = 0; i < WS_MAX_CLIENTS; i++) {
+        if (s_ws_clients[i].fd == fd && s_ws_clients[i].authed &&
+            s_ws_clients[i].gen == cur) {
+            ok = true;
+            break;
+        }
+    }
+    xSemaphoreGive(s_ws_mutex);
+    return ok;
 }
 
 static void ws_client_ack(int fd, uint32_t id)
@@ -126,8 +171,10 @@ static void ws_send_text_all(const char *json)
         .payload = (uint8_t *)json,
         .len = strlen(json),
     };
+    uint32_t cur_gen = web_auth_get_gen();
     for (int i = 0; i < WS_MAX_CLIENTS; i++) {
-        if (s_ws_clients[i].fd < 0 || !s_ws_clients[i].authed) {
+        if (s_ws_clients[i].fd < 0 || !s_ws_clients[i].authed ||
+            s_ws_clients[i].gen != cur_gen) {
             continue;
         }
         esp_err_t err = httpd_ws_send_frame_async(s_ws_server, s_ws_clients[i].fd, &frame);
@@ -175,8 +222,10 @@ static void ws_send_status_locked(int *dead, int *ndead)
         .payload = (uint8_t *)wrapped,
         .len = strlen(wrapped),
     };
+    uint32_t cur_gen = web_auth_get_gen();
     for (int i = 0; i < WS_MAX_CLIENTS; i++) {
         if (s_ws_clients[i].fd < 0 || !s_ws_clients[i].authed ||
+            s_ws_clients[i].gen != cur_gen ||
             s_ws_clients[i].acked_id == s_status_id) {
             continue;
         }
@@ -321,7 +370,7 @@ static esp_err_t ws_handler(httpd_req_t *req)
     if (frame.len == 0) {
         return ESP_OK;
     }
-    if (frame.len > 1024) {
+    if (frame.len > WEB_MAX_BODY_LEN) {
         ESP_LOGW(TAG, "ws: oversized frame (%u bytes) from fd %d", (unsigned)frame.len, fd);
         return ESP_FAIL;
     }
@@ -392,6 +441,54 @@ static esp_err_t ws_handler(httpd_req_t *req)
         if (cJSON_IsNumber(id)) {
             ws_client_ack(fd, (uint32_t)id->valuedouble);
         }
+    } else if (cJSON_IsString(type) && strcmp(type->valuestring, "cmd") == 0) {
+        /* command RPC: requires an authenticated session */
+        if (!ws_client_is_authed(fd) || !ws_client_gen_ok(fd)) {
+            ws_reply_text(req, "{\"type\":\"resp\",\"ok\":false,\"error\":\"unauthorized\"}");
+            cJSON_Delete(root);
+            return ESP_FAIL; /* close the socket */
+        }
+        cJSON *id = cJSON_GetObjectItem(root, "id");
+        cJSON *cmd = cJSON_GetObjectItem(root, "cmd");
+        cJSON *body = cJSON_GetObjectItem(root, "body");
+        if (!cJSON_IsNumber(id) || !cJSON_IsString(cmd)) {
+            ws_reply_text(req, "{\"type\":\"resp\",\"ok\":false,\"error\":\"bad cmd\"}");
+            cJSON_Delete(root);
+            return ESP_OK;
+        }
+        const char *cmdstr = cmd->valuestring;
+        cJSON *bodyobj = cJSON_IsObject(body) ? body : root;
+        const char *err = NULL;
+        char *data = web_rpc_exec(cmdstr, bodyobj, &err);
+        char *reply = NULL;
+        if (data) {
+            size_t cap = strlen(data) + 96;
+            reply = malloc(cap);
+            if (reply) {
+                snprintf(reply, cap, "{\"type\":\"resp\",\"id\":%ld,\"ok\":true,\"data\":%s}",
+                         (long)id->valuedouble, data);
+            }
+            free(data);
+        } else {
+            const char *msg = err ? err : "failed";
+            size_t cap = strlen(msg) + 64;
+            reply = malloc(cap);
+            if (reply) {
+                snprintf(reply, cap, "{\"type\":\"resp\",\"id\":%ld,\"ok\":false,\"error\":\"%s\"}",
+                         (long)id->valuedouble, msg);
+            }
+        }
+        if (reply) {
+            ws_reply_text(req, reply);
+            free(reply);
+        }
+        bool is_logout = strcmp(cmdstr, "logout") == 0;
+        cJSON_Delete(root);
+        if (is_logout) {
+            ws_client_remove(fd);
+            return ESP_FAIL; /* close the socket after the response is flushed */
+        }
+        return ESP_OK;
     }
     cJSON_Delete(root);
     return ESP_OK;

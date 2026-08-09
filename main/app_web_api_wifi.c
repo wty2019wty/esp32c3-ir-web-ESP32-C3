@@ -83,11 +83,8 @@ static void schedule_restart(void)
 }
 
 /* GET /api/wificfg -> current (NVS) WiFi configuration */
-static esp_err_t wificfg_get_handler(httpd_req_t *req)
+char *web_wificfg_get_json(void)
 {
-    if (!web_require_auth(req)) {
-        return ESP_OK;
-    }
     wifi_web_config_t cfg;
     wifi_web_config_load(&cfg);
     char ip[16], gw[16], mask[16], dns[16];
@@ -96,14 +93,11 @@ static esp_err_t wificfg_get_handler(httpd_req_t *req)
     format_ipv4(cfg.sta_mask, mask, sizeof(mask));
     format_ipv4(cfg.sta_dns, dns, sizeof(dns));
 
-    char *buf = NULL;
-    size_t cap = 1024;
-    buf = malloc(cap);
+    char *buf = malloc(1024);
     if (!buf) {
-        web_respond_json(req, 400, "{\"error\":\"oom\"}");
-        return ESP_OK;
+        return NULL;
     }
-    int n = snprintf(buf, cap,
+    int n = snprintf(buf, 1024,
         "{\"ap_ssid\":\"%s\",\"ap_password\":\"\",\"ap_password_set\":%s,"
         "\"sta_ssid\":\"%s\",\"sta_password\":\"\",\"sta_password_set\":%s,"
         "\"sta_dhcp\":%s,\"sta_ip\":\"%s\",\"sta_gw\":\"%s\","
@@ -111,10 +105,105 @@ static esp_err_t wificfg_get_handler(httpd_req_t *req)
         cfg.ap_ssid, cfg.ap_password[0] ? "true" : "false",
         cfg.sta_ssid, cfg.sta_password[0] ? "true" : "false",
         cfg.sta_dhcp ? "true" : "false", ip, gw, mask, dns);
-    httpd_resp_set_type(req, "application/json");
-    httpd_resp_sendstr(req, buf);
     (void)n;
-    free(buf);
+    return buf;
+}
+
+static esp_err_t wificfg_get_handler(httpd_req_t *req)
+{
+    if (!web_require_auth(req)) {
+        return ESP_OK;
+    }
+    char *s = web_wificfg_get_json();
+    if (!s) {
+        web_respond_json(req, 400, "{\"error\":\"oom\"}");
+        return ESP_OK;
+    }
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, s);
+    free(s);
+    return ESP_OK;
+}
+
+/* Apply a WiFi configuration from a JSON body and schedule a restart.
+ * On success the device reboots ~2s later to apply the new settings. */
+esp_err_t web_wificfg_set(cJSON *root, const char **err)
+{
+    wifi_web_config_t cfg;
+    wifi_web_config_load(&cfg); /* start from current values */
+
+    /* helper to grab a string field */
+    cJSON *j = NULL;
+    j = cJSON_GetObjectItem(root, "ap_ssid");
+    if (cJSON_IsString(j)) {
+        strlcpy(cfg.ap_ssid, j->valuestring, sizeof(cfg.ap_ssid));
+    }
+    j = cJSON_GetObjectItem(root, "ap_password");
+    if (cJSON_IsString(j)) {
+        if (strlen(j->valuestring) >= sizeof(cfg.ap_password)) {
+            *err = "ap_password too long";
+            return ESP_ERR_INVALID_ARG;
+        }
+        strlcpy(cfg.ap_password, j->valuestring, sizeof(cfg.ap_password));
+    }
+    /* null or absent: keep current password */
+    j = cJSON_GetObjectItem(root, "sta_ssid");
+    if (cJSON_IsString(j)) {
+        strlcpy(cfg.sta_ssid, j->valuestring, sizeof(cfg.sta_ssid));
+    }
+    j = cJSON_GetObjectItem(root, "sta_password");
+    if (cJSON_IsString(j)) {
+        if (strlen(j->valuestring) >= sizeof(cfg.sta_password)) {
+            *err = "sta_password too long";
+            return ESP_ERR_INVALID_ARG;
+        }
+        strlcpy(cfg.sta_password, j->valuestring, sizeof(cfg.sta_password));
+    }
+    /* null or absent: keep current password */
+    j = cJSON_GetObjectItem(root, "sta_dhcp");
+    if (cJSON_IsBool(j)) {
+        cfg.sta_dhcp = cJSON_IsTrue(j);
+    }
+    /* static IP fields (only used when sta_dhcp=false) */
+    uint32_t tmp;
+    j = cJSON_GetObjectItem(root, "sta_ip");
+    if (cJSON_IsString(j) && parse_ipv4(j->valuestring, &tmp)) {
+        cfg.sta_ip = tmp;
+    }
+    j = cJSON_GetObjectItem(root, "sta_gw");
+    if (cJSON_IsString(j) && parse_ipv4(j->valuestring, &tmp)) {
+        cfg.sta_gw = tmp;
+    }
+    j = cJSON_GetObjectItem(root, "sta_mask");
+    if (cJSON_IsString(j) && parse_ipv4(j->valuestring, &tmp)) {
+        cfg.sta_mask = tmp;
+    }
+    j = cJSON_GetObjectItem(root, "sta_dns");
+    if (cJSON_IsString(j) && parse_ipv4(j->valuestring, &tmp)) {
+        cfg.sta_dns = tmp;
+    }
+
+    /* validation */
+    if (cfg.ap_ssid[0] == '\0') {
+        *err = "ap_ssid empty";
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (cfg.ap_password[0] != '\0' && strlen(cfg.ap_password) < 8) {
+        *err = "ap_password needs >=8 chars or empty";
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!cfg.sta_dhcp && (cfg.sta_ip == 0 || cfg.sta_ip == 0xFFFFFFFFU)) {
+        *err = "invalid static ip";
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    esp_err_t ret = wifi_web_config_save(&cfg);
+    if (ret != ESP_OK) {
+        *err = "nvs write failed";
+        return ret;
+    }
+
+    schedule_restart();
     return ESP_OK;
 }
 
@@ -136,91 +225,16 @@ static esp_err_t wificfg_post_handler(httpd_req_t *req)
         return ESP_OK;
     }
 
-    wifi_web_config_t cfg;
-    wifi_web_config_load(&cfg); /* start from current values */
-
-    /* helper to grab a string field */
-    cJSON *j = NULL;
-    j = cJSON_GetObjectItem(root, "ap_ssid");
-    if (cJSON_IsString(j)) {
-        strlcpy(cfg.ap_ssid, j->valuestring, sizeof(cfg.ap_ssid));
-    }
-    j = cJSON_GetObjectItem(root, "ap_password");
-    if (cJSON_IsString(j)) {
-        if (strlen(j->valuestring) >= sizeof(cfg.ap_password)) {
-            cJSON_Delete(root);
-            web_respond_json(req, 400, "{\"error\":\"ap_password too long\"}");
-            return ESP_OK;
-        }
-        strlcpy(cfg.ap_password, j->valuestring, sizeof(cfg.ap_password));
-    }
-    /* null or absent: keep current password */
-    j = cJSON_GetObjectItem(root, "sta_ssid");
-    if (cJSON_IsString(j)) {
-        strlcpy(cfg.sta_ssid, j->valuestring, sizeof(cfg.sta_ssid));
-    }
-    j = cJSON_GetObjectItem(root, "sta_password");
-    if (cJSON_IsString(j)) {
-        if (strlen(j->valuestring) >= sizeof(cfg.sta_password)) {
-            cJSON_Delete(root);
-            web_respond_json(req, 400, "{\"error\":\"sta_password too long\"}");
-            return ESP_OK;
-        }
-        strlcpy(cfg.sta_password, j->valuestring, sizeof(cfg.sta_password));
-    }
-    /* null or absent: keep current password */
-    j = cJSON_GetObjectItem(root, "sta_dhcp");
-    if (cJSON_IsBool(j)) {
-        cfg.sta_dhcp = cJSON_IsTrue(j);
-    }
-    /* static IP fields (only used when sta_dhcp=false) */
-    const char *ip_str = NULL;
-    uint32_t tmp;
-    j = cJSON_GetObjectItem(root, "sta_ip");
-    if (cJSON_IsString(j) && parse_ipv4(j->valuestring, &tmp)) {
-        cfg.sta_ip = tmp;
-        ip_str = j->valuestring;
-    }
-    j = cJSON_GetObjectItem(root, "sta_gw");
-    if (cJSON_IsString(j) && parse_ipv4(j->valuestring, &tmp)) {
-        cfg.sta_gw = tmp;
-    }
-    j = cJSON_GetObjectItem(root, "sta_mask");
-    if (cJSON_IsString(j) && parse_ipv4(j->valuestring, &tmp)) {
-        cfg.sta_mask = tmp;
-    }
-    j = cJSON_GetObjectItem(root, "sta_dns");
-    if (cJSON_IsString(j) && parse_ipv4(j->valuestring, &tmp)) {
-        cfg.sta_dns = tmp;
-    }
-
-    /* validation */
-    if (cfg.ap_ssid[0] == '\0') {
-        cJSON_Delete(root);
-        web_respond_json(req, 400, "{\"error\":\"ap_ssid empty\"}");
-        return ESP_OK;
-    }
-    if (cfg.ap_password[0] != '\0' && strlen(cfg.ap_password) < 8) {
-        cJSON_Delete(root);
-        web_respond_json(req, 400, "{\"error\":\"ap_password needs >=8 chars or empty\"}");
-        return ESP_OK;
-    }
-    if (!cfg.sta_dhcp && (cfg.sta_ip == 0 || cfg.sta_ip == 0xFFFFFFFFU)) {
-        cJSON_Delete(root);
-        web_respond_json(req, 400, "{\"error\":\"invalid static ip\"}");
-        return ESP_OK;
-    }
-    (void)ip_str;
-
-    esp_err_t err = wifi_web_config_save(&cfg);
+    const char *err = NULL;
+    esp_err_t ret = web_wificfg_set(root, &err);
     cJSON_Delete(root);
-    if (err != ESP_OK) {
-        web_respond_json(req, 400, "{\"error\":\"nvs write failed\"}");
-        return ESP_OK;
+    if (ret == ESP_OK) {
+        web_respond_json(req, 200, "{\"ok\":true,\"restart\":true}");
+    } else {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "{\"error\":\"%s\"}", err ? err : "invalid");
+        web_respond_json(req, 400, buf);
     }
-
-    web_respond_json(req, 200, "{\"ok\":true,\"restart\":true}");
-    schedule_restart();
     return ESP_OK;
 }
 

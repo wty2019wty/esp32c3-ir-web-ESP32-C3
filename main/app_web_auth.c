@@ -33,6 +33,37 @@ static char s_token[AUTH_TOKEN_LEN + 1] = ""; /* single active session token */
 static int64_t s_token_ts = 0;                 /* token issue time (us since boot) */
 static int s_login_fails = 0;                  /* consecutive failed logins */
 static int64_t s_login_lock_until = 0;         /* login lockout until this time (us) */
+static uint32_t s_auth_gen = 1;                /* bumped whenever the session is invalidated */
+
+/* Invalidate the active session token and bump the session generation so that
+ * already-connected WebSocket sessions authenticated against the old token are
+ * rejected (see app_web_ws.c). */
+void web_auth_invalidate(void)
+{
+    s_token[0] = '\0';
+    s_token_ts = 0;
+    if (++s_auth_gen == 0) {
+        s_auth_gen = 1;
+    }
+}
+
+uint32_t web_auth_get_gen(void)
+{
+    return s_auth_gen;
+}
+
+/* Extend the current session for another full TTL; fails if no session is active. */
+esp_err_t web_auth_renew(uint32_t *expires_in)
+{
+    if (s_token[0] == '\0') {
+        return ESP_ERR_INVALID_STATE;
+    }
+    s_token_ts = esp_timer_get_time();
+    if (expires_in) {
+        *expires_in = (uint32_t)(TOKEN_TTL_US / 1000000);
+    }
+    return ESP_OK;
+}
 
 static void web_auth_load(web_auth_cfg_t *cfg)
 {
@@ -222,17 +253,62 @@ static esp_err_t login_handler(httpd_req_t *req)
 }
 
 /* GET /api/authcfg -> current login user (password is never returned) */
+char *web_authcfg_get_json(void)
+{
+    web_auth_cfg_t cfg;
+    web_auth_load(&cfg);
+    size_t cap = strlen(cfg.user) + 32;
+    char *buf = malloc(cap);
+    if (!buf) {
+        return NULL;
+    }
+    snprintf(buf, cap, "{\"user\":\"%s\"}", cfg.user);
+    return buf;
+}
+
 static esp_err_t authcfg_get_handler(httpd_req_t *req)
 {
     if (!web_require_auth(req)) {
         return ESP_OK;
     }
+    char *s = web_authcfg_get_json();
+    if (!s) {
+        web_respond_json(req, 400, "{\"error\":\"oom\"}");
+        return ESP_OK;
+    }
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, s);
+    free(s);
+    return ESP_OK;
+}
+
+/* Apply login credential changes from a JSON body; pass empty = keep current.
+ * On success the session is invalidated (forced re-login). */
+esp_err_t web_authcfg_set(cJSON *root, const char **err)
+{
     web_auth_cfg_t cfg;
     web_auth_load(&cfg);
-    char buf[128];
-    snprintf(buf, sizeof(buf), "{\"user\":\"%s\"}", cfg.user);
-    httpd_resp_set_type(req, "application/json");
-    httpd_resp_sendstr(req, buf);
+
+    cJSON *j = cJSON_GetObjectItem(root, "user");
+    if (cJSON_IsString(j) && j->valuestring[0] != '\0') {
+        strlcpy(cfg.user, j->valuestring, sizeof(cfg.user));
+    }
+    j = cJSON_GetObjectItem(root, "pass");
+    if (cJSON_IsString(j) && j->valuestring[0] != '\0') {
+        if (strlen(j->valuestring) < 4 || strlen(j->valuestring) >= sizeof(cfg.pass)) {
+            *err = "pass must be 4-63 chars";
+            return ESP_ERR_INVALID_ARG;
+        }
+        strlcpy(cfg.pass, j->valuestring, sizeof(cfg.pass));
+    }
+
+    esp_err_t ret = web_auth_save(&cfg);
+    if (ret != ESP_OK) {
+        *err = "nvs write failed";
+        return ret;
+    }
+    /* credentials changed: force a fresh login (kills existing WS sessions too) */
+    web_auth_invalidate();
     return ESP_OK;
 }
 
@@ -254,32 +330,16 @@ static esp_err_t authcfg_post_handler(httpd_req_t *req)
         return ESP_OK;
     }
 
-    web_auth_cfg_t cfg;
-    web_auth_load(&cfg);
-
-    cJSON *j = cJSON_GetObjectItem(root, "user");
-    if (cJSON_IsString(j) && j->valuestring[0] != '\0') {
-        strlcpy(cfg.user, j->valuestring, sizeof(cfg.user));
-    }
-    j = cJSON_GetObjectItem(root, "pass");
-    if (cJSON_IsString(j) && j->valuestring[0] != '\0') {
-        if (strlen(j->valuestring) < 4 || strlen(j->valuestring) >= sizeof(cfg.pass)) {
-            cJSON_Delete(root);
-            web_respond_json(req, 400, "{\"error\":\"pass must be 4-63 chars\"}");
-            return ESP_OK;
-        }
-        strlcpy(cfg.pass, j->valuestring, sizeof(cfg.pass));
-    }
+    const char *err = NULL;
+    esp_err_t ret = web_authcfg_set(root, &err);
     cJSON_Delete(root);
-
-    esp_err_t err = web_auth_save(&cfg);
-    if (err != ESP_OK) {
-        web_respond_json(req, 400, "{\"error\":\"nvs write failed\"}");
-        return ESP_OK;
+    if (ret == ESP_OK) {
+        web_respond_ok(req);
+    } else {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "{\"error\":\"%s\"}", err ? err : "invalid");
+        web_respond_json(req, 400, buf);
     }
-    /* credentials changed: force a fresh login */
-    s_token[0] = '\0';
-    web_respond_ok(req);
     return ESP_OK;
 }
 
@@ -289,8 +349,7 @@ static esp_err_t logout_handler(httpd_req_t *req)
     if (!web_require_auth(req)) {
         return ESP_OK;
     }
-    s_token[0] = '\0';
-    s_token_ts = 0;
+    web_auth_invalidate();
     web_respond_ok(req);
     return ESP_OK;
 }
@@ -301,10 +360,14 @@ static esp_err_t renew_handler(httpd_req_t *req)
     if (!web_require_auth(req)) {
         return ESP_OK;
     }
-    s_token_ts = esp_timer_get_time();
+    uint32_t expires_in = 0;
+    esp_err_t ret = web_auth_renew(&expires_in);
+    if (ret != ESP_OK) {
+        web_respond_json(req, 401, "{\"error\":\"unauthorized\"}");
+        return ESP_OK;
+    }
     char buf[48];
-    snprintf(buf, sizeof(buf), "{\"ok\":true,\"expires_in\":%lld}",
-             (long long)(TOKEN_TTL_US / 1000000));
+    snprintf(buf, sizeof(buf), "{\"ok\":true,\"expires_in\":%lu}", (unsigned long)expires_in);
     web_respond_json(req, 200, buf);
     return ESP_OK;
 }

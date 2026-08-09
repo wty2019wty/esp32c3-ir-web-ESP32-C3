@@ -99,24 +99,9 @@ static esp_err_t play_by_seq(uint32_t seq, uint32_t freq)
     return ESP_ERR_NOT_FOUND;
 }
 
-/* POST /api/play {"type":"hxd"|"raw"|"frame", ...} */
-static esp_err_t play_handler(httpd_req_t *req)
+/* Shared command core for playback. Body: {"type","freq?",value/data/seq}. */
+esp_err_t web_ir_play_exec(cJSON *root)
 {
-    if (!web_require_auth(req)) {
-        return ESP_OK;
-    }
-    char *body = web_httpd_read_body(req);
-    if (!body) {
-        web_respond_json(req, 400, "{\"error\":\"bad body\"}");
-        return ESP_OK;
-    }
-    cJSON *root = cJSON_Parse(body);
-    free(body);
-    if (!root) {
-        web_respond_json(req, 400, "{\"error\":\"bad json\"}");
-        return ESP_OK;
-    }
-
     cJSON *type = cJSON_GetObjectItem(root, "type");
     cJSON *freq_item = cJSON_GetObjectItem(root, "freq");
     uint32_t freq = 0;
@@ -124,9 +109,7 @@ static esp_err_t play_handler(httpd_req_t *req)
         double fv = freq_item->valuedouble;
         /* 0 = use global carrier; otherwise must be in the valid range */
         if (fv != 0.0 && (fv < IR_CARRIER_FREQ_MIN || fv > IR_CARRIER_FREQ_MAX)) {
-            cJSON_Delete(root);
-            web_respond_json(req, 400, "{\"error\":\"bad freq\"}");
-            return ESP_OK;
+            return ESP_ERR_INVALID_ARG;
         }
         freq = (uint32_t)fv;
     }
@@ -173,7 +156,28 @@ static esp_err_t play_handler(httpd_req_t *req)
             ret = play_by_seq((uint32_t)s->valuedouble, freq);
         }
     }
+    return ret;
+}
 
+/* POST /api/play {"type":"hxd"|"raw"|"frame", ...} */
+static esp_err_t play_handler(httpd_req_t *req)
+{
+    if (!web_require_auth(req)) {
+        return ESP_OK;
+    }
+    char *body = web_httpd_read_body(req);
+    if (!body) {
+        web_respond_json(req, 400, "{\"error\":\"bad body\"}");
+        return ESP_OK;
+    }
+    cJSON *root = cJSON_Parse(body);
+    free(body);
+    if (!root) {
+        web_respond_json(req, 400, "{\"error\":\"bad json\"}");
+        return ESP_OK;
+    }
+
+    esp_err_t ret = web_ir_play_exec(root);
     cJSON_Delete(root);
 
     if (ret == ESP_OK) {
@@ -182,6 +186,25 @@ static esp_err_t play_handler(httpd_req_t *req)
         web_respond_json(req, 400, "{\"error\":\"playback failed\"}");
     }
     return ESP_OK;
+}
+
+/* Shared command core for carrier. Body: {"freq":38000}. */
+esp_err_t web_ir_carrier_exec(cJSON *root, uint32_t *freq_out)
+{
+    cJSON *freq_item = cJSON_GetObjectItem(root, "freq");
+    if (!cJSON_IsNumber(freq_item)) {
+        return ESP_ERR_NOT_FOUND;
+    }
+    double fv = freq_item->valuedouble;
+    if (fv < IR_CARRIER_FREQ_MIN || fv > IR_CARRIER_FREQ_MAX) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    uint32_t freq = (uint32_t)fv;
+    esp_err_t ret = ir_set_carrier_freq(freq);
+    if (ret == ESP_OK && freq_out) {
+        *freq_out = ir_get_carrier_freq();
+    }
+    return ret;
 }
 
 /* POST /api/carrier {"freq":38000} */
@@ -201,28 +224,32 @@ static esp_err_t carrier_handler(httpd_req_t *req)
         web_respond_json(req, 400, "{\"error\":\"bad json\"}");
         return ESP_OK;
     }
-    cJSON *freq_item = cJSON_GetObjectItem(root, "freq");
-    if (!cJSON_IsNumber(freq_item)) {
-        cJSON_Delete(root);
-        web_respond_json(req, 400, "{\"error\":\"missing freq\"}");
-        return ESP_OK;
-    }
-    double fv = freq_item->valuedouble;
-    if (fv < IR_CARRIER_FREQ_MIN || fv > IR_CARRIER_FREQ_MAX) {
-        cJSON_Delete(root);
-        web_respond_json(req, 400, "{\"error\":\"invalid freq\"}");
-        return ESP_OK;
-    }
-    uint32_t freq = (uint32_t)fv;
-    esp_err_t ret = ir_set_carrier_freq(freq);
+    uint32_t freq = 0;
+    esp_err_t ret = web_ir_carrier_exec(root, &freq);
     cJSON_Delete(root);
 
     if (ret == ESP_OK) {
         char buf[64];
-        snprintf(buf, sizeof(buf), "{\"ok\":true,\"freq\":%lu}", (unsigned long)ir_get_carrier_freq());
+        snprintf(buf, sizeof(buf), "{\"ok\":true,\"freq\":%lu}", (unsigned long)freq);
         web_respond_json(req, 200, buf);
+    } else if (ret == ESP_ERR_NOT_FOUND) {
+        web_respond_json(req, 400, "{\"error\":\"missing freq\"}");
     } else {
         web_respond_json(req, 400, "{\"error\":\"invalid freq\"}");
+    }
+    return ESP_OK;
+}
+
+/* Shared command core for RX pause. Body: {"enabled":true|false}. */
+esp_err_t web_ir_rxpause_exec(cJSON *root, bool *enabled_out)
+{
+    cJSON *en = cJSON_GetObjectItem(root, "enabled");
+    if (!cJSON_IsBool(en)) {
+        return ESP_ERR_NOT_FOUND;
+    }
+    ir_set_rx_pause_enabled(cJSON_IsTrue(en));
+    if (enabled_out) {
+        *enabled_out = ir_get_rx_pause_enabled();
     }
     return ESP_OK;
 }
@@ -244,19 +271,18 @@ static esp_err_t rx_pause_handler(httpd_req_t *req)
         web_respond_json(req, 400, "{\"error\":\"bad json\"}");
         return ESP_OK;
     }
-    cJSON *en = cJSON_GetObjectItem(root, "enabled");
-    if (!cJSON_IsBool(en)) {
-        cJSON_Delete(root);
-        web_respond_json(req, 400, "{\"error\":\"missing enabled\"}");
-        return ESP_OK;
-    }
-    ir_set_rx_pause_enabled(cJSON_IsTrue(en));
+    bool enabled = false;
+    esp_err_t ret = web_ir_rxpause_exec(root, &enabled);
     cJSON_Delete(root);
 
-    char buf[64];
-    snprintf(buf, sizeof(buf), "{\"ok\":true,\"rx_pause_on_play\":%s}",
-             ir_get_rx_pause_enabled() ? "true" : "false");
-    web_respond_json(req, 200, buf);
+    if (ret == ESP_OK) {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "{\"ok\":true,\"rx_pause_on_play\":%s}",
+                 enabled ? "true" : "false");
+        web_respond_json(req, 200, buf);
+    } else {
+        web_respond_json(req, 400, "{\"error\":\"missing enabled\"}");
+    }
     return ESP_OK;
 }
 

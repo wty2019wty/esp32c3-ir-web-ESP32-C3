@@ -323,27 +323,86 @@ async function saveForcedPwd() {
 
 async function doLogout() {
   try {
-    await apiFetch('/api/logout', { method: 'POST' });
+    await rpc('POST', '/api/logout', {});
   } catch (e) { /* token may already be invalid */ }
   clearAuth();
   location.reload();
 }
 
-async function apiFetch(url, opts) {
-  opts = opts || {};
+/* REST-fallback call. Resolves with the parsed JSON object (normalized so a
+ * non-2xx with {"ok":true} still resolves, e.g. {ok:true,restart:true}). */
+function restCall(method, url, body) {
+  return fetch(url, {
+    method: method,
+    headers: Object.assign({ 'Content-Type': 'application/json' }, authHeaders()),
+    body: body === undefined ? undefined : JSON.stringify(body)
+  }).then(async (r) => {
+    if (r.status === 401) {
+      clearAuth();
+      showLogin();
+      throw new Error('unauthorized');
+    }
+    let d = {};
+    try { d = await r.json(); } catch (e) { d = {}; }
+    if (!r.ok && !d.ok) {
+      const e = new Error(d.error || ('HTTP ' + r.status));
+      e.status = r.status;
+      e.payload = d;
+      throw e;
+    }
+    return d;
+  });
+}
+
+function urlToCmd(method, url) {
+  const path = url.split('?')[0];
+  switch (path) {
+    case '/api/play': return 'play';
+    case '/api/carrier': return 'carrier';
+    case '/api/rxpause': return 'rxpause';
+    case '/api/wificfg': return 'wificfg';
+    case '/api/authcfg': return 'authcfg';
+    case '/api/renew': return 'renew';
+    case '/api/logout': return 'logout';
+    case '/api/status': return 'status';
+    case '/api/frames': return 'frames';
+    default: return null;
+  }
+}
+
+/* Unified API access: prefer WebSocket command RPC, fall back to REST on
+ * any WebSocket failure (not connected, send error, timeout, close). */
+function rpc(method, url, body) {
   if (!tokenAlive()) {
     clearAuth();
     showLogin();
-    throw new Error('unauthorized');
+    return Promise.reject(new Error('unauthorized'));
   }
-  opts.headers = Object.assign({}, opts.headers, authHeaders());
-  const r = await fetch(url, opts);
-  if (r.status === 401) {
-    clearAuth();
-    showLogin();
-    throw new Error('unauthorized');
+  const runRest = () => restCall(method, url, body);
+  if (wsReady && ws && ws.readyState === WebSocket.OPEN) {
+    const cmd = urlToCmd(method, url);
+    if (cmd) {
+      return new Promise((resolve, reject) => {
+        const id = ++wsCmdId;
+        const waiter = {
+          resolve, reject, runRest,
+          timer: setTimeout(() => {
+            wsCmdWaiters.delete(id);
+            runRest().then(resolve, reject); /* timeout -> REST fallback */
+          }, WS_CMD_TIMEOUT_MS)
+        };
+        wsCmdWaiters.set(id, waiter);
+        try {
+          ws.send(JSON.stringify({ type: 'cmd', id, cmd, body: body || {} }));
+        } catch (e) {
+          clearTimeout(waiter.timer);
+          wsCmdWaiters.delete(id);
+          runRest().then(resolve, reject);
+        }
+      });
+    }
   }
-  return r;
+  return runRest();
 }
 
 function scheduleRenew() {
@@ -351,13 +410,12 @@ function scheduleRenew() {
   setTimeout(async () => {
     if (!tokenAlive()) return;
     try {
-      const r = await apiFetch('/api/renew', { method: 'POST' });
-      if (r.status === 200) {
-        const d = await r.json();
-        authExpires = Date.now() + (d.expires_in || 86400) * 1000;
+      const d = await rpc('POST', '/api/renew', {});
+      if (d && d.expires_in) {
+        authExpires = Date.now() + d.expires_in * 1000;
         sessionStorage.setItem('authExpires', String(authExpires));
       }
-    } catch (e) { /* 401 handled inside apiFetch */ }
+    } catch (e) { /* 401 handled inside rpc */ }
     scheduleRenew();
   }, delay);
 }
@@ -367,6 +425,10 @@ function scheduleRenew() {
 let ws = null;
 let wsRetryTimer = null;
 let pollTimers = [];
+let wsReady = false;      /* WS connected AND authenticated */
+let wsCmdId = 0;
+const wsCmdWaiters = new Map();
+const WS_CMD_TIMEOUT_MS = 6000;
 
 function stopPolling() {
   if (!pollTimers.length) return;
@@ -408,11 +470,25 @@ function wsConnect() {
     try { d = JSON.parse(ev.data); } catch (e) { return; }
     if (d.type === 'auth') {
       if (d.ok === true) {
+        wsReady = true;
         stopPolling();
       } else if (d.ok === false) {
         clearAuth();
         showLogin();
         try { s.close(); } catch (e) { /* ignored */ }
+      }
+    } else if (d.type === 'resp') {
+      const w = wsCmdWaiters.get(d.id);
+      if (!w) return;
+      clearTimeout(w.timer);
+      wsCmdWaiters.delete(d.id);
+      if (d.ok) {
+        w.resolve(Object.assign({ ok: true }, d.data || {}));
+      } else {
+        const e = new Error(d.error || 'failed');
+        e.status = 400;
+        e.payload = d;
+        w.reject(e);
       }
     } else if (d.type === 'status' && d.data) {
       applyStatus(d.data);
@@ -425,6 +501,13 @@ function wsConnect() {
   };
   s.onclose = () => {
     ws = null;
+    wsReady = false;
+    /* flush any in-flight WS commands via REST so nothing hangs */
+    wsCmdWaiters.forEach(w => {
+      clearTimeout(w.timer);
+      w.runRest().then(w.resolve, w.reject);
+    });
+    wsCmdWaiters.clear();
     if (tokenAlive()) {
       startPollingFallback();
       scheduleWsRetry();
@@ -438,15 +521,6 @@ function toast(msg) {
   t.textContent = msg;
   t.style.opacity = 1;
   setTimeout(() => { t.style.opacity = 0; }, 1800);
-}
-
-async function postJSON(url, body) {
-  const r = await apiFetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body)
-  });
-  return r.json();
 }
 
 /* ---------------- status ---------------- */
@@ -479,8 +553,7 @@ function applyStatus(s) {
 async function refreshStatus() {
   if (!auth) return;   /* not logged in: no polling */
   try {
-    const s = await (await apiFetch('/api/status')).json();
-    applyStatus(s);
+    applyStatus(await rpc('GET', '/api/status', {}));
   } catch (e) { /* transient */ }
 }
 
@@ -565,9 +638,15 @@ function applyFrame(f) {
 async function pollFrames() {
   if (!auth) return;   /* not logged in: no polling */
   try {
-    const d = await (await apiFetch('/api/frames?since=' + lastSeq)).json();
+    const d = await rpc('GET', '/api/frames', { since: lastSeq });
     if (d.last_seq != null && d.last_seq > lastSeq) lastSeq = d.last_seq;
     (d.frames || []).forEach(applyFrame);
+    if (d.truncated) {
+      /* backfill exceeded the WS buffer; resync the rest over REST */
+      const r = await restCall('GET', '/api/frames?since=' + lastSeq);
+      if (r.last_seq != null && r.last_seq > lastSeq) lastSeq = r.last_seq;
+      (r.frames || []).forEach(applyFrame);
+    }
   } catch (e) { /* transient */ }
 }
 
@@ -606,27 +685,25 @@ function playRaw() {
 
 async function play(body) {
   try {
-    const d = await postJSON('/api/play', body);
-    if (d.ok) toast('回放已开始');
-    else toast('回放失败：参数错误');
-  } catch (e) { toast('回放请求失败'); }
+    await rpc('POST', '/api/play', body);
+    toast('回放已开始');
+  } catch (e) { toast('回放失败：' + (e.message || '参数错误')); }
 }
 
 async function setCarrier() {
   const freq = parseInt($('carrierInput').value, 10);
   if (!(freq >= 1000 && freq <= 1000000)) { toast('载波范围 1000 - 1000000 Hz'); return; }
   try {
-    const d = await postJSON('/api/carrier', { freq });
-    if (d.ok) { $('carrierStatus').textContent = '已设置 ' + d.freq + ' Hz'; toast('载波已更新'); }
-    else toast('载波设置失败');
+    const d = await rpc('POST', '/api/carrier', { freq });
+    $('carrierStatus').textContent = '已设置 ' + d.freq + ' Hz';
+    toast('载波已更新');
   } catch (e) { toast('载波请求失败'); }
 }
 
 async function setRxPause(enabled) {
   try {
-    const d = await postJSON('/api/rxpause', { enabled });
-    if (d.ok) toast(enabled ? '已开启：回放时暂停接收' : '已关闭：回放时允许自环');
-    else toast('设置失败');
+    await rpc('POST', '/api/rxpause', { enabled });
+    toast(enabled ? '已开启：回放时暂停接收' : '已关闭：回放时允许自环');
   } catch (e) { toast('设置请求失败'); }
 }
 
@@ -643,7 +720,7 @@ function showTab(t) {
 async function loadWifiCfg() {
   $('cfgStatus').textContent = '';
   try {
-    const c = await (await apiFetch('/api/wificfg')).json();
+    const c = await rpc('GET', '/api/wificfg', {});
     $('cfgApSsid').value = c.ap_ssid;
     $('cfgApPwd').value = '';
     $('cfgApPwd').placeholder = c.ap_password_set ? '已设置（留空 = 不修改）' : '留空 = 开放网络';
@@ -660,7 +737,7 @@ async function loadWifiCfg() {
     $('cfgStaGw').value = c.sta_gw;
     $('cfgStaDns').value = c.sta_dns;
     try {
-      const a = await (await apiFetch('/api/authcfg')).json();
+      const a = await rpc('GET', '/api/authcfg', {});
       $('cfgAuthUser').value = a.user;
     } catch (e) { /* ignore */ }
   } catch (e) {
@@ -710,15 +787,13 @@ async function saveWifiCfg() {
     sta_dns: dnsV
   };
   try {
-    const d = await postJSON('/api/wificfg', body);
+    const d = await rpc('POST', '/api/wificfg', body);
     if (d.ok && d.restart) {
       $('cfgStatus').textContent = '已保存，设备 2 秒后重启，请稍候重新连接...';
       $('cfgSaveBtn').disabled = true;
-    } else {
-      $('cfgStatus').textContent = '保存失败：' + (d.error || '未知错误');
     }
   } catch (e) {
-    $('cfgStatus').textContent = '保存请求失败';
+    $('cfgStatus').textContent = '保存失败：' + ((e.payload && e.payload.error) || e.message || '请求失败');
   }
 }
 
@@ -734,7 +809,7 @@ async function saveAuthCfg() {
   const body = { user: u };
   if (p !== '') body.pass = p;
   try {
-    const d = await postJSON('/api/authcfg', body);
+    const d = await rpc('POST', '/api/authcfg', body);
     if (d.ok) {
       $('authStatus').textContent = '已保存';
       $('cfgAuthPass').value = '';
@@ -742,10 +817,10 @@ async function saveAuthCfg() {
       toast('登录设置已保存，请重新登录');
       clearAuth();
       showLogin();
-    } else {
-      $('authStatus').textContent = '保存失败：' + (d.error || '未知错误');
     }
-  } catch (e) { $('authStatus').textContent = '保存请求失败'; }
+  } catch (e) {
+    $('authStatus').textContent = '保存失败：' + ((e.payload && e.payload.error) || e.message || '请求失败');
+  }
 }
 
 /* ---------------- init ---------------- */
