@@ -37,6 +37,9 @@
   .badge.ap { background: #1f5c2e; color: #7ee08a; }
   .badge.sta { background: #1f4a6e; color: #7ec4e0; }
   .badge.off { background: #5c1f1f; color: #e07e7e; }
+  .badge.ws { background: #1f4a6e; color: #7ec4e0; }
+  .badge.rest { background: #5c4a1f; color: #e0c47e; }
+  .badge.con { background: #3a3f4a; color: #9aa3b3; }
   .tabbtn { background: #232936; color: #d7dae0; border: 1px solid #2a2f3a; }
   .tabbtn.active { background: #2f6fed; color: #fff; border-color: #2f6fed; }
   .formgrid { display: grid; grid-template-columns: 190px 1fr; gap: 9px 12px; align-items: center; }
@@ -61,7 +64,7 @@
 </style>
 </head>
 <body>
-<h1>esp32c3-ir-web 红外信号监视器</h1>
+<h1>esp32c3-ir-web 红外信号监视器 <span id="chanBadge" class="badge con">连接中...</span></h1>
 
 <div class="row" style="margin-bottom: 12px;">
   <button id="tabMonBtn" class="tabbtn active" onclick="showTab('mon')">实时监视</button>
@@ -430,6 +433,27 @@ let wsCmdId = 0;
 const wsCmdWaiters = new Map();
 const WS_CMD_TIMEOUT_MS = 6000;
 
+/* Reflect the current API channel in the header badge:
+ *   WS实时          -> commands/pushes go over WebSocket
+ *   REST轮询(回退)   -> WebSocket unavailable, using REST
+ *   WS连接中...      -> socket connecting (not yet authed) */
+function setChan() {
+  const b = $('chanBadge');
+  if (wsReady) {
+    b.className = 'badge ws';
+    b.textContent = 'WS实时';
+  } else if (ws && ws.readyState === WebSocket.OPEN) {
+    b.className = 'badge con';
+    b.textContent = 'WS认证中...';
+  } else if (ws && (ws.readyState === WebSocket.CONNECTING)) {
+    b.className = 'badge con';
+    b.textContent = 'WS连接中...';
+  } else {
+    b.className = 'badge rest';
+    b.textContent = 'REST轮询(回退)';
+  }
+}
+
 function stopPolling() {
   if (!pollTimers.length) return;
   pollTimers.forEach(clearInterval);
@@ -462,7 +486,9 @@ function wsConnect() {
     return;
   }
   ws = s;
+  setChan();
   s.onopen = () => {
+    setChan();
     try { s.send(JSON.stringify({ type: 'auth', token: auth })); } catch (e) { /* ignored */ }
   };
   s.onmessage = (ev) => {
@@ -471,6 +497,7 @@ function wsConnect() {
     if (d.type === 'auth') {
       if (d.ok === true) {
         wsReady = true;
+        setChan();
         stopPolling();
       } else if (d.ok === false) {
         clearAuth();
@@ -502,6 +529,7 @@ function wsConnect() {
   s.onclose = () => {
     ws = null;
     wsReady = false;
+    setChan();
     /* flush any in-flight WS commands via REST so nothing hangs */
     wsCmdWaiters.forEach(w => {
       clearTimeout(w.timer);
