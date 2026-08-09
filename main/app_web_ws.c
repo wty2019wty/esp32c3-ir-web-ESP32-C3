@@ -28,6 +28,7 @@ typedef struct {
     bool authed;
     uint32_t gen;        /* session generation the client authenticated against */
     uint32_t acked_id;   /* last status id confirmed by this client (0 = none) */
+    int pending;         /* queued async sends, for back-pressure */
 } ws_client_t;
 
 static httpd_handle_t s_ws_server = NULL;
@@ -161,39 +162,102 @@ static bool ws_has_authed_clients(void)
     return has;
 }
 
-static void ws_send_text_all(const char *json)
+/* ---- async push: serialize ALL sends through the httpd task --------------
+ * httpd_ws_send_frame_async() writes to the socket from the *caller's* task
+ * while the httpd task concurrently writes command replies/pongs to the same
+ * fd -> interleaved bytes -> "Invalid frame header" on the client. Instead we
+ * queue the frame via httpd_ws_send_data_async() so every write happens in the
+ * httpd task context. The payload is copied here and freed in the callback. */
+
+#define WS_MAX_PENDING 4   /* queued frames per client; extra pushes are dropped */
+
+typedef struct {
+    int fd;
+    char *payload;
+} ws_async_msg_t;
+
+static void ws_async_send_done(esp_err_t err, int socket, void *arg)
 {
-    if (!s_ws_server || !s_ws_mutex) {
+    ws_async_msg_t *m = arg;
+    if (err != ESP_OK) {
+        ESP_LOGD(TAG, "ws: async send to fd %d failed: %s", socket, esp_err_to_name(err));
+        ws_client_remove(socket);
+    } else if (m && s_ws_mutex && xSemaphoreTake(s_ws_mutex, portMAX_DELAY) == pdTRUE) {
+        for (int i = 0; i < WS_MAX_CLIENTS; i++) {
+            if (s_ws_clients[i].fd == m->fd && s_ws_clients[i].pending > 0) {
+                s_ws_clients[i].pending--;
+                break;
+            }
+        }
+        xSemaphoreGive(s_ws_mutex);
+    }
+    if (m) {
+        free(m->payload);
+        free(m);
+    }
+}
+
+/* Caller must hold s_ws_mutex. Copies the text and queues the send. */
+static void ws_async_send_text_locked(int fd, const char *json)
+{
+    if (!s_ws_server || fd < 0) {
         return;
     }
-    int dead[WS_MAX_CLIENTS];
-    int ndead = 0;
-    if (xSemaphoreTake(s_ws_mutex, portMAX_DELAY) != pdTRUE) {
+    for (int i = 0; i < WS_MAX_CLIENTS; i++) {
+        if (s_ws_clients[i].fd == fd && s_ws_clients[i].pending >= WS_MAX_PENDING) {
+            ESP_LOGD(TAG, "ws: dropping push to fd %d (queue full)", fd);
+            return; /* back-pressure: skip this push, client resyncs via frames cmd */
+        }
+    }
+    size_t len = strlen(json);
+    char *dup = malloc(len + 1);
+    if (!dup) {
         return;
+    }
+    memcpy(dup, json, len + 1);
+    ws_async_msg_t *m = malloc(sizeof(*m));
+    if (!m) {
+        free(dup);
+        return;
+    }
+    m->fd = fd;
+    m->payload = dup;
+    for (int i = 0; i < WS_MAX_CLIENTS; i++) {
+        if (s_ws_clients[i].fd == fd) {
+            s_ws_clients[i].pending++;
+            break;
+        }
     }
     httpd_ws_frame_t frame = {
         .final = true,
         .fragmented = false,
         .type = HTTPD_WS_TYPE_TEXT,
-        .payload = (uint8_t *)json,
-        .len = strlen(json),
+        .payload = (uint8_t *)dup,
+        .len = len,
     };
+    esp_err_t err = httpd_ws_send_data_async(s_ws_server, fd, &frame, ws_async_send_done, m);
+    if (err != ESP_OK) {
+        ws_async_send_done(err, fd, m);
+    }
+}
+
+static void ws_send_text_all(const char *json)
+{
+    if (!s_ws_server || !s_ws_mutex) {
+        return;
+    }
+    if (xSemaphoreTake(s_ws_mutex, portMAX_DELAY) != pdTRUE) {
+        return;
+    }
     uint32_t cur_gen = web_auth_get_gen();
     for (int i = 0; i < WS_MAX_CLIENTS; i++) {
         if (s_ws_clients[i].fd < 0 || !s_ws_clients[i].authed ||
             s_ws_clients[i].gen != cur_gen) {
             continue;
         }
-        esp_err_t err = httpd_ws_send_frame_async(s_ws_server, s_ws_clients[i].fd, &frame);
-        if (err != ESP_OK && ndead < WS_MAX_CLIENTS) {
-            dead[ndead++] = s_ws_clients[i].fd;
-            ESP_LOGD(TAG, "ws: async send to fd %d failed: %s", s_ws_clients[i].fd, esp_err_to_name(err));
-        }
+        ws_async_send_text_locked(s_ws_clients[i].fd, json);
     }
     xSemaphoreGive(s_ws_mutex);
-    for (int i = 0; i < ndead; i++) {
-        ws_client_remove(dead[i]);
-    }
 }
 
 static esp_err_t ws_reply_text(httpd_req_t *req, const char *json)
@@ -209,8 +273,8 @@ static esp_err_t ws_reply_text(httpd_req_t *req, const char *json)
 }
 
 /* Send the cached status to clients whose acked_id is stale. Caller must
- * hold s_ws_mutex; dead fds are collected into dead[] / ndead. */
-static void ws_send_status_locked(int *dead, int *ndead)
+ * hold s_ws_mutex. */
+static void ws_send_status_locked(void)
 {
     if (!s_status_inner || !s_ws_server) {
         return;
@@ -222,13 +286,6 @@ static void ws_send_status_locked(int *dead, int *ndead)
     }
     snprintf(wrapped, cap, "{\"type\":\"status\",\"id\":%lu,\"data\":%s}",
              (unsigned long)s_status_id, s_status_inner);
-    httpd_ws_frame_t frame = {
-        .final = true,
-        .fragmented = false,
-        .type = HTTPD_WS_TYPE_TEXT,
-        .payload = (uint8_t *)wrapped,
-        .len = strlen(wrapped),
-    };
     uint32_t cur_gen = web_auth_get_gen();
     for (int i = 0; i < WS_MAX_CLIENTS; i++) {
         if (s_ws_clients[i].fd < 0 || !s_ws_clients[i].authed ||
@@ -236,12 +293,7 @@ static void ws_send_status_locked(int *dead, int *ndead)
             s_ws_clients[i].acked_id == s_status_id) {
             continue;
         }
-        esp_err_t err = httpd_ws_send_frame_async(s_ws_server, s_ws_clients[i].fd, &frame);
-        if (err != ESP_OK && *ndead < WS_MAX_CLIENTS) {
-            dead[(*ndead)++] = s_ws_clients[i].fd;
-            ESP_LOGD(TAG, "ws: status send to fd %d failed: %s",
-                     s_ws_clients[i].fd, esp_err_to_name(err));
-        }
+        ws_async_send_text_locked(s_ws_clients[i].fd, wrapped);
     }
     free(wrapped);
 }
@@ -258,8 +310,6 @@ static void ws_push_status_now(void)
     if (!inner) {
         return;
     }
-    int dead[WS_MAX_CLIENTS];
-    int ndead = 0;
     if (xSemaphoreTake(s_ws_mutex, portMAX_DELAY) != pdTRUE) {
         free(inner);
         return;
@@ -271,11 +321,8 @@ static void ws_push_status_now(void)
         s_status_id = 1;
     }
     s_last_forced_push_us = esp_timer_get_time();
-    ws_send_status_locked(dead, &ndead);
+    ws_send_status_locked();
     xSemaphoreGive(s_ws_mutex);
-    for (int i = 0; i < ndead; i++) {
-        ws_client_remove(dead[i]);
-    }
 }
 
 static void ws_status_timer_cb(void *arg)
@@ -289,8 +336,6 @@ static void ws_status_timer_cb(void *arg)
     if (!inner) {
         return;
     }
-    int dead[WS_MAX_CLIENTS];
-    int ndead = 0;
     if (xSemaphoreTake(s_ws_mutex, portMAX_DELAY) != pdTRUE) {
         free(inner);
         return;
@@ -317,11 +362,8 @@ static void ws_status_timer_cb(void *arg)
 
     /* send the latest status to clients that have not confirmed receipt yet;
      * unchanged states are never re-broadcast to clients that already acked */
-    ws_send_status_locked(dead, &ndead);
+    ws_send_status_locked();
     xSemaphoreGive(s_ws_mutex);
-    for (int i = 0; i < ndead; i++) {
-        ws_client_remove(dead[i]);
-    }
 }
 
 /* Playback start/stop: push the status immediately so the UI never stays
