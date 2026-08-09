@@ -479,16 +479,18 @@ function stopStatusPoll() {
  * socket is torn down so the reconnect path (badge + retry) takes over. */
 async function pollStatus() {
   if (!wsReady || !tokenAlive()) return;
+  const target = ws;
   try {
     const s = await rpc('status');
     lastStatusAt = Date.now();
-    if (ws) ws.lastMsgAt = Date.now(); /* feed the watchdog */
+    if (ws === target) target.lastMsgAt = Date.now(); /* feed the watchdog */
     applyStatus(s);
     setChan();
   } catch (e) {
-    /* dead/blocked socket: tear it down so the retry logic takes over */
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      try { ws.close(); } catch (e2) { /* ignored */ }
+    /* dead/blocked socket: tear it down so the retry logic takes over. Only
+     * close the socket this probe used, never a newer replacement. */
+    if (target && ws === target && target.readyState === WebSocket.OPEN) {
+      try { target.close(); } catch (e2) { /* ignored */ }
     }
   }
 }
@@ -511,6 +513,7 @@ function reconnect() {
  * the page stays disconnected until the user reconnects (or reloads). */
 function disconnect() {
   wsManualClosed = true;
+  pendingLogin = null;
   closeSocket();
   setChan();
 }
@@ -571,6 +574,7 @@ function wsConnect() {
     return;
   }
   ws = s;
+  lastStatusAt = 0; /* fresh connection: no verified-alive timestamp yet */
   s.lastMsgAt = Date.now();
   /* watchdog: if the server goes silent (dead NAT hole, network drop that
    * doesn't fire onclose), force a reconnect */
@@ -588,8 +592,12 @@ function wsConnect() {
     } else if (tokenAlive()) {
       /* existing session: authenticate with the stored token */
       try { s.send(JSON.stringify({ type: 'auth', token: auth })); } catch (e) { /* ignored */ }
+    } else {
+      /* expired/missing token (e.g. reconnecting after the token expired while
+       * disconnected): prompt the user to log in again */
+      clearAuth();
+      showLogin();
     }
-    /* no token and no pending login: wait for the user to submit the form */
   };
   s.onmessage = (ev) => {
     s.lastMsgAt = Date.now();
