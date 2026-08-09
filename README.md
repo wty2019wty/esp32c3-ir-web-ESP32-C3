@@ -181,14 +181,48 @@ idf.py menuconfig   # → "IR Web Tool Configuration"
 
 ### 前后端分离
 
-页面可与设备分离部署（如托管在 CF Pages / 任意静态服务器）。此时：
+页面可与设备分离部署（如托管在 CF Pages / 任意静态服务器）。页面内置的
+Content-Security-Policy 已放行任意 `ws:`/`wss:` 源（`connect-src 'self' ws: wss:`），
+WebSocket 不受 CORS 限制，因此从任意域名加载页面都能连接设备。此时：
 
 - 页面加载后不会自动连接，**登录框内需先手动填写设备地址**（支持
   `ws://192.168.0.145:80`、`wss://ir.example.com` 或省略协议只填 `host:port`，
   HTTPS 页面下省略协议默认 `wss://`）；地址保存在浏览器 localStorage，下次自动填入。
 - 若设备关闭了"启用内置 Web 界面"（`webcfg` 的 `web_ui=false`），`/` 与 `/index.html` 返回 404，
   外部前端仍可通过 `/api/ws` 完整控制（登录、命令、推送）。
-- HTTPS 页面连接明文 `ws://` 可能被浏览器当作混合内容拦截，请使用 `wss://`。
+- **HTTPS 页面必须用 `wss://`**：HTTPS（如 CF Pages 的 `*.pages.dev`）页面里连接明文
+  `ws://` 会被浏览器按**混合内容**拦截（`Mixed Content`），这是连接失败最常见的原因。
+  设备自身只提供明文 `ws://`，需要借助反向代理/隧道把它变成 `wss://` 端点，见下。
+
+#### 部署到 Cloudflare Pages
+
+把 `main/web/index.html` 直接推到 CF Pages（或任意静态托管）即可作为前端：
+
+1. 前端页面部署到 `https://<your-pages>.pages.dev`（自动 HTTPS）。
+2. 给设备套 **Cloudflare Tunnel**，把设备的 `/api/ws` 暴露成 `wss://ir.example.com/api/ws`
+   （Tunnel 自动带 HTTPS，无需 VPS/证书）：
+   - 在局域网一台常开主机（树莓派/NAS）安装并登录 `cloudflared`：
+     ```bash
+     cloudflared tunnel create ir-web
+     cloudflared tunnel route dns ir-web ir.example.com
+     ```
+   - 配置文件 `~/.cloudflared/config.yml`：
+     ```yaml
+     tunnel: ir-web
+     credentials-file: /root/.cloudflared/<tunnel-id>.json
+
+     ingress:
+       - hostname: ir.example.com
+         service: http://192.168.0.145:80
+       - service: http_status:404
+     ```
+   - 运行 `cloudflared tunnel run ir-web`。注意：Tunnel 到设备这一段是局域网明文 HTTP，
+     登录凭据/token 会在 `ir.example.com` 与设备之间以明文传输，建议只允许 cloudflared
+     主机访问设备（同一可信网段），并在 Cloudflare Access 上给该域名加访问策略。
+3. 浏览器打开 `https://<your-pages>.pages.dev`，登录框填
+   `wss://ir.example.com` + 账号密码即可远程控制（也可在设备设置页关闭内置页面）。
+
+> 也可用 nginx/VPS 反向代理产生 `wss://`（见下节），原理相同。
 
 ### HTTPS 反向代理（nginx）部署注意
 
@@ -202,7 +236,7 @@ idf.py menuconfig   # → "IR Web Tool Configuration"
 - **nginx 日志**：默认 `access_log` 不记录请求体，登录密码/token 不会落盘；
   不要自定义 `log_format` 打印请求体。
 - **强制 HTTPS**：配置 HTTP → HTTPS 跳转，避免用户用 `http://` 直接访问导致凭据走明文。
-- **WebSocket 必须走 wss**：页面会连接 `ws://<IP>/api/ws`，反代需要转发 Upgrade 头，
+- **WebSocket 必须走 wss**：外部前端（HTTPS 页面）需连接 `wss://<host>/api/ws`，反代需要转发 Upgrade 头，
   示例：
 
 ```nginx
@@ -215,7 +249,7 @@ location /api/ws {
 }
 ```
 
-HTTPS 页面下浏览器会自动使用 `wss://`；若反代未转发 Upgrade 头，WebSocket 会连接失败，
+HTTPS 页面下浏览器会使用 `wss://`；若反代未转发 Upgrade 头，WebSocket 会连接失败，
 **整个页面不可用**（无 REST 回退，登录与控制全部依赖 WS）。
 
 ## 工程结构
