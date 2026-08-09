@@ -291,6 +291,7 @@ const TOKEN_TTL_MS = 24 * 60 * 60 * 1000;
 let auth = sessionStorage.getItem('auth') || '';
 let authExpires = Number(sessionStorage.getItem('authExpires') || 0);
 let cfgAuthUserLoaded = ''; /* current login user reported by the server (auth settings change detection) */
+let cfgAuthLoaded = false;  /* true once the auth config was successfully read (blocks unsafe saves otherwise) */
 if (auth && !authExpires) authExpires = Date.now() + TOKEN_TTL_MS; /* sessions from older firmware */
 function tokenAlive() { return auth && authExpires && Date.now() < authExpires; }
 function clearAuth() {
@@ -378,13 +379,16 @@ async function saveForcedPwd() {
   if (p !== p2) { $('pwdMsg').textContent = '两次输入的密码不一致'; return; }
   try {
     const d = await rpc('authcfg', { user: u, pass: p });
-    if (d.ok) {
+    if (d.ok && d.invalidated) {
       clearAuth(); /* server invalidated the old token */
       $('loginUser').value = u;
       $('loginPass').value = p;
       $('pwdMsg').textContent = '';
       $('pwdOverlay').style.display = 'none';
       await doLogin(); /* re-login with the new credentials */
+    } else if (d.ok) {
+      /* 服务端认为凭据没有变化（如重复提交当前密码），强制修改不生效 */
+      $('pwdMsg').textContent = '保存失败：密码未变更，请设置一个新密码';
     } else {
       $('pwdMsg').textContent = '保存失败：' + (d.error || '未知错误');
     }
@@ -911,9 +915,14 @@ async function loadWifiCfg() {
     try {
       const a = await rpc('authcfg');
       cfgAuthUserLoaded = a.user;
+      cfgAuthLoaded = true;
       $('cfgAuthUser').value = a.user;
       $('cfgAuthSingle').checked = !!a.single_session;
-    } catch (e) { /* ignore */ }
+    } catch (e) {
+      /* keep the previous loaded state; saving is blocked until a re-read
+       * succeeds so we never save with unknown current user / single_session */
+      cfgAuthLoaded = false;
+    }
   } catch (e) {
     $('cfgStatus').textContent = '读取配置失败';
   }
@@ -993,20 +1002,26 @@ async function saveAuthCfg() {
   if (!u) { $('authStatus').textContent = '用户名不能为空'; return; }
   if (p !== p2) { $('authStatus').textContent = '两次输入的密码不一致'; return; }
   if (p !== '' && p.length < 4) { $('authStatus').textContent = '密码至少 4 位'; return; }
-  const userChanged = u !== cfgAuthUserLoaded;
-  const passChanged = p !== '';
-  const credsChanged = userChanged || passChanged;
+  if (!cfgAuthLoaded) { $('authStatus').textContent = '无法保存：认证配置读取失败，请重新打开设置页'; return; }
   const body = { single_session: $('cfgAuthSingle').checked };
-  if (userChanged) body.user = u;
-  if (passChanged) body.pass = p;
+  if (u !== cfgAuthUserLoaded) body.user = u;
+  if (p !== '') body.pass = p;
   try {
     const d = await rpc('authcfg', body);
     if (d.ok) {
+      if (d.user !== undefined) {
+        /* 旧固件把设置请求当成了读取请求，single_session 并未保存 */
+        $('authStatus').textContent = '保存失败：固件版本过旧，不支持此设置';
+        return;
+      }
       $('authStatus').textContent = '已保存';
       $('cfgAuthPass').value = '';
       $('cfgAuthPass2').value = '';
       cfgAuthUserLoaded = u;
-      if (credsChanged) {
+      cfgAuthLoaded = true;
+      if (d.invalidated || d.invalidated === undefined) {
+        /* invalidated = 凭据已变更需重登；undefined 仅出现在旧固件（其保存成功
+         * 后必然作废会话），同样需要重登 */
         toast('登录设置已保存，请重新登录');
         clearAuth();
         showLogin();

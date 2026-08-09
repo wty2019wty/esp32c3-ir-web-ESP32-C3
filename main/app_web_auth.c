@@ -106,12 +106,6 @@ static esp_err_t web_auth_save_all(const web_auth_cfg_t *cfg, const bool *single
     return e;
 }
 
-esp_err_t web_auth_single_session_set(bool enabled, const char **err)
-{
-    return web_auth_save_all(NULL, &enabled, err);
-}
-
-/* Extend the current session for another full TTL; fails if no session is active. */
 esp_err_t web_auth_renew(uint32_t *expires_in)
 {
     if (s_token[0] == '\0') {
@@ -275,8 +269,9 @@ char *web_authcfg_get_json(void)
 
 /* Apply login credential / session-policy changes from a JSON body; pass empty
  * = keep current. When user/pass actually change the session is invalidated
- * (forced re-login); a pure single_session toggle does not log anyone out. */
-esp_err_t web_authcfg_set(cJSON *root, const char **err)
+ * (forced re-login); a pure single_session toggle does not log anyone out.
+ * *invalidated (may be NULL) is set to true when the session was invalidated. */
+esp_err_t web_authcfg_set(cJSON *root, bool *invalidated, const char **err)
 {
     web_auth_cfg_t cfg;
     web_auth_load(&cfg);
@@ -317,6 +312,9 @@ esp_err_t web_authcfg_set(cJSON *root, const char **err)
     if (creds_changed) {
         /* credentials changed: force a fresh login (kills existing WS sessions too) */
         web_auth_invalidate();
+    }
+    if (invalidated) {
+        *invalidated = creds_changed;
     }
     return ESP_OK;
 }

@@ -229,15 +229,20 @@ char *web_rpc_exec(const char *cmd, cJSON *body, const char **err)
     }
 
     if (strcmp(cmd, "authcfg") == 0) {
-        /* present user/pass/single_session fields => set; otherwise => get */
+        /* present user/pass/single_session fields => set; otherwise => get.
+         * The set reply carries "invalidated":true when the session was
+         * invalidated (credentials actually changed), so the client only
+         * forces a re-login when the server really did. */
         if (cJSON_GetObjectItem(body, "user") || cJSON_GetObjectItem(body, "pass") ||
             cJSON_GetObjectItem(body, "single_session")) {
             const char *e = NULL;
-            if (web_authcfg_set(body, &e) != ESP_OK) {
+            bool invalidated = false;
+            if (web_authcfg_set(body, &invalidated, &e) != ESP_OK) {
                 *err = e ? e : "invalid";
                 return NULL;
             }
-            return xstrdup("{}");
+            return xstrdup(invalidated ? "{\"invalidated\":true}"
+                                       : "{\"invalidated\":false}");
         }
         return web_authcfg_get_json();
     }

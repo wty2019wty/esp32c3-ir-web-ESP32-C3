@@ -32,9 +32,8 @@ bool web_auth_token_ok(const char *token);
 void web_auth_invalidate(void);                       /* clear token + bump session generation */
 uint32_t web_auth_get_gen(void);                      /* current session generation */
 char *web_authcfg_get_json(void);                     /* caller frees */
-esp_err_t web_authcfg_set(cJSON *root, const char **err);
+esp_err_t web_authcfg_set(cJSON *root, bool *invalidated, const char **err);
 bool web_auth_single_session_get(void);               /* true = every login kicks out older sessions (default on) */
-esp_err_t web_auth_single_session_set(bool enabled, const char **err); /* saved to NVS */
 esp_err_t web_auth_renew(uint32_t *expires_in);
 /* WS login (the only unauthenticated operation). Returns a malloc'd complete
  * response JSON with "type":"login" (caller frees); ESP_OK = success, caller
