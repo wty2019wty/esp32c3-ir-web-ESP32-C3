@@ -50,6 +50,7 @@ static void ws_client_remove(int fd)
         if (s_ws_clients[i].fd == fd) {
             s_ws_clients[i].fd = -1;
             s_ws_clients[i].authed = false;
+            s_ws_clients[i].pending = 0; /* drop any stale back-pressure */
         }
     }
     xSemaphoreGive(s_ws_mutex);
@@ -68,6 +69,7 @@ static void ws_client_add(int fd, bool authed)
             s_ws_clients[i].authed = authed;
             s_ws_clients[i].gen = authed ? web_auth_get_gen() : 0;
             s_ws_clients[i].acked_id = 0;
+            s_ws_clients[i].pending = 0;
             xSemaphoreGive(s_ws_mutex);
             return;
         }
@@ -78,6 +80,7 @@ static void ws_client_add(int fd, bool authed)
             s_ws_clients[i].authed = authed;
             s_ws_clients[i].gen = authed ? web_auth_get_gen() : 0;
             s_ws_clients[i].acked_id = 0;
+            s_ws_clients[i].pending = 0; /* slot reuse must not inherit stale counts */
             break;
         }
     }
@@ -180,8 +183,22 @@ static void ws_async_send_done(esp_err_t err, int socket, void *arg)
 {
     ws_async_msg_t *m = arg;
     if (err != ESP_OK) {
+        /* Runs in the httpd task (s_ws_mutex not held). Remove the client only
+         * if it still has this queued send outstanding; if the slot was already
+         * freed (close) or reused (fd value recycled for a new client, pending
+         * reset to 0), leave the current occupant alone. */
         ESP_LOGD(TAG, "ws: async send to fd %d failed: %s", socket, esp_err_to_name(err));
-        ws_client_remove(socket);
+        if (m && s_ws_mutex && xSemaphoreTake(s_ws_mutex, portMAX_DELAY) == pdTRUE) {
+            for (int i = 0; i < WS_MAX_CLIENTS; i++) {
+                if (s_ws_clients[i].fd == m->fd && s_ws_clients[i].pending > 0) {
+                    s_ws_clients[i].fd = -1;
+                    s_ws_clients[i].authed = false;
+                    s_ws_clients[i].pending = 0;
+                    break;
+                }
+            }
+            xSemaphoreGive(s_ws_mutex);
+        }
     } else if (m && s_ws_mutex && xSemaphoreTake(s_ws_mutex, portMAX_DELAY) == pdTRUE) {
         for (int i = 0; i < WS_MAX_CLIENTS; i++) {
             if (s_ws_clients[i].fd == m->fd && s_ws_clients[i].pending > 0) {
@@ -237,7 +254,20 @@ static void ws_async_send_text_locked(int fd, const char *json)
     };
     esp_err_t err = httpd_ws_send_data_async(s_ws_server, fd, &frame, ws_async_send_done, m);
     if (err != ESP_OK) {
-        ws_async_send_done(err, fd, m);
+        /* Send never got queued, so the done-callback will not fire. Clean up
+         * inline. We hold s_ws_mutex here, so do NOT call ws_async_send_done()
+         * (its error path takes the mutex -> deadlock on a non-recursive mutex). */
+        ESP_LOGD(TAG, "ws: async send to fd %d failed: %s", fd, esp_err_to_name(err));
+        for (int i = 0; i < WS_MAX_CLIENTS; i++) {
+            if (s_ws_clients[i].fd == fd) {
+                s_ws_clients[i].fd = -1;
+                s_ws_clients[i].authed = false;
+                s_ws_clients[i].pending = 0;
+                break;
+            }
+        }
+        free(m->payload);
+        free(m);
     }
 }
 

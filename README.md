@@ -175,8 +175,8 @@ idf.py menuconfig   # → "IR Web Tool Configuration"
   **代数**递增，已连接的 WebSocket 会话随即失效（命令被拒、推送停止），
   防止退出登录后残留连接仍可操作设备。
 
-`/api/status` 返回的状态字段：`mode`、`ap_ip`、`sta_ip`、`ap_ssid`、`sta_ssid`、
-`sta_ip_mode`、`sta_connected`、`carrier_hz`、`rx_pause_on_play`、`playing`。
+`status` 推送（及 `status` 命令）中的 `data` 字段：`mode`、`ap_ip`、`sta_ip`、`ap_ssid`、
+`sta_ssid`、`sta_ip_mode`、`sta_connected`、`carrier_hz`、`rx_pause_on_play`、`playing`。
 单帧对象字段：`seq`、`ts`、`nec{...}`、`feat{...}`、`freq`、`durs[...]`。
 
 ### 前后端分离

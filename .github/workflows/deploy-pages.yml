@@ -40,11 +40,16 @@ jobs:
         run: test -f ./main/web/index.html
       - name: Setup Pages
         uses: actions/configure-pages@v5
+      - name: Stage front-end page
+        # 只发布页面本身，避免把开发辅助文件（如 run.bat）一并发布到公开站点
+        run: |
+          mkdir -p ./_site
+          cp ./main/web/index.html ./_site/index.html
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
         with:
-          # 仅上传 main 分支下 web 目录的静态资源（前后端分离：只部署前端页面）
-          path: './main/web'
+          # 仅上传前端页面（前后端分离：只部署前端页面）
+          path: './_site'
           # 目录为空或缺少文件时让部署直接失败，避免发布一个空站点
           if-no-files: error
       - name: Deploy to GitHub Pages
