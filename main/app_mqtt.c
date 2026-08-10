@@ -398,6 +398,15 @@ esp_err_t web_mqttcfg_set(cJSON *root, const char **err)
         *err = "topics must be non-empty and contain no wildcards (+/#)";
         return ESP_ERR_INVALID_ARG;
     }
+    /* With the topic suffix enabled the Client ID is embedded in topics, where
+     * / + # are not allowed. Rejecting them here keeps the topic suffix an
+     * exact copy of the Client ID, so two IDs that differ only in those
+     * characters (e.g. "a/b" vs "a-b") cannot collapse onto the same topics. */
+    if (cfg.topic_suffix && cfg.client_id[0] != '\0' &&
+        strpbrk(cfg.client_id, "/+#")) {
+        *err = "client_id must not contain + # / when topic suffix is enabled";
+        return ESP_ERR_INVALID_ARG;
+    }
 
     esp_err_t ret = mqtt_web_config_save(&cfg);
     if (ret != ESP_OK) {
@@ -693,9 +702,12 @@ esp_err_t mqtt_init(void)
         return ESP_OK;
     }
 
-    /* Client ID: configured value, or auto-generate one from the MAC. */
+    /* Client ID: configured value, or auto-generate one from the MAC.
+     * s_topic_suffix holds the full sanitized Client ID (validated at save
+     * time to contain no / + #), so it is never silently truncated and two
+     * devices with distinct Client IDs always get distinct topic suffixes. */
     static char s_client_id[32];
-    static char s_topic_suffix[32];
+    static char s_topic_suffix[MQTT_CFG_STR_LEN];
     const char *cid = cfg.client_id[0] ? cfg.client_id : NULL;
     if (!cid) {
         uint8_t mac[6];
@@ -706,9 +718,15 @@ esp_err_t mqtt_init(void)
         }
     }
     if (cid) {
+        /* Sanitization is a no-op for validated Client IDs, but keep it as a
+         * guard for the auto-generated/MAC path. */
         mqtt_topic_sanitize(cid, s_topic_suffix, sizeof(s_topic_suffix));
     } else {
-        strlcpy(s_topic_suffix, "device", sizeof(s_topic_suffix));
+        /* No Client ID at all: suffixing would collapse every device onto the
+         * same topics (the exact cross-talk it exists to prevent), so disable
+         * it rather than fall back to a constant suffix. */
+        ESP_LOGW(TAG, "no Client ID available, disabling topic suffix");
+        cfg.topic_suffix = false;
     }
 
     mqtt_effective_topic(cfg.topic_cmd, s_topic_suffix, cfg.topic_suffix,
