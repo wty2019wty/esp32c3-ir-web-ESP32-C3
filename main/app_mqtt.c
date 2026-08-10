@@ -32,6 +32,7 @@
 
 /* NVS keys for the web-editable MQTT configuration */
 #define KEY_ENABLE "mqtt_enable"
+#define KEY_PROTO  "mqtt_proto"
 #define KEY_BROKER "mqtt_broker"
 #define KEY_USER   "mqtt_user"
 #define KEY_PWD    "mqtt_pwd"
@@ -64,6 +65,7 @@ esp_err_t mqtt_web_config_load(mqtt_web_config_t *cfg)
 {
     memset(cfg, 0, sizeof(*cfg));
     cfg->enabled = CONFIG_IR_TOOL_MQTT_ENABLE;
+    cfg->mqtt5 = false; /* default protocol: 3.1.1 */
     strlcpy(cfg->broker_uri, CONFIG_IR_TOOL_MQTT_BROKER_URI, sizeof(cfg->broker_uri));
     strlcpy(cfg->username, CONFIG_IR_TOOL_MQTT_USERNAME, sizeof(cfg->username));
     strlcpy(cfg->password, CONFIG_IR_TOOL_MQTT_PASSWORD, sizeof(cfg->password));
@@ -83,6 +85,10 @@ esp_err_t mqtt_web_config_load(mqtt_web_config_t *cfg)
     uint8_t v8 = cfg->enabled ? 1 : 0;
     if (nvs_get_u8(h, KEY_ENABLE, &v8) == ESP_OK) {
         cfg->enabled = v8 != 0;
+    }
+    v8 = 0;
+    if (nvs_get_u8(h, KEY_PROTO, &v8) == ESP_OK) {
+        cfg->mqtt5 = v8 != 0;
     }
     size_t len;
     len = sizeof(cfg->broker_uri);
@@ -140,6 +146,7 @@ esp_err_t mqtt_web_config_save(const mqtt_web_config_t *cfg)
         return ESP_FAIL;
     }
     esp_err_t err = nvs_set_u8(h, KEY_ENABLE, cfg->enabled ? 1 : 0);
+    if (err == ESP_OK) err = nvs_set_u8(h, KEY_PROTO, cfg->mqtt5 ? 1 : 0);
     if (err == ESP_OK) err = nvs_set_str(h, KEY_BROKER, cfg->broker_uri);
     if (err == ESP_OK) err = nvs_set_str(h, KEY_USER, cfg->username);
     if (err == ESP_OK) err = nvs_set_str(h, KEY_PWD, cfg->password);
@@ -206,12 +213,13 @@ char *web_mqttcfg_get_json(void)
         return NULL;
     }
     int n = snprintf(buf, 2048,
-        "{\"enabled\":%s,\"broker_uri\":\"%s\",\"username\":\"%s\","
+        "{\"enabled\":%s,\"protocol\":\"%s\",\"broker_uri\":\"%s\",\"username\":\"%s\","
         "\"password_set\":%s,\"client_id\":\"%s\","
         "\"topic_cmd\":\"%s\",\"topic_rsp\":\"%s\",\"topic_status\":\"%s\","
         "\"topic_frame\":\"%s\",\"qos\":%d,"
         "\"publish_frames\":%s,\"publish_status\":%s}",
         cfg.enabled ? "true" : "false",
+        cfg.mqtt5 ? "5" : "311",
         cfg.broker_uri, cfg.username, cfg.password[0] ? "true" : "false",
         cfg.client_id,
         cfg.topic_cmd, cfg.topic_rsp, cfg.topic_status, cfg.topic_frame,
@@ -233,6 +241,17 @@ esp_err_t web_mqttcfg_set(cJSON *root, const char **err)
     j = cJSON_GetObjectItem(root, "enabled");
     if (cJSON_IsBool(j)) {
         cfg.enabled = cJSON_IsTrue(j);
+    }
+    j = cJSON_GetObjectItem(root, "protocol");
+    if (cJSON_IsString(j)) {
+        if (strcmp(j->valuestring, "311") == 0) {
+            cfg.mqtt5 = false;
+        } else if (strcmp(j->valuestring, "5") == 0) {
+            cfg.mqtt5 = true;
+        } else {
+            *err = "protocol invalid";
+            return ESP_ERR_INVALID_ARG;
+        }
     }
 
     static const char *const str_fields[] = {
@@ -590,6 +609,7 @@ esp_err_t mqtt_init(void)
         .credentials.client_id = cid,
         .credentials.username = cfg.username[0] ? cfg.username : NULL,
         .credentials.authentication.password = cfg.password[0] ? cfg.password : NULL,
+        .session.protocol_ver = cfg.mqtt5 ? MQTT_PROTOCOL_V_5 : MQTT_PROTOCOL_V_3_1_1,
         .session.keepalive = 60,
         .session.last_will.topic = s_topic_status,
         .session.last_will.msg = "offline",
@@ -621,8 +641,8 @@ esp_err_t mqtt_init(void)
         ESP_LOGI(TAG, "MQTT ready (will connect when station link is up)");
     }
 
-    ESP_LOGI(TAG, "MQTT configured: broker=%s client_id=%s", cfg.broker_uri,
-             cid ? cid : "(auto)");
+    ESP_LOGI(TAG, "MQTT configured: protocol=%s broker=%s client_id=%s",
+             cfg.mqtt5 ? "5.0" : "3.1.1", cfg.broker_uri, cid ? cid : "(auto)");
 #else
     ESP_LOGI(TAG, "MQTT disabled by menuconfig");
 #endif

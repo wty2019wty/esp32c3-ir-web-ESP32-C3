@@ -249,6 +249,11 @@
       </span>
       <label>客户端 ID（留空 = 自动）</label>
       <input type="text" id="cfgMqttClientId" maxlength="63" placeholder="自动生成 ir-web-XXXXXX" autocomplete="off">
+      <label>MQTT 协议</label>
+      <select id="cfgMqttProtocol">
+        <option value="311" selected>MQTT 3.1.1（兼容性最好）</option>
+        <option value="5">MQTT 5.0</option>
+      </select>
       <label>命令主题</label>
       <input type="text" id="cfgMqttTopicCmd" maxlength="63" placeholder="ir-web/cmd">
       <label>响应主题</label>
@@ -1082,6 +1087,7 @@ async function loadMqttCfg() {
     $('cfgMqttPwdClear').checked = false;
     $('cfgMqttPwdClear').parentElement.style.display = c.password_set ? 'inline-flex' : 'none';
     $('cfgMqttClientId').value = c.client_id;
+    $('cfgMqttProtocol').value = c.protocol === '5' ? '5' : '311';
     $('cfgMqttTopicCmd').value = c.topic_cmd;
     $('cfgMqttTopicRsp').value = c.topic_rsp;
     $('cfgMqttTopicStatus').value = c.topic_status;
@@ -1113,6 +1119,7 @@ async function saveMqttCfg() {
     username: $('cfgMqttUser').value.trim(),
     password: pwd !== '' ? pwd : ($('cfgMqttPwdClear').checked ? '' : null),
     client_id: $('cfgMqttClientId').value.trim(),
+    protocol: $('cfgMqttProtocol').value,
     topic_cmd: topics[0],
     topic_rsp: topics[1],
     topic_status: topics[2],

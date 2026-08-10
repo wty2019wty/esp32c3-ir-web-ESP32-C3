@@ -212,6 +212,8 @@ idf.py menuconfig   # → "IR Web Tool Configuration"
   **留空 = 运行时禁用 MQTT**
 - `IR_TOOL_MQTT_USERNAME` / `IR_TOOL_MQTT_PASSWORD`：Broker 认证（留空 = 匿名）
 - `IR_TOOL_MQTT_CLIENT_ID`：客户端 ID（留空 = 按 MAC 自动生成 `ir-web-XXXXXX`）
+- `MQTT 协议`：**Web 设置页可选 MQTT 3.1.1（默认）或 MQTT 5.0**，保存重启后生效；
+  两种协议代码均编译进固件（`CONFIG_MQTT_PROTOCOL_5=y`），Broker 不支持 5.0 时切回 3.1.1 即可
 - `IR_TOOL_MQTT_TOPIC_CMD/RSP/STATUS/FRAME`：主题，默认
   `ir-web/cmd`、`ir-web/rsp`、`ir-web/status`、`ir-web/frame`
 - `IR_TOOL_MQTT_QOS`：QoS（默认 1）；`IR_TOOL_MQTT_PUBLISH_FRAMES`、`IR_TOOL_MQTT_PUBLISH_STATUS`

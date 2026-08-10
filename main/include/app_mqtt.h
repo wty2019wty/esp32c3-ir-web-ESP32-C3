@@ -15,6 +15,7 @@ extern "C" {
  * defaults). Topics must be non-empty and must not contain MQTT wildcards. */
 typedef struct {
     bool enabled;
+    bool mqtt5;                            /* false = MQTT 3.1.1, true = MQTT 5.0 */
     char broker_uri[MQTT_CFG_BROKER_LEN];  /* empty = MQTT disabled */
     char username[MQTT_CFG_STR_LEN];       /* empty = anonymous */
     char password[MQTT_CFG_STR_LEN];       /* empty = no password */
