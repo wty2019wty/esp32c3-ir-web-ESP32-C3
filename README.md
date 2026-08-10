@@ -220,6 +220,7 @@ idf.py menuconfig   # → "IR Web Tool Configuration"
 | 四个主题 | `ir-web/*` | 见下方主题表 |
 | QoS | 1 | 作用于订阅/命令/状态；**帧固定 QoS 0** |
 | 推送帧 / 推送状态 | 开 | 两个独立开关 |
+| 主题自动带设备标识 | 关 | 开启后主题嵌入 Client ID，多设备部署互不干扰 |
 
 **传输方式（由 Broker 地址的 scheme 决定）**：
 
@@ -245,6 +246,19 @@ MQTT 的 WebSocket 是设备**出站客户端连接**，与设备内置 `/api/ws
 即：设备**订阅 1 个主题**（命令），**发布 3 个主题**（响应/状态/帧）。外部客户端则相反：
 要控制设备就**向 `ir-web/cmd` 发布**并**订阅 `ir-web/rsp`** 收响应；要监视就
 **订阅 `ir-web/status` 和 `ir-web/frame`**。
+
+**开启"主题自动带设备标识"后**，实际主题会在第一级路径后插入 Client ID
+（Client ID 留空时按 MAC 自动生成，每台设备唯一）：
+
+| 配置的主题 | 开启后的实际主题（示例 Client ID `esp-a1b2c3`） |
+|---|---|
+| `ir-web/cmd` | `ir-web/esp-a1b2c3/cmd` |
+| `ir-web/rsp` | `ir-web/esp-a1b2c3/rsp` |
+| `ir-web/status` | `ir-web/esp-a1b2c3/status` |
+| `ir-web/frame` | `ir-web/esp-a1b2c3/frame` |
+
+适合多台设备连接同一 Broker：命令、响应、状态（含 LWT）、红外帧都按设备隔离，
+互不覆盖、互不串扰。开启后启动日志会打印四个实际主题，便于核对。
 
 #### 3. 命令协议（控制设备）
 
@@ -379,6 +393,9 @@ c.loop_forever()
 #### 7. 注意事项与限制
 
 - 仅在 **STA 连接路由器**时启动 MQTT；纯 SoftAP 模式不连接；
+- **多设备部署**：同一 Broker 下多台设备务必保持默认 Client ID（自动按 MAC 生成）
+  或每台设置不同 ID，并开启"主题自动带设备标识"；否则主题互相覆盖、命令会被所有
+  设备同时执行；
 - 红外帧固定 QoS 0（实时尽力而为，同 WebSocket 推送语义），命令/状态按配置 QoS 发送；
 - 帧 JSON 可达数 KB，MQTT 收发缓冲已设为 12288 字节（`buffer.size`），整帧单包发送；
 - **安全**：MQTT 命令通道不经过 Web 登录认证（无 WebSocket 的 token 机制），安全性依赖

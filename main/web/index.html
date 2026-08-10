@@ -290,6 +290,14 @@
         <input type="checkbox" id="cfgMqttPubStatus"> 连接/播放变化时推送状态
       </label>
     </div>
+    <div class="row" style="margin-top:6px;">
+      <label style="display:flex;align-items:center;gap:8px;color:#d7dae0;font-size:12px;">
+        <input type="checkbox" id="cfgMqttTopicSuffix"> 主题自动带上设备标识（Client ID 后缀）
+      </label>
+      <span style="font-size:12px; color:#8a93a3;">
+        开启后命令主题变为 ir-web/&lt;client-id&gt;/cmd，多台设备同连一个 Broker 时互不干扰
+      </span>
+    </div>
     <div class="row" style="margin-top:12px;">
       <button id="cfgMqttSaveBtn" onclick="saveMqttCfg()">保存并重启</button>
       <span id="cfgMqttStatus"></span>
@@ -1109,6 +1117,7 @@ async function loadMqttCfg() {
     $('cfgMqttQos').value = String(c.qos);
     $('cfgMqttPubFrames').checked = !!c.publish_frames;
     $('cfgMqttPubStatus').checked = !!c.publish_status;
+    $('cfgMqttTopicSuffix').checked = !!c.topic_suffix;
   } catch (e) {
     $('cfgMqttStatus').textContent = '读取 MQTT 配置失败（固件可能过旧）';
   }
@@ -1141,7 +1150,8 @@ async function saveMqttCfg() {
     topic_frame: topics[3],
     qos: parseInt($('cfgMqttQos').value, 10),
     publish_frames: $('cfgMqttPubFrames').checked,
-    publish_status: $('cfgMqttPubStatus').checked
+    publish_status: $('cfgMqttPubStatus').checked,
+    topic_suffix: $('cfgMqttTopicSuffix').checked
   };
   try {
     const d = await rpc('mqttcfg', body);

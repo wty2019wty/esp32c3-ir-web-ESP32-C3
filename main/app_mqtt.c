@@ -50,6 +50,7 @@ typedef struct {
 #define KEY_ENABLE "mqtt_enable"
 #define KEY_PROTO  "mqtt_proto"
 #define KEY_TLS    "mqtt_tls"
+#define KEY_TSFX   "mqtt_tsfx"
 #define KEY_BROKER "mqtt_broker"
 #define KEY_USER   "mqtt_user"
 #define KEY_PWD    "mqtt_pwd"
@@ -66,11 +67,14 @@ static esp_mqtt_client_handle_t s_client = NULL;
 static bool s_started = false;
 static volatile bool s_connected = false;
 
-/* Runtime settings resolved from NVS (menuconfig provides defaults) */
-static char s_topic_cmd[MQTT_CFG_STR_LEN];
-static char s_topic_rsp[MQTT_CFG_STR_LEN];
-static char s_topic_status[MQTT_CFG_STR_LEN];
-static char s_topic_frame[MQTT_CFG_STR_LEN];
+/* Runtime settings resolved from NVS (menuconfig provides defaults).
+ * With the per-device topic suffix enabled the effective topics embed the
+ * Client ID, so they can exceed the base topic length. */
+#define MQTT_TOPIC_EFF_LEN 160
+static char s_topic_cmd[MQTT_TOPIC_EFF_LEN];
+static char s_topic_rsp[MQTT_TOPIC_EFF_LEN];
+static char s_topic_status[MQTT_TOPIC_EFF_LEN];
+static char s_topic_frame[MQTT_TOPIC_EFF_LEN];
 static int s_qos = 1;
 static bool s_publish_frames = true;
 static bool s_publish_status = true;
@@ -84,6 +88,7 @@ esp_err_t mqtt_web_config_load(mqtt_web_config_t *cfg)
     cfg->enabled = CONFIG_IR_TOOL_MQTT_ENABLE;
     cfg->mqtt5 = false; /* default protocol: 3.1.1 */
     cfg->tls_skip = false; /* default: verify against the built-in certificate bundle */
+    cfg->topic_suffix = false; /* default: topics as configured */
     strlcpy(cfg->broker_uri, CONFIG_IR_TOOL_MQTT_BROKER_URI, sizeof(cfg->broker_uri));
     strlcpy(cfg->username, CONFIG_IR_TOOL_MQTT_USERNAME, sizeof(cfg->username));
     strlcpy(cfg->password, CONFIG_IR_TOOL_MQTT_PASSWORD, sizeof(cfg->password));
@@ -111,6 +116,10 @@ esp_err_t mqtt_web_config_load(mqtt_web_config_t *cfg)
     v8 = 0;
     if (nvs_get_u8(h, KEY_TLS, &v8) == ESP_OK) {
         cfg->tls_skip = v8 != 0;
+    }
+    v8 = 0;
+    if (nvs_get_u8(h, KEY_TSFX, &v8) == ESP_OK) {
+        cfg->topic_suffix = v8 != 0;
     }
     size_t len;
     len = sizeof(cfg->broker_uri);
@@ -170,6 +179,7 @@ esp_err_t mqtt_web_config_save(const mqtt_web_config_t *cfg)
     esp_err_t err = nvs_set_u8(h, KEY_ENABLE, cfg->enabled ? 1 : 0);
     if (err == ESP_OK) err = nvs_set_u8(h, KEY_PROTO, cfg->mqtt5 ? 1 : 0);
     if (err == ESP_OK) err = nvs_set_u8(h, KEY_TLS, cfg->tls_skip ? 1 : 0);
+    if (err == ESP_OK) err = nvs_set_u8(h, KEY_TSFX, cfg->topic_suffix ? 1 : 0);
     if (err == ESP_OK) err = nvs_set_str(h, KEY_BROKER, cfg->broker_uri);
     if (err == ESP_OK) err = nvs_set_str(h, KEY_USER, cfg->username);
     if (err == ESP_OK) err = nvs_set_str(h, KEY_PWD, cfg->password);
@@ -224,6 +234,36 @@ static bool mqtt_topic_ok(const char *t)
     return true;
 }
 
+/* Replace characters that are invalid inside an MQTT topic filter
+ * (wildcards +/# and the level separator /) so the Client ID can be embedded. */
+static void mqtt_topic_sanitize(const char *in, char *out, size_t out_sz)
+{
+    size_t i = 0;
+    for (; in[i] != '\0' && i + 1 < out_sz; i++) {
+        char c = in[i];
+        out[i] = (c == '+' || c == '#' || c == '/') ? '-' : c;
+    }
+    out[i] = '\0';
+}
+
+/* Insert the per-device suffix right after the first path level:
+ * "ir-web/cmd" + "esp-a1b2c3" -> "ir-web/esp-a1b2c3/cmd". */
+static void mqtt_effective_topic(const char *base, const char *suffix, bool enabled,
+                                 char *out, size_t out_sz)
+{
+    if (!enabled || !suffix || suffix[0] == '\0') {
+        strlcpy(out, base, out_sz);
+        return;
+    }
+    const char *slash = strchr(base, '/');
+    if (slash) {
+        int root_len = (int)(slash - base + 1);
+        snprintf(out, out_sz, "%.*s%s/%s", root_len, base, suffix, slash + 1);
+    } else {
+        snprintf(out, out_sz, "%s/%s", base, suffix);
+    }
+}
+
 /* Current (NVS) MQTT configuration as a JSON string (caller frees).
  * Passwords are never echoed back, only a password_set flag. */
 char *web_mqttcfg_get_json(void)
@@ -237,6 +277,7 @@ char *web_mqttcfg_get_json(void)
     }
     int n = snprintf(buf, 2048,
         "{\"enabled\":%s,\"protocol\":\"%s\",\"tls_verify\":\"%s\","
+        "\"topic_suffix\":%s,"
         "\"broker_uri\":\"%s\",\"username\":\"%s\","
         "\"password_set\":%s,\"client_id\":\"%s\","
         "\"topic_cmd\":\"%s\",\"topic_rsp\":\"%s\",\"topic_status\":\"%s\","
@@ -245,6 +286,7 @@ char *web_mqttcfg_get_json(void)
         cfg.enabled ? "true" : "false",
         cfg.mqtt5 ? "5" : "311",
         cfg.tls_skip ? "skip" : "bundle",
+        cfg.topic_suffix ? "true" : "false",
         cfg.broker_uri, cfg.username, cfg.password[0] ? "true" : "false",
         cfg.client_id,
         cfg.topic_cmd, cfg.topic_rsp, cfg.topic_status, cfg.topic_frame,
@@ -288,6 +330,10 @@ esp_err_t web_mqttcfg_set(cJSON *root, const char **err)
             *err = "tls_verify invalid";
             return ESP_ERR_INVALID_ARG;
         }
+    }
+    j = cJSON_GetObjectItem(root, "topic_suffix");
+    if (cJSON_IsBool(j)) {
+        cfg.topic_suffix = cJSON_IsTrue(j);
     }
 
     static const char *const str_fields[] = {
@@ -647,16 +693,9 @@ esp_err_t mqtt_init(void)
         return ESP_OK;
     }
 
-    strlcpy(s_topic_cmd, cfg.topic_cmd, sizeof(s_topic_cmd));
-    strlcpy(s_topic_rsp, cfg.topic_rsp, sizeof(s_topic_rsp));
-    strlcpy(s_topic_status, cfg.topic_status, sizeof(s_topic_status));
-    strlcpy(s_topic_frame, cfg.topic_frame, sizeof(s_topic_frame));
-    s_qos = cfg.qos;
-    s_publish_frames = cfg.publish_frames;
-    s_publish_status = cfg.publish_status;
-
     /* Client ID: configured value, or auto-generate one from the MAC. */
     static char s_client_id[32];
+    static char s_topic_suffix[32];
     const char *cid = cfg.client_id[0] ? cfg.client_id : NULL;
     if (!cid) {
         uint8_t mac[6];
@@ -666,6 +705,23 @@ esp_err_t mqtt_init(void)
             cid = s_client_id;
         }
     }
+    if (cid) {
+        mqtt_topic_sanitize(cid, s_topic_suffix, sizeof(s_topic_suffix));
+    } else {
+        strlcpy(s_topic_suffix, "device", sizeof(s_topic_suffix));
+    }
+
+    mqtt_effective_topic(cfg.topic_cmd, s_topic_suffix, cfg.topic_suffix,
+                         s_topic_cmd, sizeof(s_topic_cmd));
+    mqtt_effective_topic(cfg.topic_rsp, s_topic_suffix, cfg.topic_suffix,
+                         s_topic_rsp, sizeof(s_topic_rsp));
+    mqtt_effective_topic(cfg.topic_status, s_topic_suffix, cfg.topic_suffix,
+                         s_topic_status, sizeof(s_topic_status));
+    mqtt_effective_topic(cfg.topic_frame, s_topic_suffix, cfg.topic_suffix,
+                         s_topic_frame, sizeof(s_topic_frame));
+    s_qos = cfg.qos;
+    s_publish_frames = cfg.publish_frames;
+    s_publish_status = cfg.publish_status;
 
     esp_mqtt_client_config_t mqtt_cfg = {
         .broker.address.uri = cfg.broker_uri,
@@ -722,6 +778,8 @@ esp_err_t mqtt_init(void)
     ESP_LOGI(TAG, "MQTT configured: protocol=%s tls=%s broker=%s client_id=%s",
              cfg.mqtt5 ? "5.0" : "3.1.1", cfg.tls_skip ? "skip-verify" : "bundle",
              cfg.broker_uri, cid ? cid : "(auto)");
+    ESP_LOGI(TAG, "MQTT topics: cmd=%s rsp=%s status=%s frame=%s",
+             s_topic_cmd, s_topic_rsp, s_topic_status, s_topic_frame);
 #else
     ESP_LOGI(TAG, "MQTT disabled by menuconfig");
 #endif
