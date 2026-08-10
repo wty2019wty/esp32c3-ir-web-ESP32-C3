@@ -8,6 +8,8 @@
 #include "app_wifi.h"
 #include "mqtt_client.h"
 #include "esp_event.h"
+#include "esp_wifi.h"
+#include "esp_netif.h"
 #include "esp_log.h"
 #include "esp_mac.h"
 #include "cJSON.h"
