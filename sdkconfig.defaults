@@ -36,4 +36,11 @@ CONFIG_MQTT_BUFFER_SIZE=12288
 CONFIG_MQTT_PROTOCOL_311=y
 CONFIG_MQTT_PROTOCOL_5=y
 
+# MQTT transports: plain TCP, TLS, and WebSocket (client side, outbound).
+# MQTT-over-WS is a client connection to the broker and is fully independent
+# from the built-in HTTP WebSocket server used by the web UI (/api/ws).
+CONFIG_WS_TRANSPORT=y
+CONFIG_MQTT_TRANSPORT_WEBSOCKET=y
+CONFIG_MQTT_TRANSPORT_WEBSOCKET_SECURE=y
+
 CONFIG_PM_ENABLE=y

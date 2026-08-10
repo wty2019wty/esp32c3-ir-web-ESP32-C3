@@ -214,6 +214,10 @@ idf.py menuconfig   # → "IR Web Tool Configuration"
 - `IR_TOOL_MQTT_CLIENT_ID`：客户端 ID（留空 = 按 MAC 自动生成 `ir-web-XXXXXX`）
 - `MQTT 协议`：**Web 设置页可选 MQTT 3.1.1（默认）或 MQTT 5.0**，保存重启后生效；
   两种协议代码均编译进固件（`CONFIG_MQTT_PROTOCOL_5=y`），Broker 不支持 5.0 时切回 3.1.1 即可
+- `MQTT over WebSocket`：Broker 地址填 `ws://host:port/path`（如 `ws://192.168.1.100:9001/mqtt`）
+  即通过 WebSocket 传输连接，`wss://` 为 WebSocket + TLS；也可照常使用 `mqtt://`（TCP）、
+  `mqtts://`（TLS）。MQTT 的 WebSocket 是**出站客户端连接**，与设备内置的
+  `/api/ws` WebSocket **服务端**完全独立，互不影响
 - `IR_TOOL_MQTT_TOPIC_CMD/RSP/STATUS/FRAME`：主题，默认
   `ir-web/cmd`、`ir-web/rsp`、`ir-web/status`、`ir-web/frame`
 - `IR_TOOL_MQTT_QOS`：QoS（默认 1）；`IR_TOOL_MQTT_PUBLISH_FRAMES`、`IR_TOOL_MQTT_PUBLISH_STATUS`

@@ -228,7 +228,12 @@
     <div style="font-size:12px; color:#8a93a3; margin-bottom:10px;">
       保存后设备 2 秒后自动重启生效。MQTT 命令通道<b style="color:#ffd479;">不经过 Web 登录认证</b>，
       请使用带账号密码的 Broker（或 TLS）。设备仅在<b style="color:#ffd479;">连接路由器（STA）</b>时
-      启动 MQTT；纯热点（SoftAP）模式下不连接。
+      启动 MQTT；纯热点（SoftAP）模式下不连接。<br>
+      Broker 地址支持 <span class="mono">mqtt://</span>（TCP）、
+      <span class="mono">mqtts://</span>（TLS）、
+      <span class="mono">ws://</span>（MQTT over WebSocket）、
+      <span class="mono">wss://</span>（WebSocket + TLS），例如
+      <span class="mono">ws://192.168.1.100:9001/mqtt</span>。
     </div>
     <div class="row" style="margin-bottom:8px;">
       <label style="display:flex;align-items:center;gap:8px;cursor:pointer;">
@@ -237,7 +242,7 @@
     </div>
     <div class="formgrid">
       <label>Broker 地址</label>
-      <input type="text" id="cfgMqttBroker" maxlength="127" placeholder="mqtt://192.168.1.100:1883（留空 = 禁用）" autocomplete="off">
+      <input type="text" id="cfgMqttBroker" maxlength="127" placeholder="mqtt://192.168.1.100:1883 或 ws://192.168.1.100:9001/mqtt（留空 = 禁用）" autocomplete="off">
       <label>用户名（留空 = 匿名）</label>
       <input type="text" id="cfgMqttUser" maxlength="63" autocomplete="off">
       <label>密码（留空 = 不修改）</label>
