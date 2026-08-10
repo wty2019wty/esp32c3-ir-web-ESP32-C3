@@ -27,10 +27,6 @@ CONFIG_HTTPD_WS_SUPPORT=y
 CONFIG_IR_TOOL_MAX_RX_SEGS=1024
 CONFIG_IR_TOOL_HISTORY_DEPTH=8
 
-# MQTT: let one full IR frame (raw durations) fit in a single packet.
-# Default 1024 bytes would fragment multi-KB frame payloads.
-CONFIG_MQTT_BUFFER_SIZE=12288
-
 # MQTT: compile in both protocol implementations so the protocol version can be
 # selected at runtime from the Web settings page (3.1.1 default / 5.0).
 CONFIG_MQTT_PROTOCOL_311=y

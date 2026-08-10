@@ -224,7 +224,8 @@ idf.py menuconfig   # → "IR Web Tool Configuration"
 - `IR_TOOL_MQTT_TOPIC_CMD/RSP/STATUS/FRAME`：主题，默认
   `ir-web/cmd`、`ir-web/rsp`、`ir-web/status`、`ir-web/frame`
 - `IR_TOOL_MQTT_QOS`：QoS（默认 1）；`IR_TOOL_MQTT_PUBLISH_FRAMES`、`IR_TOOL_MQTT_PUBLISH_STATUS`
-- 帧 JSON 可能达数 KB，`CONFIG_MQTT_BUFFER_SIZE` 已在 `sdkconfig.defaults` 中放大到 12288
+- 帧 JSON 可能达数 KB，MQTT 客户端收发缓冲已在代码中设为 12288 字节
+  （`app_mqtt.c` 的 `buffer.size`），保证整帧单包发送
 
 **命令（发到 `ir-web/cmd`）**：JSON 信封与 WebSocket 命令一致
 （`cmd`/`body` 字段完全相同），额外支持可选 `id` 关联请求与响应：

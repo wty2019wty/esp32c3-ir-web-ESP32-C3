@@ -24,6 +24,9 @@
 /* Same upper bound as the web layer: one frame with IR_RAW_MAX_SEGS raw
  * durations (each <= 5 digits) fits comfortably. */
 #define MQTT_FRAME_JSON_CAP 16384
+/* MQTT send/receive buffer: large enough for one full IR frame payload
+ * (raw durations) so multi-KB publishes go out in a single packet. */
+#define MQTT_BUFFER_SIZE 12288
 
 /* Drop frame publishes while this many QoS 1/2 messages are unacknowledged,
  * so a slow broker cannot balloon the outbox with multi-KB frames. */
@@ -641,6 +644,7 @@ esp_err_t mqtt_init(void)
         .session.last_will.qos = s_qos,
         .session.last_will.retain = 1,
         .network.reconnect_timeout_ms = 5000,
+        .buffer.size = MQTT_BUFFER_SIZE,
     };
 
     s_client = esp_mqtt_client_init(&mqtt_cfg);
