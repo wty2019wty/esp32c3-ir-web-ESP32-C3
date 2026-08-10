@@ -18,6 +18,9 @@
 #include "nvs_flash.h"
 #include "nvs.h"
 #include "cJSON.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
 
 #define TAG "mqtt"
 
@@ -28,11 +31,18 @@
  * (raw durations) so multi-KB publishes go out in a single packet. */
 #define MQTT_BUFFER_SIZE 12288
 
-/* Frame publish budget. Frames are best-effort real-time data (same semantics
- * as the WebSocket push) and are published at QoS 0, so they never wait on
- * broker acks. When the outbox holds more than this many bytes (the network
- * cannot keep up), new frames are dropped until it drains. */
-#define MQTT_FRAME_OUTBOX_LIMIT_BYTES (16 * 1024)
+/* Frame publish queue. IR frames are best-effort real-time data (same
+ * semantics as the WebSocket push) and are sent at QoS 0 from a dedicated
+ * publisher task, NOT through the esp-mqtt outbox: esp-mqtt's task loop only
+ * drains one outbox message per poll-read cycle (default 1 s), which would
+ * throttle a continuous IR stream to ~1 frame/second. With a dedicated task,
+ * throughput is limited only by the network. */
+#define MQTT_FRAME_QUEUE_DEPTH 4
+
+typedef struct {
+    char *data;
+    int len;
+} mqtt_frame_msg_t;
 
 #define MQTT_NS "ir_tool"
 
@@ -64,6 +74,7 @@ static char s_topic_frame[MQTT_CFG_STR_LEN];
 static int s_qos = 1;
 static bool s_publish_frames = true;
 static bool s_publish_status = true;
+static QueueHandle_t s_frame_queue = NULL;
 
 /* ---------------- NVS config load / save ---------------- */
 
@@ -369,6 +380,27 @@ static void mqtt_publish(const char *topic, const char *payload, int len, int qo
     }
 }
 
+/* Dedicated publisher for IR frames (QoS 0, direct synchronous send). */
+static void mqtt_frame_pub_task(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        mqtt_frame_msg_t *msg = NULL;
+        if (xQueueReceive(s_frame_queue, &msg, portMAX_DELAY) != pdTRUE || !msg) {
+            continue;
+        }
+        if (s_client && s_connected) {
+            int r = esp_mqtt_client_publish(s_client, s_topic_frame,
+                                            msg->data, msg->len, 0, 0);
+            if (r < 0) {
+                ESP_LOGW(TAG, "frame publish failed (msg_id=%d)", r);
+            }
+        }
+        free(msg->data);
+        free(msg);
+    }
+}
+
 static void mqtt_publish_status(void)
 {
     if (!s_publish_status) {
@@ -480,7 +512,7 @@ static void mqtt_handle_command(const char *payload, int len)
 static void mqtt_frame_cb(const ir_frame_t *frame, void *arg)
 {
     (void)arg;
-    if (!s_publish_frames || !s_connected || !frame) {
+    if (!s_publish_frames || !s_connected || !frame || !s_frame_queue) {
         return;
     }
     char *buf = malloc(MQTT_FRAME_JSON_CAP);
@@ -492,23 +524,26 @@ static void mqtt_frame_cb(const ir_frame_t *frame, void *arg)
         free(buf);
         return;
     }
-    int used = esp_mqtt_client_get_outbox_size(s_client);
-    if (used + n > MQTT_FRAME_OUTBOX_LIMIT_BYTES) {
+    mqtt_frame_msg_t *msg = malloc(sizeof(*msg));
+    if (!msg) {
+        free(buf);
+        return;
+    }
+    msg->data = buf;
+    msg->len = n;
+    if (xQueueSend(s_frame_queue, &msg, 0) != pdTRUE) {
         /* Rate-limit the log: under a continuous IR stream this can fire at
          * capture rate and would flood the console. */
         static int64_t s_last_drop_log_us = 0;
         int64_t now = esp_timer_get_time();
         if (now - s_last_drop_log_us > 1000 * 1000) {
             s_last_drop_log_us = now;
-            ESP_LOGW(TAG, "dropping frame (outbox backlog %d bytes)", used);
+            ESP_LOGW(TAG, "dropping frame (publish queue full)");
         }
-        free(buf);
+        free(msg->data);
+        free(msg);
         return;
     }
-    /* Frames are QoS 0 (best-effort real-time, like the WebSocket push); they
-     * must not be stalled behind QoS 1/2 acks. */
-    mqtt_publish(s_topic_frame, buf, n, 0, false);
-    free(buf);
 }
 
 static void mqtt_play_cb(bool playing, void *arg)
@@ -665,6 +700,16 @@ esp_err_t mqtt_init(void)
 
     ir_set_frame_cb(mqtt_frame_cb, NULL);
     ir_set_play_cb(mqtt_play_cb, NULL);
+
+    /* Dedicated frame publisher: keeps the IR capture task non-blocking and
+     * bypasses the esp-mqtt outbox / 1-message-per-poll-cycle throttle. */
+    s_frame_queue = xQueueCreate(MQTT_FRAME_QUEUE_DEPTH, sizeof(mqtt_frame_msg_t *));
+    if (s_frame_queue &&
+        xTaskCreate(mqtt_frame_pub_task, "mqtt_pub", 4096, NULL, 5, NULL) != pdPASS) {
+        ESP_LOGW(TAG, "failed to create frame publisher task");
+        vQueueDelete(s_frame_queue);
+        s_frame_queue = NULL;
+    }
 
     /* wifi_init() blocks until STA is connected (or falls back to AP), so the
      * GOT_IP event may already have fired before we registered. Start now. */

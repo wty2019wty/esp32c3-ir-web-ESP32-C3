@@ -225,7 +225,8 @@ idf.py menuconfig   # → "IR Web Tool Configuration"
   `ir-web/cmd`、`ir-web/rsp`、`ir-web/status`、`ir-web/frame`
 - `IR_TOOL_MQTT_QOS`：QoS（默认 1，作用于订阅/命令/状态）；`IR_TOOL_MQTT_PUBLISH_FRAMES`、
   `IR_TOOL_MQTT_PUBLISH_STATUS`。**红外帧固定以 QoS 0 推送**（实时尽力而为，与 WebSocket
-  推送语义一致，避免等待 Broker ack 造成积压丢帧；积压时按 outbox 字节数丢弃并限频告警）
+  推送语义一致）：由独立发布任务直接发送，**不经过 esp-mqtt 的 outbox**（其任务循环约
+  每秒只排空一条消息，会掐死连续红外流）；积压时按发布队列深度丢弃并限频告警
 - 帧 JSON 可能达数 KB，MQTT 客户端收发缓冲已在代码中设为 12288 字节
   （`app_mqtt.c` 的 `buffer.size`），保证整帧单包发送
 
