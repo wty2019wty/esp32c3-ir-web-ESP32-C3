@@ -39,6 +39,18 @@ static uint32_t s_status_id = 0;    /* bumped on every status change */
 static char *s_status_inner = NULL; /* cached status payload (data part) */
 static int64_t s_last_forced_push_us = 0; /* last heartbeat/forced status push (us) */
 
+/* Reset every client slot matching fd. Caller must hold s_ws_mutex. */
+static void ws_client_reset_locked(int fd)
+{
+    for (int i = 0; i < WS_MAX_CLIENTS; i++) {
+        if (s_ws_clients[i].fd == fd) {
+            s_ws_clients[i].fd = -1;
+            s_ws_clients[i].authed = false;
+            s_ws_clients[i].pending = 0;
+        }
+    }
+}
+
 static void ws_client_remove(int fd)
 {
     if (!s_ws_mutex || fd < 0) {
@@ -47,13 +59,7 @@ static void ws_client_remove(int fd)
     if (xSemaphoreTake(s_ws_mutex, portMAX_DELAY) != pdTRUE) {
         return;
     }
-    for (int i = 0; i < WS_MAX_CLIENTS; i++) {
-        if (s_ws_clients[i].fd == fd) {
-            s_ws_clients[i].fd = -1;
-            s_ws_clients[i].authed = false;
-            s_ws_clients[i].pending = 0; /* drop any stale back-pressure */
-        }
-    }
+    ws_client_reset_locked(fd); /* drop any stale back-pressure */
     xSemaphoreGive(s_ws_mutex);
 }
 
@@ -92,25 +98,6 @@ static void ws_client_add(int fd, bool authed)
         }
     }
     xSemaphoreGive(s_ws_mutex);
-}
-
-static bool ws_client_is_authed(int fd)
-{
-    bool a = false;
-    if (!s_ws_mutex || fd < 0) {
-        return false;
-    }
-    if (xSemaphoreTake(s_ws_mutex, portMAX_DELAY) != pdTRUE) {
-        return false;
-    }
-    for (int i = 0; i < WS_MAX_CLIENTS; i++) {
-        if (s_ws_clients[i].fd == fd && s_ws_clients[i].authed) {
-            a = true;
-            break;
-        }
-    }
-    xSemaphoreGive(s_ws_mutex);
-    return a;
 }
 
 /* True when the client authenticated against the current session generation;
@@ -202,9 +189,7 @@ static void ws_async_send_done(esp_err_t err, int socket, void *arg)
         if (s_ws_clients[m->slot].fd == m->fd &&
             s_ws_clients[m->slot].seq == m->seq) {
             if (err != ESP_OK) {
-                s_ws_clients[m->slot].fd = -1;
-                s_ws_clients[m->slot].authed = false;
-                s_ws_clients[m->slot].pending = 0;
+                ws_client_reset_locked(m->fd);
             } else if (s_ws_clients[m->slot].pending > 0) {
                 s_ws_clients[m->slot].pending--;
             }
@@ -268,14 +253,7 @@ static void ws_async_send_text_locked(int fd, const char *json)
          * inline. We hold s_ws_mutex here, so do NOT call ws_async_send_done()
          * (its error path takes the mutex -> deadlock on a non-recursive mutex). */
         ESP_LOGD(TAG, "ws: async send to fd %d failed: %s", fd, esp_err_to_name(err));
-        for (int i = 0; i < WS_MAX_CLIENTS; i++) {
-            if (s_ws_clients[i].fd == fd) {
-                s_ws_clients[i].fd = -1;
-                s_ws_clients[i].authed = false;
-                s_ws_clients[i].pending = 0;
-                break;
-            }
-        }
+        ws_client_reset_locked(fd);
         free(m->payload);
         free(m);
     }
@@ -558,8 +536,8 @@ static esp_err_t ws_handler(httpd_req_t *req)
             ws_client_ack(fd, (uint32_t)id->valuedouble);
         }
     } else if (cJSON_IsString(type) && strcmp(type->valuestring, "cmd") == 0) {
-        /* command RPC: requires an authenticated session */
-        if (!ws_client_is_authed(fd) || !ws_client_gen_ok(fd)) {
+        /* command RPC: requires an authenticated session against the current generation */
+        if (!ws_client_gen_ok(fd)) {
             ws_reply_text(req, "{\"type\":\"resp\",\"ok\":false,\"error\":\"unauthorized\"}");
             cJSON_Delete(root);
             return ESP_FAIL; /* close the socket */

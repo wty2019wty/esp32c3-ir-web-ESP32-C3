@@ -17,16 +17,6 @@
 /* single frame JSON buffer, sized for IR_RAW_MAX_SEGS durations */
 #define FRAME_JSON_CAP 16384
 
-static char *xstrdup(const char *s)
-{
-    size_t n = strlen(s) + 1;
-    char *p = malloc(n);
-    if (p) {
-        memcpy(p, s, n);
-    }
-    return p;
-}
-
 /* Serialize one frame to a heap JSON string (caller frees). */
 static char *frame_json(const ir_frame_t *f)
 {
@@ -173,7 +163,7 @@ char *web_rpc_exec(const char *cmd, cJSON *body, const char **err)
             *err = "playback failed";
             return NULL;
         }
-        return xstrdup("{}");
+        return strdup("{}");
     }
 
     if (strcmp(cmd, "carrier") == 0) {
@@ -189,7 +179,7 @@ char *web_rpc_exec(const char *cmd, cJSON *body, const char **err)
         }
         char buf[48];
         snprintf(buf, sizeof(buf), "{\"freq\":%lu}", (unsigned long)freq);
-        return xstrdup(buf);
+        return strdup(buf);
     }
 
     if (strcmp(cmd, "rxpause") == 0) {
@@ -202,7 +192,7 @@ char *web_rpc_exec(const char *cmd, cJSON *body, const char **err)
         char buf[48];
         snprintf(buf, sizeof(buf), "{\"rx_pause_on_play\":%s}",
                  enabled ? "true" : "false");
-        return xstrdup(buf);
+        return strdup(buf);
     }
 
     if (strcmp(cmd, "wificfg") == 0) {
@@ -223,7 +213,7 @@ char *web_rpc_exec(const char *cmd, cJSON *body, const char **err)
                 *err = e ? e : "invalid";
                 return NULL;
             }
-            return xstrdup("{\"restart\":true}");
+            return strdup("{\"restart\":true}");
         }
         return web_wificfg_get_json();
     }
@@ -241,7 +231,7 @@ char *web_rpc_exec(const char *cmd, cJSON *body, const char **err)
                 *err = e ? e : "invalid";
                 return NULL;
             }
-            return xstrdup(invalidated ? "{\"invalidated\":true}"
+            return strdup(invalidated ? "{\"invalidated\":true}"
                                        : "{\"invalidated\":false}");
         }
         return web_authcfg_get_json();
@@ -255,12 +245,12 @@ char *web_rpc_exec(const char *cmd, cJSON *body, const char **err)
         }
         char buf[48];
         snprintf(buf, sizeof(buf), "{\"expires_in\":%lu}", (unsigned long)expires_in);
-        return xstrdup(buf);
+        return strdup(buf);
     }
 
     if (strcmp(cmd, "logout") == 0) {
         web_auth_invalidate();
-        return xstrdup("{}");
+        return strdup("{}");
     }
 
     if (strcmp(cmd, "webcfg") == 0) {
@@ -272,12 +262,12 @@ char *web_rpc_exec(const char *cmd, cJSON *body, const char **err)
                 *err = e ? e : "invalid";
                 return NULL;
             }
-            return xstrdup("{\"restart\":true}");
+            return strdup("{\"restart\":true}");
         }
         char buf[32];
         snprintf(buf, sizeof(buf), "{\"web_ui\":%s}",
                  web_ui_enabled_get() ? "true" : "false");
-        return xstrdup(buf);
+        return strdup(buf);
     }
 
     *err = "unknown cmd";
