@@ -24,6 +24,8 @@
   防止他人用相同账号在别处登录；可在 Web 设置页关闭（关闭后同账号多端共享会话）
 - **前后端分离（可选）**：登录前可手动填写设备 ws(s) 地址；设置页的"启用内置 Web 界面"
   开关可让设备**不提供页面、仅保留 `/api/ws`**，供外部前端连接
+- **MQTT 接入（可选）**：订阅命令主题即可执行与 WebSocket 完全相同的 RPC 命令，
+  自动向主题推送实时状态与红外帧（NEC 解码 + 原始波形），可接入 Home Assistant / Node-RED 等
 
 ## 硬件连接
 
@@ -195,6 +197,50 @@ idf.py menuconfig   # → "IR Web Tool Configuration"
 `sta_ssid`、`sta_ip_mode`、`sta_connected`、`carrier_hz`、`rx_pause_on_play`、`playing`。
 单帧对象字段：`seq`、`ts`、`nec{...}`、`feat{...}`、`freq`、`durs[...]`。
 
+### MQTT（可选，命令 RPC + 状态/帧推送）
+
+设备内置 MQTT 客户端（`espressif/mqtt` 组件），复用与 WebSocket 完全相同的命令核心
+与 JSON 序列化。**STA 连接路由器时才启动 MQTT**；纯 SoftAP（无外网/无到 Broker 路由）模式下
+客户端保持停止。
+
+**配置（menuconfig，或直接改 `sdkconfig.defaults` 后重新编译）**：
+
+- `IR_TOOL_MQTT_ENABLE`：总开关（默认开）
+- `IR_TOOL_MQTT_BROKER_URI`：Broker 地址，如 `mqtt://192.168.1.100:1883`；
+  **留空 = 运行时禁用 MQTT**
+- `IR_TOOL_MQTT_USERNAME` / `IR_TOOL_MQTT_PASSWORD`：Broker 认证（留空 = 匿名）
+- `IR_TOOL_MQTT_CLIENT_ID`：客户端 ID（留空 = 按 MAC 自动生成 `ir-web-XXXXXX`）
+- `IR_TOOL_MQTT_TOPIC_CMD/RSP/STATUS/FRAME`：主题，默认
+  `ir-web/cmd`、`ir-web/rsp`、`ir-web/status`、`ir-web/frame`
+- `IR_TOOL_MQTT_QOS`：QoS（默认 1）；`IR_TOOL_MQTT_PUBLISH_FRAMES`、`IR_TOOL_MQTT_PUBLISH_STATUS`
+- 帧 JSON 可能达数 KB，`CONFIG_MQTT_BUFFER_SIZE` 已在 `sdkconfig.defaults` 中放大到 12288
+
+**命令（发到 `ir-web/cmd`）**：JSON 信封与 WebSocket 命令一致
+（`cmd`/`body` 字段完全相同），额外支持可选 `id` 关联请求与响应：
+
+```json
+{"id":"a1","cmd":"status"}
+{"id":"a2","cmd":"play","body":{"type":"hxd","value":"ED127F80","freq":38000}}
+{"id":"a3","cmd":"frames","body":{"since":0}}
+```
+
+也支持直接发送裸命令名（如 `status`）。响应发布到 `ir-web/rsp`：
+
+```json
+{"ok":true,"id":"a1","cmd":"status","result":{...}}
+{"ok":false,"id":"x","cmd":"play","error":"playback failed"}
+```
+
+**推送**：
+
+- `ir-web/status`：连接成功时发布完整状态对象（retained，便于新订阅者立即拿到），
+  播放开始/结束时再次发布；断线时 Broker 按 LWT 发布 `offline`（retained，覆盖旧状态）
+- `ir-web/frame`：每次捕获到新红外帧立即发布，单帧对象与 WebSocket 推送完全一致
+  （含 `nec` 解码、`feat` 特征、`freq`、`durs` 原始波形）
+
+**安全说明**：MQTT 命令通道**不经过 Web 登录认证**（没有 WebSocket 的 token 机制），
+安全性依赖 Broker 的账号密码/TLS；请勿在公网匿名 Broker 上暴露命令主题。
+
 ### 前后端分离
 
 页面可与设备分离部署（如托管在 CF Pages / 任意静态服务器）。页面内置的
@@ -285,14 +331,15 @@ esp32c3-IR/
 ├── .github/workflows/        # deploy-pages.yml：前端部署到 GitHub Pages
 └── main/
     ├── CMakeLists.txt        # EMBED_TXTFILES 内嵌 index.html
-    ├── idf_component.yml     # 依赖 espressif/cjson
-    ├── Kconfig.projbuild     # 引脚/载波/WiFi/HTTP/认证配置项
-    ├── app_main.c            # NVS → IR → WiFi → Web
+    ├── idf_component.yml     # 依赖 espressif/cjson、espressif/mqtt
+    ├── Kconfig.projbuild     # 引脚/载波/WiFi/HTTP/认证/MQTT 配置项
+    ├── app_main.c            # NVS → IR → WiFi → Web → MQTT
     ├── app_ir.c              # RMT RX/TX 核心 + 载波 + RAM 历史
     ├── app_ir_nec.c          # NEC 协议解码
     ├── app_ir_play.c         # hxd/raw 回放编码
     ├── app_ir_store.c        # 帧存储 + 历史环形缓冲 + 回调
     ├── app_wifi.c            # AP/STA 互斥 + 超时降级
+    ├── app_mqtt.c            # MQTT 客户端：命令 RPC + 状态/帧推送 + WiFi 联动
     ├── app_web.c             # HTTP server 初始化（仅静态页面 + WS 端点）
     ├── app_web_api_ir.c      # IR 命令核心（play/carrier/rxpause，WS-only）
     ├── app_web_api_wifi.c    # WiFi 配置核心（wificfg 读写，WS-only）

@@ -8,6 +8,7 @@
 #include "app_ir.h"
 #include "app_wifi.h"
 #include "app_web.h"
+#include "app_mqtt.h"
 
 static const char *TAG = "app";
 
@@ -82,6 +83,12 @@ void app_main(void)
     err = web_init();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Web init failed: %s", esp_err_to_name(err));
+        return;
+    }
+
+    err = mqtt_init();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "MQTT init failed: %s", esp_err_to_name(err));
         return;
     }
 

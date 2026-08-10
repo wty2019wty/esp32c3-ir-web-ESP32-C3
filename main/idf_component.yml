@@ -4,3 +4,4 @@ dependencies:
   idf:
     version: '>=5.0.0'
   espressif/cjson: "^1.7.16"
+  espressif/mqtt: "^1.1.0"
