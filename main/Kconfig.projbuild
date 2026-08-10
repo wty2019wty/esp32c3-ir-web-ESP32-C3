@@ -103,7 +103,9 @@ menu "IR Web Tool Configuration"
             help
                 Enable the built-in MQTT client. The broker URI below still has
                 to be set for the client to connect; an empty URI disables MQTT
-                at runtime even with this option enabled.
+                at runtime even with this option enabled. All values can also
+                be changed from the Web settings page (persisted in NVS and
+                taking priority over these defaults).
 
         config IR_TOOL_MQTT_BROKER_URI
             string "Broker URI (empty = MQTT disabled)"

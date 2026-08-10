@@ -14,10 +14,11 @@
   h2 { font-size: 15px; margin: 0 0 10px; color: #8ab4ff; }
   .card { background: #1a1d24; border: 1px solid #2a2f3a; border-radius: 10px; padding: 14px 16px; margin-bottom: 12px; }
   .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin: 6px 0; }
-  input[type=number], input[type=text] { background: #0f1115; color: #e8eaed; border: 1px solid #333a47;
+  input[type=number], input[type=text], select { background: #0f1115; color: #e8eaed; border: 1px solid #333a47;
          border-radius: 6px; padding: 7px 9px; font-size: 14px; }
   input[type=number] { width: 110px; }
   input[type=text] { width: 220px; font-family: Consolas, monospace; }
+  select { width: 220px; }
   button { background: #2f6fed; color: #fff; border: 0; border-radius: 6px; padding: 8px 14px;
            font-size: 13px; cursor: pointer; }
   button:hover { background: #3b7dff; }
@@ -219,6 +220,61 @@
     <div class="row" style="margin-top:12px;">
       <button id="cfgSaveBtn" onclick="saveWifiCfg()">保存并重启</button>
       <span id="cfgStatus"></span>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>MQTT 设置</h2>
+    <div style="font-size:12px; color:#8a93a3; margin-bottom:10px;">
+      保存后设备 2 秒后自动重启生效。MQTT 命令通道<b style="color:#ffd479;">不经过 Web 登录认证</b>，
+      请使用带账号密码的 Broker（或 TLS）。设备仅在<b style="color:#ffd479;">连接路由器（STA）</b>时
+      启动 MQTT；纯热点（SoftAP）模式下不连接。
+    </div>
+    <div class="row" style="margin-bottom:8px;">
+      <label style="display:flex;align-items:center;gap:8px;cursor:pointer;">
+        <input type="checkbox" id="cfgMqttEnable"> 启用 MQTT
+      </label>
+    </div>
+    <div class="formgrid">
+      <label>Broker 地址</label>
+      <input type="text" id="cfgMqttBroker" maxlength="127" placeholder="mqtt://192.168.1.100:1883（留空 = 禁用）" autocomplete="off">
+      <label>用户名（留空 = 匿名）</label>
+      <input type="text" id="cfgMqttUser" maxlength="63" autocomplete="off">
+      <label>密码（留空 = 不修改）</label>
+      <span class="row" style="margin:0;">
+        <input type="password" id="cfgMqttPwd" maxlength="63" placeholder="未设置" style="flex:1;min-width:0;" autocomplete="new-password">
+        <label style="display:none;align-items:center;gap:4px;color:#d7dae0;font-size:12px;margin:0;">
+          <input type="checkbox" id="cfgMqttPwdClear"> 清除
+        </label>
+      </span>
+      <label>客户端 ID（留空 = 自动）</label>
+      <input type="text" id="cfgMqttClientId" maxlength="63" placeholder="自动生成 ir-web-XXXXXX" autocomplete="off">
+      <label>命令主题</label>
+      <input type="text" id="cfgMqttTopicCmd" maxlength="63" placeholder="ir-web/cmd">
+      <label>响应主题</label>
+      <input type="text" id="cfgMqttTopicRsp" maxlength="63" placeholder="ir-web/rsp">
+      <label>状态主题（含离线 LWT）</label>
+      <input type="text" id="cfgMqttTopicStatus" maxlength="63" placeholder="ir-web/status">
+      <label>红外帧主题</label>
+      <input type="text" id="cfgMqttTopicFrame" maxlength="63" placeholder="ir-web/frame">
+      <label>QoS</label>
+      <select id="cfgMqttQos">
+        <option value="0">0 - 最多一次</option>
+        <option value="1" selected>1 - 至少一次（推荐）</option>
+        <option value="2">2 - 恰好一次</option>
+      </select>
+    </div>
+    <div class="row" style="margin-top:10px;">
+      <label style="display:flex;align-items:center;gap:8px;color:#d7dae0;font-size:12px;">
+        <input type="checkbox" id="cfgMqttPubFrames"> 推送捕获的红外帧
+      </label>
+      <label style="display:flex;align-items:center;gap:8px;color:#d7dae0;font-size:12px;">
+        <input type="checkbox" id="cfgMqttPubStatus"> 连接/播放变化时推送状态
+      </label>
+    </div>
+    <div class="row" style="margin-top:12px;">
+      <button id="cfgMqttSaveBtn" onclick="saveMqttCfg()">保存并重启</button>
+      <span id="cfgMqttStatus"></span>
     </div>
   </div>
 
@@ -915,7 +971,10 @@ function showTab(t) {
   $('viewSet').style.display = t === 'set' ? '' : 'none';
   $('tabMonBtn').classList.toggle('active', t === 'mon');
   $('tabSetBtn').classList.toggle('active', t === 'set');
-  if (t === 'set') loadWifiCfg();
+  if (t === 'set') {
+    loadWifiCfg();
+    loadMqttCfg();
+  }
 }
 
 async function loadWifiCfg() {
@@ -1006,6 +1065,70 @@ async function saveWifiCfg() {
     }
   } catch (e) {
     $('cfgStatus').textContent = '保存失败：' + ((e.payload && e.payload.error) || e.message || '请求失败');
+  }
+}
+
+/* ---------------- MQTT settings ---------------- */
+
+async function loadMqttCfg() {
+  $('cfgMqttStatus').textContent = '';
+  try {
+    const c = await rpc('mqttcfg');
+    $('cfgMqttEnable').checked = !!c.enabled;
+    $('cfgMqttBroker').value = c.broker_uri;
+    $('cfgMqttUser').value = c.username;
+    $('cfgMqttPwd').value = '';
+    $('cfgMqttPwd').placeholder = c.password_set ? '已设置（留空 = 不修改）' : '未设置';
+    $('cfgMqttPwdClear').checked = false;
+    $('cfgMqttPwdClear').parentElement.style.display = c.password_set ? 'inline-flex' : 'none';
+    $('cfgMqttClientId').value = c.client_id;
+    $('cfgMqttTopicCmd').value = c.topic_cmd;
+    $('cfgMqttTopicRsp').value = c.topic_rsp;
+    $('cfgMqttTopicStatus').value = c.topic_status;
+    $('cfgMqttTopicFrame').value = c.topic_frame;
+    $('cfgMqttQos').value = String(c.qos);
+    $('cfgMqttPubFrames').checked = !!c.publish_frames;
+    $('cfgMqttPubStatus').checked = !!c.publish_status;
+  } catch (e) {
+    $('cfgMqttStatus').textContent = '读取 MQTT 配置失败（固件可能过旧）';
+  }
+}
+
+async function saveMqttCfg() {
+  $('cfgMqttStatus').textContent = '';
+  const topicIds = ['cfgMqttTopicCmd', 'cfgMqttTopicRsp', 'cfgMqttTopicStatus', 'cfgMqttTopicFrame'];
+  const topics = topicIds.map(id => $(id).value.trim());
+  if (topics.some(t => !t)) {
+    $('cfgMqttStatus').textContent = '主题不能为空';
+    return;
+  }
+  if (topics.some(t => /[+#]/.test(t))) {
+    $('cfgMqttStatus').textContent = '主题不能包含通配符 + 或 #';
+    return;
+  }
+  const pwd = $('cfgMqttPwd').value;
+  const body = {
+    enabled: $('cfgMqttEnable').checked,
+    broker_uri: $('cfgMqttBroker').value.trim(),
+    username: $('cfgMqttUser').value.trim(),
+    password: pwd !== '' ? pwd : ($('cfgMqttPwdClear').checked ? '' : null),
+    client_id: $('cfgMqttClientId').value.trim(),
+    topic_cmd: topics[0],
+    topic_rsp: topics[1],
+    topic_status: topics[2],
+    topic_frame: topics[3],
+    qos: parseInt($('cfgMqttQos').value, 10),
+    publish_frames: $('cfgMqttPubFrames').checked,
+    publish_status: $('cfgMqttPubStatus').checked
+  };
+  try {
+    const d = await rpc('mqttcfg', body);
+    if (d.ok && d.restart) {
+      $('cfgMqttStatus').textContent = '已保存，设备 2 秒后重启生效，请稍候重新连接...';
+      $('cfgMqttSaveBtn').disabled = true;
+    }
+  } catch (e) {
+    $('cfgMqttStatus').textContent = '保存失败：' + ((e.payload && e.payload.error) || e.message || '请求失败');
   }
 }
 

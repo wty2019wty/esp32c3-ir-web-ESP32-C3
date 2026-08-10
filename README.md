@@ -25,7 +25,8 @@
 - **前后端分离（可选）**：登录前可手动填写设备 ws(s) 地址；设置页的"启用内置 Web 界面"
   开关可让设备**不提供页面、仅保留 `/api/ws`**，供外部前端连接
 - **MQTT 接入（可选）**：订阅命令主题即可执行与 WebSocket 完全相同的 RPC 命令，
-  自动向主题推送实时状态与红外帧（NEC 解码 + 原始波形），可接入 Home Assistant / Node-RED 等
+  自动向主题推送实时状态与红外帧（NEC 解码 + 原始波形），可接入 Home Assistant / Node-RED 等；
+  Broker 地址、账号、主题等可在 **Web 设置页**直接修改
 
 ## 硬件连接
 
@@ -203,7 +204,8 @@ idf.py menuconfig   # → "IR Web Tool Configuration"
 与 JSON 序列化。**STA 连接路由器时才启动 MQTT**；纯 SoftAP（无外网/无到 Broker 路由）模式下
 客户端保持停止。
 
-**配置（menuconfig，或直接改 `sdkconfig.defaults` 后重新编译）**：
+**配置**：默认值来自 menuconfig（或改 `sdkconfig.defaults` 后重新编译），
+也可以在 **Web 设置页 → MQTT 设置**直接修改（保存后 2 秒自动重启，写入 NVS 并优先于默认值）：
 
 - `IR_TOOL_MQTT_ENABLE`：总开关（默认开）
 - `IR_TOOL_MQTT_BROKER_URI`：Broker 地址，如 `mqtt://192.168.1.100:1883`；

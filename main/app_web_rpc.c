@@ -4,6 +4,7 @@
 #include "app_web_internal.h"
 #include "app_ir.h"
 #include "app_wifi.h"
+#include "app_mqtt.h"
 #include "esp_log.h"
 #include "cJSON.h"
 
@@ -268,6 +269,31 @@ char *web_rpc_exec(const char *cmd, cJSON *body, const char **err)
         snprintf(buf, sizeof(buf), "{\"web_ui\":%s}",
                  web_ui_enabled_get() ? "true" : "false");
         return strdup(buf);
+    }
+
+    if (strcmp(cmd, "mqttcfg") == 0) {
+        /* present any config field => set; otherwise => get */
+        static const char *const set_fields[] = {
+            "enabled", "broker_uri", "username", "password", "client_id",
+            "topic_cmd", "topic_rsp", "topic_status", "topic_frame",
+            "qos", "publish_frames", "publish_status"
+        };
+        bool has_set = false;
+        for (size_t i = 0; i < sizeof(set_fields) / sizeof(set_fields[0]); i++) {
+            if (cJSON_GetObjectItem(body, set_fields[i])) {
+                has_set = true;
+                break;
+            }
+        }
+        if (has_set) {
+            const char *e = NULL;
+            if (web_mqttcfg_set(body, &e) != ESP_OK) {
+                *err = e ? e : "invalid";
+                return NULL;
+            }
+            return strdup("{\"restart\":true}");
+        }
+        return web_mqttcfg_get_json();
     }
 
     *err = "unknown cmd";
