@@ -43,4 +43,10 @@ CONFIG_WS_TRANSPORT=y
 CONFIG_MQTT_TRANSPORT_WEBSOCKET=y
 CONFIG_MQTT_TRANSPORT_WEBSOCKET_SECURE=y
 
+# TLS: when no CA/bundle is attached, esp-tls falls back to skipping server
+# certificate verification instead of failing the handshake. The MQTT client
+# defaults to verifying against the built-in certificate bundle; "skip" mode
+# (selectable in the Web settings) relies on this fallback.
+CONFIG_ESP_TLS_SKIP_SERVER_CERT_VERIFY=y
+
 CONFIG_PM_ENABLE=y

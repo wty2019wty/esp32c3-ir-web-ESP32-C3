@@ -218,6 +218,9 @@ idf.py menuconfig   # → "IR Web Tool Configuration"
   即通过 WebSocket 传输连接，`wss://` 为 WebSocket + TLS；也可照常使用 `mqtt://`（TCP）、
   `mqtts://`（TLS）。MQTT 的 WebSocket 是**出站客户端连接**，与设备内置的
   `/api/ws` WebSocket **服务端**完全独立，互不影响
+- `TLS 证书校验`：**默认使用内置证书包校验**（ESP-IDF 内置全量公共 CA，适合公共 Broker
+  的 `mqtts://`/`wss://`）；自签名证书或内网 CA 的 Broker 请在 Web 设置页改为
+  **跳过校验**（`CONFIG_ESP_TLS_SKIP_SERVER_CERT_VERIFY=y` 已启用，作为跳过时的回退）
 - `IR_TOOL_MQTT_TOPIC_CMD/RSP/STATUS/FRAME`：主题，默认
   `ir-web/cmd`、`ir-web/rsp`、`ir-web/status`、`ir-web/frame`
 - `IR_TOOL_MQTT_QOS`：QoS（默认 1）；`IR_TOOL_MQTT_PUBLISH_FRAMES`、`IR_TOOL_MQTT_PUBLISH_STATUS`

@@ -234,6 +234,8 @@
       <span class="mono">ws://</span>（MQTT over WebSocket）、
       <span class="mono">wss://</span>（WebSocket + TLS），例如
       <span class="mono">ws://192.168.1.100:9001/mqtt</span>。
+      <b style="color:#ffd479;">mqtts:// / wss://</b> 默认用内置证书包校验服务器证书
+      （适合公共 Broker）；自签名证书或内网 CA 请选"跳过校验"。
     </div>
     <div class="row" style="margin-bottom:8px;">
       <label style="display:flex;align-items:center;gap:8px;cursor:pointer;">
@@ -258,6 +260,11 @@
       <select id="cfgMqttProtocol">
         <option value="311" selected>MQTT 3.1.1（兼容性最好）</option>
         <option value="5">MQTT 5.0</option>
+      </select>
+      <label>TLS 证书校验</label>
+      <select id="cfgMqttTls">
+        <option value="bundle" selected>内置证书包校验（推荐，公共 CA）</option>
+        <option value="skip">跳过校验（自签名 / 内网 CA）</option>
       </select>
       <label>命令主题</label>
       <input type="text" id="cfgMqttTopicCmd" maxlength="63" placeholder="ir-web/cmd">
@@ -821,9 +828,9 @@ function applyStatus(s) {
   if (s.ap_ip) txt += ` 热点 <b>${esc(s.ap_ssid)}</b> → <span class="mono">http://${esc(s.ap_ip)}</span>`;
   if (s.sta_ip) txt += `STA <b>${esc(s.sta_ssid)}</b> → <span class="mono">${esc(s.sta_ip)}</span>(${esc(s.sta_ip_mode === 'static' ? '静态IP' : 'DHCP')})`;
   else if (s.sta_ssid) txt += `STA <b>${esc(s.sta_ssid)}</b>(未连接，${esc(s.sta_ip_mode === 'static' ? '静态IP' : 'DHCP')})`;
-  txt += `<br>载波： <span class="mono">${esc(s.carrier_hz)} Hz</span>`;
+  txt += `<br>载波频率： <span class="mono">${esc(s.carrier_hz)} Hz</span>`;
   txt += `<br>回放状态：${s.playing ? '<b style="color:#ffd479;">播放中</b>' : '空闲'}`;
-  txt += `<br>WS地址：<span class="mono">${esc(wsUrl())}</span>`;
+  txt += `<br>WS 地址：<span class="mono">${esc(wsUrl())}</span>`;
   $('statusText').innerHTML = txt;
 
   const ci = $('carrierInput');
@@ -1093,6 +1100,7 @@ async function loadMqttCfg() {
     $('cfgMqttPwdClear').parentElement.style.display = c.password_set ? 'inline-flex' : 'none';
     $('cfgMqttClientId').value = c.client_id;
     $('cfgMqttProtocol').value = c.protocol === '5' ? '5' : '311';
+    $('cfgMqttTls').value = c.tls_verify === 'skip' ? 'skip' : 'bundle';
     $('cfgMqttTopicCmd').value = c.topic_cmd;
     $('cfgMqttTopicRsp').value = c.topic_rsp;
     $('cfgMqttTopicStatus').value = c.topic_status;
@@ -1125,6 +1133,7 @@ async function saveMqttCfg() {
     password: pwd !== '' ? pwd : ($('cfgMqttPwdClear').checked ? '' : null),
     client_id: $('cfgMqttClientId').value.trim(),
     protocol: $('cfgMqttProtocol').value,
+    tls_verify: $('cfgMqttTls').value,
     topic_cmd: topics[0],
     topic_rsp: topics[1],
     topic_status: topics[2],

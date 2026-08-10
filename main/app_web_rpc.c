@@ -274,7 +274,7 @@ char *web_rpc_exec(const char *cmd, cJSON *body, const char **err)
     if (strcmp(cmd, "mqttcfg") == 0) {
         /* present any config field => set; otherwise => get */
         static const char *const set_fields[] = {
-            "enabled", "protocol", "broker_uri", "username", "password", "client_id",
+            "enabled", "protocol", "tls_verify", "broker_uri", "username", "password", "client_id",
             "topic_cmd", "topic_rsp", "topic_status", "topic_frame",
             "qos", "publish_frames", "publish_status"
         };
