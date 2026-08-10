@@ -89,11 +89,10 @@ bool ir_get_frame(ir_frame_t *out)
 
 void ir_set_frame_cb(ir_frame_cb_t cb, void *arg)
 {
+    /* NULL is a no-op: since multiple listeners coexist, "clear everything"
+     * on NULL would silently disable every other listener (e.g. a caller that
+     * used to deregister itself would now kill the WS and MQTT pushes too). */
     if (!cb) {
-        for (int i = 0; i < IR_CB_MAX; i++) {
-            s_frame_listeners[i].cb = NULL;
-            s_frame_listeners[i].arg = NULL;
-        }
         return;
     }
     for (int i = 0; i < IR_CB_MAX; i++) {
@@ -113,10 +112,6 @@ void ir_set_frame_cb(ir_frame_cb_t cb, void *arg)
 void ir_set_play_cb(ir_play_cb_t cb, void *arg)
 {
     if (!cb) {
-        for (int i = 0; i < IR_CB_MAX; i++) {
-            s_play_listeners[i].cb = NULL;
-            s_play_listeners[i].arg = NULL;
-        }
         return;
     }
     for (int i = 0; i < IR_CB_MAX; i++) {

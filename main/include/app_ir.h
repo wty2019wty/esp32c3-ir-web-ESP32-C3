@@ -56,6 +56,12 @@ bool ir_get_frame(ir_frame_t *out);
  * and stored in the history ring. Keep it short (no blocking).
  */
 typedef void (*ir_frame_cb_t)(const ir_frame_t *frame, void *arg);
+/**
+ * Register a frame callback. Multiple independent listeners are supported
+ * (e.g. WebSocket push + MQTT publisher); each is identified by its function
+ * pointer, and re-registering the same cb only updates its arg. Passing NULL
+ * is a no-op and never deregisters anything.
+ */
 void ir_set_frame_cb(ir_frame_cb_t cb, void *arg);
 
 /**
@@ -63,6 +69,10 @@ void ir_set_frame_cb(ir_frame_cb_t cb, void *arg);
  * (true = playback started, false = playback finished).
  */
 typedef void (*ir_play_cb_t)(bool playing, void *arg);
+/**
+ * Register a playback-state callback. Same multi-listener semantics and
+ * NULL-is-a-no-op rule as ir_set_frame_cb.
+ */
 void ir_set_play_cb(ir_play_cb_t cb, void *arg);
 
 /* ---- in-memory history ring (no filesystem) ---- */

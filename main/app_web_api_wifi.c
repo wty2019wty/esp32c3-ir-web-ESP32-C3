@@ -97,20 +97,27 @@ char *web_wificfg_get_json(void)
     format_ipv4(cfg.sta_mask, mask, sizeof(mask));
     format_ipv4(cfg.sta_dns, dns, sizeof(dns));
 
-    char *buf = malloc(1024);
-    if (!buf) {
+    /* Built with cJSON so every value is JSON-escaped: an SSID containing a
+     * quote or control character must not break the settings page. */
+    cJSON *root = cJSON_CreateObject();
+    if (!root) {
         return NULL;
     }
-    int n = snprintf(buf, 1024,
-        "{\"ap_ssid\":\"%s\",\"ap_password\":\"\",\"ap_password_set\":%s,"
-        "\"sta_ssid\":\"%s\",\"sta_password\":\"\",\"sta_password_set\":%s,"
-        "\"sta_dhcp\":%s,\"sta_ip\":\"%s\",\"sta_gw\":\"%s\","
-        "\"sta_mask\":\"%s\",\"sta_dns\":\"%s\"}",
-        cfg.ap_ssid, cfg.ap_password[0] ? "true" : "false",
-        cfg.sta_ssid, cfg.sta_password[0] ? "true" : "false",
-        cfg.sta_dhcp ? "true" : "false", ip, gw, mask, dns);
-    (void)n;
-    return buf;
+    cJSON_AddStringToObject(root, "ap_ssid", cfg.ap_ssid);
+    cJSON_AddStringToObject(root, "ap_password", "");
+    cJSON_AddBoolToObject(root, "ap_password_set", cfg.ap_password[0] != '\0');
+    cJSON_AddStringToObject(root, "sta_ssid", cfg.sta_ssid);
+    cJSON_AddStringToObject(root, "sta_password", "");
+    cJSON_AddBoolToObject(root, "sta_password_set", cfg.sta_password[0] != '\0');
+    cJSON_AddBoolToObject(root, "sta_dhcp", cfg.sta_dhcp);
+    cJSON_AddStringToObject(root, "sta_ip", ip);
+    cJSON_AddStringToObject(root, "sta_gw", gw);
+    cJSON_AddStringToObject(root, "sta_mask", mask);
+    cJSON_AddStringToObject(root, "sta_dns", dns);
+
+    char *s = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    return s;
 }
 
 /* Apply a WiFi configuration from a JSON body and schedule a restart.

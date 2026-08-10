@@ -33,10 +33,10 @@
 
 /* Frame publish queue. IR frames are best-effort real-time data (same
  * semantics as the WebSocket push) and are sent at QoS 0 from a dedicated
- * publisher task, NOT through the esp-mqtt outbox: esp-mqtt's task loop only
- * drains one outbox message per poll-read cycle (default 1 s), which would
- * throttle a continuous IR stream to ~1 frame/second. With a dedicated task,
- * throughput is limited only by the network. */
+ * publisher task. QoS-0 publishes go out synchronously in the calling task, so
+ * doing them on the IR receive task would stall captures while the (possibly
+ * TLS) network send runs; the dedicated task keeps the send off the IR task
+ * and lets throughput be limited only by the network. */
 #define MQTT_FRAME_QUEUE_DEPTH 4
 
 typedef struct {
@@ -214,11 +214,13 @@ static void mqtt_schedule_restart(void)
             .callback = mqtt_restart_cb,
             .name = "mqtt_restart",
         };
-        esp_timer_create(&args, &t);
+        if (esp_timer_create(&args, &t) != ESP_OK) {
+            ESP_LOGE(TAG, "failed to create restart timer, restarting now");
+            esp_restart();
+            return;
+        }
     }
-    if (t) {
-        esp_timer_start_once(t, 2 * 1000 * 1000);
-    }
+    esp_timer_start_once(t, 2 * 1000 * 1000);
 }
 
 static bool mqtt_topic_ok(const char *t)
@@ -271,30 +273,32 @@ char *web_mqttcfg_get_json(void)
     mqtt_web_config_t cfg;
     mqtt_web_config_load(&cfg);
 
-    char *buf = malloc(2048);
-    if (!buf) {
+    /* Built with cJSON so every value is JSON-escaped: the set path rejects
+     * quotes/backslashes, but menuconfig defaults and control characters are
+     * not validated and must not be able to break the settings page. */
+    cJSON *root = cJSON_CreateObject();
+    if (!root) {
         return NULL;
     }
-    int n = snprintf(buf, 2048,
-        "{\"enabled\":%s,\"protocol\":\"%s\",\"tls_verify\":\"%s\","
-        "\"topic_suffix\":%s,"
-        "\"broker_uri\":\"%s\",\"username\":\"%s\","
-        "\"password_set\":%s,\"client_id\":\"%s\","
-        "\"topic_cmd\":\"%s\",\"topic_rsp\":\"%s\",\"topic_status\":\"%s\","
-        "\"topic_frame\":\"%s\",\"qos\":%d,"
-        "\"publish_frames\":%s,\"publish_status\":%s}",
-        cfg.enabled ? "true" : "false",
-        cfg.mqtt5 ? "5" : "311",
-        cfg.tls_skip ? "skip" : "bundle",
-        cfg.topic_suffix ? "true" : "false",
-        cfg.broker_uri, cfg.username, cfg.password[0] ? "true" : "false",
-        cfg.client_id,
-        cfg.topic_cmd, cfg.topic_rsp, cfg.topic_status, cfg.topic_frame,
-        cfg.qos,
-        cfg.publish_frames ? "true" : "false",
-        cfg.publish_status ? "true" : "false");
-    (void)n;
-    return buf;
+    cJSON_AddBoolToObject(root, "enabled", cfg.enabled);
+    cJSON_AddStringToObject(root, "protocol", cfg.mqtt5 ? "5" : "311");
+    cJSON_AddStringToObject(root, "tls_verify", cfg.tls_skip ? "skip" : "bundle");
+    cJSON_AddBoolToObject(root, "topic_suffix", cfg.topic_suffix);
+    cJSON_AddStringToObject(root, "broker_uri", cfg.broker_uri);
+    cJSON_AddStringToObject(root, "username", cfg.username);
+    cJSON_AddBoolToObject(root, "password_set", cfg.password[0] != '\0');
+    cJSON_AddStringToObject(root, "client_id", cfg.client_id);
+    cJSON_AddStringToObject(root, "topic_cmd", cfg.topic_cmd);
+    cJSON_AddStringToObject(root, "topic_rsp", cfg.topic_rsp);
+    cJSON_AddStringToObject(root, "topic_status", cfg.topic_status);
+    cJSON_AddStringToObject(root, "topic_frame", cfg.topic_frame);
+    cJSON_AddNumberToObject(root, "qos", cfg.qos);
+    cJSON_AddBoolToObject(root, "publish_frames", cfg.publish_frames);
+    cJSON_AddBoolToObject(root, "publish_status", cfg.publish_status);
+
+    char *s = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    return s;
 }
 
 /* Apply an MQTT configuration from a JSON body and schedule a restart.
@@ -622,7 +626,13 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
     case MQTT_EVENT_CONNECTED:
         ESP_LOGI(TAG, "connected to broker");
         s_connected = true;
-        esp_mqtt_client_subscribe_single(s_client, s_topic_cmd, s_qos);
+        {
+            int sub_id = esp_mqtt_client_subscribe_single(s_client, s_topic_cmd, s_qos);
+            if (sub_id < 0) {
+                ESP_LOGW(TAG, "failed to subscribe to \"%s\" (msg_id=%d)",
+                         s_topic_cmd, sub_id);
+            }
+        }
         mqtt_publish_status();
         break;
     case MQTT_EVENT_DISCONNECTED:
@@ -636,8 +646,13 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
             if (ev->total_data_len == ev->data_len) {
                 mqtt_handle_command(ev->data, ev->data_len);
             } else {
-                ESP_LOGW(TAG, "fragmented command ignored (%d/%d bytes)",
+                /* Payload larger than the MQTT receive buffer arrives
+                 * fragmented and cannot be reassembled, so the command cannot
+                 * run. Publish an error instead of silently dropping it, so
+                 * automation clients do not mistake the no-op for success. */
+                ESP_LOGW(TAG, "command too large, ignoring (%d of %d bytes)",
                          ev->data_len, ev->total_data_len);
+                mqtt_respond(NULL, NULL, NULL, "command too large");
             }
         }
         break;
@@ -775,11 +790,12 @@ esp_err_t mqtt_init(void)
     ir_set_frame_cb(mqtt_frame_cb, NULL);
     ir_set_play_cb(mqtt_play_cb, NULL);
 
-    /* Dedicated frame publisher: keeps the IR capture task non-blocking and
-     * bypasses the esp-mqtt outbox / 1-message-per-poll-cycle throttle. */
+    /* Dedicated frame publisher: keeps the IR capture task non-blocking.
+     * Stack sized like esp-mqtt's own task (6144): QoS-0 publishes send
+     * synchronously here, and the mbedTLS path needs headroom on TLS brokers. */
     s_frame_queue = xQueueCreate(MQTT_FRAME_QUEUE_DEPTH, sizeof(mqtt_frame_msg_t *));
     if (s_frame_queue &&
-        xTaskCreate(mqtt_frame_pub_task, "mqtt_pub", 4096, NULL, 5, NULL) != pdPASS) {
+        xTaskCreate(mqtt_frame_pub_task, "mqtt_pub", 6144, NULL, 5, NULL) != pdPASS) {
         ESP_LOGW(TAG, "failed to create frame publisher task");
         vQueueDelete(s_frame_queue);
         s_frame_queue = NULL;
