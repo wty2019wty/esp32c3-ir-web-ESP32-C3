@@ -24,6 +24,9 @@
   防止他人用相同账号在别处登录；可在 Web 设置页关闭（关闭后同账号多端共享会话）
 - **前后端分离（可选）**：登录前可手动填写设备 ws(s) 地址；设置页的"启用内置 Web 界面"
   开关可让设备**不提供页面、仅保留 `/api/ws`**，供外部前端连接
+- **MQTT 接入（可选）**：订阅命令主题即可执行与 WebSocket 完全相同的 RPC 命令，
+  自动向主题推送实时状态与红外帧（NEC 解码 + 原始波形），可接入 Home Assistant / Node-RED 等；
+  Broker 地址、账号、主题等可在 **Web 设置页**直接修改
 
 ## 硬件连接
 
@@ -195,6 +198,192 @@ idf.py menuconfig   # → "IR Web Tool Configuration"
 `sta_ssid`、`sta_ip_mode`、`sta_connected`、`carrier_hz`、`rx_pause_on_play`、`playing`。
 单帧对象字段：`seq`、`ts`、`nec{...}`、`feat{...}`、`freq`、`durs[...]`。
 
+### MQTT（可选，命令 RPC + 状态/帧推送）
+
+设备内置 MQTT 客户端（`espressif/mqtt` 组件），复用与 WebSocket 完全相同的命令核心
+与 JSON 序列化。**STA 连接路由器时才启动 MQTT**；纯 SoftAP（无外网/无到 Broker 路由）模式下
+客户端保持停止。
+
+#### 1. 启用与配置
+
+默认值来自 menuconfig（或改 `sdkconfig.defaults` 后重新编译），也可以在
+**Web 设置页 → MQTT 设置**直接修改（保存后 2 秒自动重启，写入 NVS 并优先于默认值）：
+
+| 配置项 | 默认值 | 说明 |
+|---|---|---|
+| 启用 MQTT | 开 | `IR_TOOL_MQTT_ENABLE` |
+| Broker 地址 | 空（= 禁用） | 支持 `mqtt://`、`mqtts://`、`ws://`、`wss://` |
+| 用户名 / 密码 | 空（匿名） | Broker 认证，密码只存不回显 |
+| 客户端 ID | 空（自动） | 留空按 MAC 生成 `ir-web-XXXXXX` |
+| MQTT 协议 | 3.1.1 | 可选 3.1.1 或 5.0，保存重启后生效 |
+| TLS 证书校验 | 内置证书包 | 可选"内置证书包校验 / 跳过校验" |
+| 四个主题 | `ir-web/*` | 见下方主题表 |
+| QoS | 1 | 作用于订阅/命令/状态；**帧固定 QoS 0** |
+| 推送帧 / 推送状态 | 开 | 两个独立开关 |
+
+**传输方式（由 Broker 地址的 scheme 决定）**：
+
+- `mqtt://192.168.1.100:1883`：MQTT over TCP（默认端口 1883）
+- `mqtts://broker.example.com:8883`：MQTT over TLS（需证书校验或跳过校验）
+- `ws://192.168.1.100:9001/mqtt`：MQTT over WebSocket（EMQX 常用端口 8083/9001，路径 `/mqtt`）
+- `wss://broker.example.com:443/mqtt`：WebSocket + TLS
+
+MQTT 的 WebSocket 是设备**出站客户端连接**，与设备内置 `/api/ws` WebSocket **服务端**
+完全独立，端口、代码互不影响。
+
+#### 2. 主题一览（哪些订阅、哪些发送）
+
+主题全部可在 Web 设置页修改，默认值如下。方向以**设备**为参考：
+
+| 主题 | 默认值 | 设备方向 | 用途 |
+|---|---|---|---|
+| 命令主题 | `ir-web/cmd` | **订阅（收）** | 接收外部命令（JSON 信封） |
+| 响应主题 | `ir-web/rsp` | **发送（发）** | 回传命令执行结果 |
+| 状态主题 | `ir-web/status` | **发送（发）** | 发布状态 JSON；同时作为 LWT 离线主题 |
+| 红外帧主题 | `ir-web/frame` | **发送（发）** | 每捕获一帧红外信号发布一帧 JSON |
+
+即：设备**订阅 1 个主题**（命令），**发布 3 个主题**（响应/状态/帧）。外部客户端则相反：
+要控制设备就**向 `ir-web/cmd` 发布**并**订阅 `ir-web/rsp`** 收响应；要监视就
+**订阅 `ir-web/status` 和 `ir-web/frame`**。
+
+#### 3. 命令协议（控制设备）
+
+命令 JSON 信封与 WebSocket 完全一致（`cmd` / `body` 字段相同），额外支持可选 `id`
+字段用于关联请求与响应：
+
+```json
+{"id":"a1","cmd":"status"}
+{"id":"a2","cmd":"play","body":{"type":"hxd","value":"ED127F80","freq":38000}}
+{"id":"a3","cmd":"frames","body":{"since":0}}
+```
+
+也支持直接发送裸命令名（如 `status`）。
+
+**支持的 `cmd`（发到 `ir-web/cmd`）：**
+
+| cmd | body | 说明 |
+|---|---|---|
+| `status` | 空 | 返回当前状态对象 |
+| `play` | `{"type":"hxd","value":"ED127F80"}` / `{"type":"raw","data":[...],"freq":N}` / `{"type":"frame","seq":N}`，可选 `freq` | 回放：NEC hxd / 原始数据 / 历史帧 |
+| `carrier` | `{"freq":38000}` | 设置载波频率并持久化 |
+| `rxpause` | `{"enabled":true}` | 回放时是否暂停接收 |
+| `frames` | `{"since":N}` | 增量拉取帧历史；超 48KB 返回 `"truncated":true`，按 `last_seq` 继续拉取 |
+| `wificfg` | 含配置字段 = 保存并重启；空 = 读取 | WiFi 配置，密码不回显（`ap_password_set`/`sta_password_set`；`null`=不改、`""`=清除） |
+| `authcfg` | 含 `user`/`pass`/`single_session` = 保存；空 = 读取 | 登录设置；返回 `{"invalidated":bool}` |
+| `webcfg` | `{"web_ui":bool}` = 保存并重启；空 = 读取 | 是否启用内置 Web 页面 |
+| `mqttcfg` | 含任意 MQTT 字段 = 保存并重启；空 = 读取 | 读取返回 `enabled/protocol/tls_verify/broker_uri/username/password_set/client_id/topic_cmd/topic_rsp/topic_status/topic_frame/qos/publish_frames/publish_status` |
+| `renew` / `logout` | 空 | 会话续期 / 退出登录（WebSocket 会话相关，MQTT 下一般用不到） |
+
+**响应格式（发布到 `ir-web/rsp`）：**
+
+```json
+{"ok":true,"id":"a1","cmd":"status","result":{...}}
+{"ok":false,"id":"x","cmd":"play","error":"playback failed"}
+```
+
+- `ok`：执行结果；`id`/`cmd` 与请求对应，便于多命令并发时关联；
+- `result`：成功时的返回数据（JSON 对象，即 WebSocket 响应的 `data`）；
+- `error`：失败时的简短错误信息。
+
+#### 4. 状态推送（`ir-web/status`）
+
+- 设备**连接成功时**发布一次完整状态（retained，新订阅者立即能拿到最新状态）；
+- **播放开始/结束**时再次发布（`playing` 字段变化）；
+- 设备**异常掉线**时，Broker 按 LWT 向该主题发布 `offline`（retained，覆盖旧状态）。
+
+状态 JSON 字段：
+
+```json
+{
+  "mode": "STA",
+  "ap_ip": "",
+  "sta_ip": "192.168.1.23",
+  "ap_ssid": "",
+  "sta_ssid": "MyWiFi",
+  "sta_ip_mode": "dhcp",
+  "sta_connected": true,
+  "carrier_hz": 38000,
+  "rx_pause_on_play": true,
+  "playing": false
+}
+```
+
+字段含义：`mode`（AP/STA）、`ap_ip`/`sta_ip`（IP，未用为空串）、`sta_ip_mode`
+（dhcp/static/-）、`carrier_hz`（当前载波）、`rx_pause_on_play`（回放暂停接收开关）、
+`playing`（是否正在回放）。
+
+#### 5. 红外帧推送（`ir-web/frame`）
+
+每捕获一帧红外信号立即发布一帧 JSON（与 WebSocket 推送的帧对象完全一致），
+**固定 QoS 0**、由独立发布任务直接发送（不经 esp-mqtt outbox），队列深度 4，
+积压时丢弃新帧并限频告警（每秒最多一条日志）：
+
+```json
+{
+  "seq": 42,
+  "ts": 1234567,
+  "nec": {"ok":true,"repeat":false,"ext":false,"chksum":true,"bits":32,"addr":0,"cmd":127,"raw":3977412480,"hxd":"ED127F80"},
+  "feat": {"total_us":67460,"pulses":32,"min_pulse":560,"max_pulse":1690,"leader_pulse":9000,"leader_space":4500,"last_gap":0,"seg_count":66},
+  "freq": 38000,
+  "durs": [9000,4500,560,560,560,1690,560,560]
+}
+```
+
+字段：`seq`（递增序号）、`ts`（uptime 毫秒）、`nec`（NEC 解码结果：`ok`/`repeat`/
+`ext` 16 位地址/`chksum`/`bits`/`addr`/`cmd`/`raw`/`hxd` LSB 十六进制）、`feat`
+（波形特征：总时长、脉冲数、最小/最大脉冲、引导码、尾间隙、段数）、`freq`（载波）、
+`durs`（交替电平微秒序列，首段为载波开）。NEC 解码失败时 `nec.ok=false`。
+示例中 `durs` 已省略大部分（`seg_count` 为实际段数）。
+
+#### 6. 端到端示例
+
+**Mosquitto 命令行（控制 + 监听）：**
+
+```bash
+# 终端 1：监听状态与红外帧
+mosquitto_sub -h 192.168.1.100 -t 'ir-web/status' -t 'ir-web/frame' -v
+
+# 终端 2：订阅响应主题，然后发命令
+mosquitto_sub -h 192.168.1.100 -t 'ir-web/rsp' -v &
+mosquitto_pub -h 192.168.1.100 -t 'ir-web/cmd' -m '{"cmd":"status"}'
+mosquitto_pub -h 192.168.1.100 -t 'ir-web/cmd' \
+  -m '{"id":"a2","cmd":"play","body":{"type":"hxd","value":"ED127F80"}}'
+```
+
+**Python（paho-mqtt）监听红外帧：**
+
+```python
+import json
+import paho.mqtt.client as mqtt
+
+def on_message(client, userdata, msg):
+    d = json.loads(msg.payload)
+    if msg.topic.endswith("/frame"):
+        nec = d.get("nec", {})
+        print(f"frame #{d['seq']} hxd={nec.get('hxd')} segs={d['feat']['seg_count']}")
+
+c = mqtt.Client()
+c.on_message = on_message
+c.connect("192.168.1.100")
+c.subscribe("ir-web/status")
+c.subscribe("ir-web/frame")
+c.loop_forever()
+```
+
+**常见用途：**
+
+- **控制**：向 `ir-web/cmd` 发 `play/carrier/rxpause` 等命令，从 `ir-web/rsp` 收结果；
+- **监视**：订阅 `ir-web/frame` 实时获取每个红外信号，接入 Home Assistant / Node-RED；
+- **在线状态**：订阅 `ir-web/status`，收到 `offline` 即设备掉线（LWT）。
+
+#### 7. 注意事项与限制
+
+- 仅在 **STA 连接路由器**时启动 MQTT；纯 SoftAP 模式不连接；
+- 红外帧固定 QoS 0（实时尽力而为，同 WebSocket 推送语义），命令/状态按配置 QoS 发送；
+- 帧 JSON 可达数 KB，MQTT 收发缓冲已设为 12288 字节（`buffer.size`），整帧单包发送；
+- **安全**：MQTT 命令通道不经过 Web 登录认证（无 WebSocket 的 token 机制），安全性依赖
+  Broker 的账号密码/TLS；请勿在公网匿名 Broker 上暴露命令主题。
+
 ### 前后端分离
 
 页面可与设备分离部署（如托管在 CF Pages / 任意静态服务器）。页面内置的
@@ -277,32 +466,35 @@ HTTPS 页面下浏览器会使用 `wss://`；若反代未转发 Upgrade 头，We
 ## 工程结构
 
 ```text
-esp32c3-IR/
+esp32c3-ir-web-ESP32-C3/
 ├── CMakeLists.txt
-├── sdkconfig.defaults        # esp32c3 / 4MB flash / 自定义分区 / NVS 加密 / WS 支持
+├── sdkconfig.defaults        # esp32c3 / 4MB flash / 自定义分区 / NVS 加密 / WS 支持 / MQTT（协议+WS 传输+TLS）
 ├── partitions.csv            # nvs + phy_init + factory（约 3.9MB app 区）
+├── dependencies.lock         # 组件依赖锁定（espressif/cjson、espressif/mqtt、idf 版本）
 ├── api-demo.py               # Python 示例脚本：WS 登录 + 回放/监听（WebSocket-only）
-├── .github/workflows/        # deploy-pages.yml：前端部署到 GitHub Pages
+├── LICENSE
+├── .github/workflows/        # build.yml：固件编译 CI；deploy-pages.yml：前端部署到 GitHub Pages
 └── main/
     ├── CMakeLists.txt        # EMBED_TXTFILES 内嵌 index.html
-    ├── idf_component.yml     # 依赖 espressif/cjson
-    ├── Kconfig.projbuild     # 引脚/载波/WiFi/HTTP/认证配置项
-    ├── app_main.c            # NVS → IR → WiFi → Web
+    ├── idf_component.yml     # 依赖 espressif/cjson、espressif/mqtt
+    ├── Kconfig.projbuild     # 引脚/载波/WiFi/HTTP/认证/MQTT 配置项
+    ├── app_main.c            # NVS → IR → WiFi → Web → MQTT
     ├── app_ir.c              # RMT RX/TX 核心 + 载波 + RAM 历史
     ├── app_ir_nec.c          # NEC 协议解码
     ├── app_ir_play.c         # hxd/raw 回放编码
-    ├── app_ir_store.c        # 帧存储 + 历史环形缓冲 + 回调
+    ├── app_ir_store.c        # 帧存储 + 历史环形缓冲 + 多监听器回调（WS/MQTT 共用）
     ├── app_wifi.c            # AP/STA 互斥 + 超时降级
+    ├── app_mqtt.c            # MQTT 客户端：命令 RPC + 状态/帧推送 + WiFi 联动
     ├── app_web.c             # HTTP server 初始化（仅静态页面 + WS 端点）
-    ├── app_web_api_ir.c      # IR 命令核心（play/carrier/rxpause，WS-only）
-    ├── app_web_api_wifi.c    # WiFi 配置核心（wificfg 读写，WS-only）
+    ├── app_web_api_ir.c      # IR 命令核心（play/carrier/rxpause，WS/MQTT 共用）
+    ├── app_web_api_wifi.c    # WiFi 配置核心（wificfg 读写，WS/MQTT 共用）
     ├── app_web_auth.c        # WS 登录 / token 认证 / 会话代数 / 凭据管理
-    ├── app_web_rpc.c         # 命令分发（WS cmd → 各模块）+ 帧历史 JSON 构建
+    ├── app_web_rpc.c         # 命令分发（WS/MQTT cmd → 各模块）+ 帧历史 JSON 构建
     ├── app_web_ws.c          # WebSocket /api/ws：登录认证、命令 RPC、推送（串行发送 + 心跳）
     ├── app_web_util.c        # JSON 序列化 + HTTP 工具函数
     ├── web/index.html        # 前端单页（内嵌，无需文件系统）
     ├── web/run.bat           # 本地静态服务器（python -m http.server 80），前后端分离调试用
-    └── include/              # 各模块头文件
+    └── include/              # 各模块头文件（app_ir.h / app_wifi.h / app_web.h / app_mqtt.h 等）
 ```
 
 ## 实现要点

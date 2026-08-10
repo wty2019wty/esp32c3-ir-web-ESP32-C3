@@ -97,4 +97,77 @@ menu "IR Web Tool Configuration"
         int "Max RMT symbols per transmission (raw data replay)"
         default 2048
 
+    menu "MQTT Client"
+
+        config IR_TOOL_MQTT_ENABLE
+            bool "Enable MQTT client"
+            default y
+            help
+                Enable the built-in MQTT client. The broker URI below still has
+                to be set for the client to connect; an empty URI disables MQTT
+                at runtime even with this option enabled. All values can also
+                be changed from the Web settings page (persisted in NVS and
+                taking priority over these defaults).
+
+        config IR_TOOL_MQTT_BROKER_URI
+            string "Broker URI (empty = MQTT disabled)"
+            default ""
+            help
+                For example mqtt://192.168.1.100:1883 or
+                mqtts://broker.example.com:8883.
+
+        config IR_TOOL_MQTT_USERNAME
+            string "MQTT username (empty = anonymous)"
+            default ""
+
+        config IR_TOOL_MQTT_PASSWORD
+            string "MQTT password (empty = no password)"
+            default ""
+
+        config IR_TOOL_MQTT_CLIENT_ID
+            string "MQTT client ID (empty = auto from MAC address)"
+            default ""
+
+        config IR_TOOL_MQTT_TOPIC_CMD
+            string "Command topic (subscribe)"
+            default "ir-web/cmd"
+
+        config IR_TOOL_MQTT_TOPIC_RSP
+            string "Command response topic (publish)"
+            default "ir-web/rsp"
+
+        config IR_TOOL_MQTT_TOPIC_STATUS
+            string "Status topic (publish, also used for LWT)"
+            default "ir-web/status"
+
+        config IR_TOOL_MQTT_TOPIC_FRAME
+            string "IR frame topic (publish)"
+            default "ir-web/frame"
+
+        config IR_TOOL_MQTT_QOS
+            int "MQTT QoS for subscribe/commands/status"
+            default 1
+            range 0 2
+            help
+                QoS 0 = at most once, QoS 1 = at least once (default),
+                QoS 2 = exactly once. IR frames are always published at QoS 0
+                (best-effort real-time, same as the WebSocket push) so a slow
+                broker cannot stall the capture stream behind acks.
+
+        config IR_TOOL_MQTT_PUBLISH_FRAMES
+            bool "Publish captured IR frames"
+            default y
+            help
+                Publish every newly captured frame (same JSON shape as the
+                WebSocket frame push) to the frame topic.
+
+        config IR_TOOL_MQTT_PUBLISH_STATUS
+            bool "Publish status on connect / play state changes"
+            default y
+            help
+                Publish the full status object to the status topic when the
+                client connects and whenever playback starts/stops.
+
+    endmenu
+
 endmenu
