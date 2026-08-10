@@ -228,7 +228,14 @@
     <div style="font-size:12px; color:#8a93a3; margin-bottom:10px;">
       保存后设备 2 秒后自动重启生效。MQTT 命令通道<b style="color:#ffd479;">不经过 Web 登录认证</b>，
       请使用带账号密码的 Broker（或 TLS）。设备仅在<b style="color:#ffd479;">连接路由器（STA）</b>时
-      启动 MQTT；纯热点（SoftAP）模式下不连接。
+      启动 MQTT；纯热点（SoftAP）模式下不连接。<br>
+      Broker 地址支持 <span class="mono">mqtt://</span>（TCP）、
+      <span class="mono">mqtts://</span>（TLS）、
+      <span class="mono">ws://</span>（MQTT over WebSocket）、
+      <span class="mono">wss://</span>（WebSocket + TLS），例如
+      <span class="mono">ws://192.168.1.100:9001/mqtt</span>。
+      <b style="color:#ffd479;">mqtts:// / wss://</b> 默认用内置证书包校验服务器证书
+      （适合公共 Broker）；自签名证书或内网 CA 请选"跳过校验"。
     </div>
     <div class="row" style="margin-bottom:8px;">
       <label style="display:flex;align-items:center;gap:8px;cursor:pointer;">
@@ -237,7 +244,7 @@
     </div>
     <div class="formgrid">
       <label>Broker 地址</label>
-      <input type="text" id="cfgMqttBroker" maxlength="127" placeholder="mqtt://192.168.1.100:1883（留空 = 禁用）" autocomplete="off">
+      <input type="text" id="cfgMqttBroker" maxlength="127" placeholder="mqtt://192.168.1.100:1883 或 ws://192.168.1.100:9001/mqtt（留空 = 禁用）" autocomplete="off">
       <label>用户名（留空 = 匿名）</label>
       <input type="text" id="cfgMqttUser" maxlength="63" autocomplete="off">
       <label>密码（留空 = 不修改）</label>
@@ -254,6 +261,11 @@
         <option value="311" selected>MQTT 3.1.1（兼容性最好）</option>
         <option value="5">MQTT 5.0</option>
       </select>
+      <label>TLS 证书校验</label>
+      <select id="cfgMqttTls">
+        <option value="bundle" selected>内置证书包校验（推荐，公共 CA）</option>
+        <option value="skip">跳过校验（自签名 / 内网 CA）</option>
+      </select>
       <label>命令主题</label>
       <input type="text" id="cfgMqttTopicCmd" maxlength="63" placeholder="ir-web/cmd">
       <label>响应主题</label>
@@ -262,7 +274,7 @@
       <input type="text" id="cfgMqttTopicStatus" maxlength="63" placeholder="ir-web/status">
       <label>红外帧主题</label>
       <input type="text" id="cfgMqttTopicFrame" maxlength="63" placeholder="ir-web/frame">
-      <label>QoS</label>
+      <label>QoS（命令/状态）</label>
       <select id="cfgMqttQos">
         <option value="0">0 - 最多一次</option>
         <option value="1" selected>1 - 至少一次（推荐）</option>
@@ -273,6 +285,7 @@
       <label style="display:flex;align-items:center;gap:8px;color:#d7dae0;font-size:12px;">
         <input type="checkbox" id="cfgMqttPubFrames"> 推送捕获的红外帧
       </label>
+      <span style="font-size:12px; color:#8a93a3;">（帧固定 QoS 0，实时尽力推送，不因等待确认而阻塞）</span>
       <label style="display:flex;align-items:center;gap:8px;color:#d7dae0;font-size:12px;">
         <input type="checkbox" id="cfgMqttPubStatus"> 连接/播放变化时推送状态
       </label>
@@ -816,9 +829,9 @@ function applyStatus(s) {
   if (s.ap_ip) txt += ` 热点 <b>${esc(s.ap_ssid)}</b> → <span class="mono">http://${esc(s.ap_ip)}</span>`;
   if (s.sta_ip) txt += `STA <b>${esc(s.sta_ssid)}</b> → <span class="mono">${esc(s.sta_ip)}</span>(${esc(s.sta_ip_mode === 'static' ? '静态IP' : 'DHCP')})`;
   else if (s.sta_ssid) txt += `STA <b>${esc(s.sta_ssid)}</b>(未连接，${esc(s.sta_ip_mode === 'static' ? '静态IP' : 'DHCP')})`;
-  txt += `<br>载波： <span class="mono">${esc(s.carrier_hz)} Hz</span>`;
+  txt += `<br>载波频率： <span class="mono">${esc(s.carrier_hz)} Hz</span>`;
   txt += `<br>回放状态：${s.playing ? '<b style="color:#ffd479;">播放中</b>' : '空闲'}`;
-  txt += `<br>WS地址：<span class="mono">${esc(wsUrl())}</span>`;
+  txt += `<br>WS 地址：<span class="mono">${esc(wsUrl())}</span>`;
   $('statusText').innerHTML = txt;
 
   const ci = $('carrierInput');
@@ -1088,6 +1101,7 @@ async function loadMqttCfg() {
     $('cfgMqttPwdClear').parentElement.style.display = c.password_set ? 'inline-flex' : 'none';
     $('cfgMqttClientId').value = c.client_id;
     $('cfgMqttProtocol').value = c.protocol === '5' ? '5' : '311';
+    $('cfgMqttTls').value = c.tls_verify === 'skip' ? 'skip' : 'bundle';
     $('cfgMqttTopicCmd').value = c.topic_cmd;
     $('cfgMqttTopicRsp').value = c.topic_rsp;
     $('cfgMqttTopicStatus').value = c.topic_status;
@@ -1120,6 +1134,7 @@ async function saveMqttCfg() {
     password: pwd !== '' ? pwd : ($('cfgMqttPwdClear').checked ? '' : null),
     client_id: $('cfgMqttClientId').value.trim(),
     protocol: $('cfgMqttProtocol').value,
+    tls_verify: $('cfgMqttTls').value,
     topic_cmd: topics[0],
     topic_rsp: topics[1],
     topic_status: topics[2],
