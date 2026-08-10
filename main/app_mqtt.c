@@ -28,9 +28,11 @@
  * (raw durations) so multi-KB publishes go out in a single packet. */
 #define MQTT_BUFFER_SIZE 12288
 
-/* Drop frame publishes while this many QoS 1/2 messages are unacknowledged,
- * so a slow broker cannot balloon the outbox with multi-KB frames. */
-#define MQTT_MAX_PENDING_FRAMES 4
+/* Frame publish budget. Frames are best-effort real-time data (same semantics
+ * as the WebSocket push) and are published at QoS 0, so they never wait on
+ * broker acks. When the outbox holds more than this many bytes (the network
+ * cannot keep up), new frames are dropped until it drains. */
+#define MQTT_FRAME_OUTBOX_LIMIT_BYTES (16 * 1024)
 
 #define MQTT_NS "ir_tool"
 
@@ -53,7 +55,6 @@
 static esp_mqtt_client_handle_t s_client = NULL;
 static bool s_started = false;
 static volatile bool s_connected = false;
-static volatile int s_pending = 0; /* unacked QoS1/2 publishes, approximate */
 
 /* Runtime settings resolved from NVS (menuconfig provides defaults) */
 static char s_topic_cmd[MQTT_CFG_STR_LEN];
@@ -356,13 +357,13 @@ esp_err_t web_mqttcfg_set(cJSON *root, const char **err)
 /* Publish a heap/stack payload to a topic. Copies into the outbox
  * (store=true) so the caller may free the buffer right after this returns;
  * the actual network send happens inside the MQTT task. */
-static void mqtt_publish(const char *topic, const char *payload, int len, bool retain)
+static void mqtt_publish(const char *topic, const char *payload, int len, int qos, bool retain)
 {
     if (!s_client || !s_connected || !payload) {
         return;
     }
     int msg_id = esp_mqtt_client_enqueue(s_client, topic, payload, len,
-                                         s_qos, retain ? 1 : 0, true);
+                                         qos, retain ? 1 : 0, true);
     if (msg_id < 0) {
         ESP_LOGW(TAG, "publish failed to \"%s\" (msg_id=%d)", topic, msg_id);
     }
@@ -379,7 +380,7 @@ static void mqtt_publish_status(void)
     }
     /* Retained so a subscriber joining later gets the last known state; the
      * LWT "offline" message replaces it when the device drops. */
-    mqtt_publish(s_topic_status, json, (int)strlen(json), true);
+    mqtt_publish(s_topic_status, json, (int)strlen(json), s_qos, true);
     free(json);
 }
 
@@ -414,7 +415,7 @@ static void mqtt_respond(const char *cmd, const char *id, char *data, const char
     char *json = cJSON_PrintUnformatted(resp);
     cJSON_Delete(resp);
     if (json) {
-        mqtt_publish(s_topic_rsp, json, (int)strlen(json), false);
+        mqtt_publish(s_topic_rsp, json, (int)strlen(json), s_qos, false);
         free(json);
     }
     free(data);
@@ -482,10 +483,6 @@ static void mqtt_frame_cb(const ir_frame_t *frame, void *arg)
     if (!s_publish_frames || !s_connected || !frame) {
         return;
     }
-    if (s_qos > 0 && s_pending >= MQTT_MAX_PENDING_FRAMES) {
-        ESP_LOGW(TAG, "dropping frame (outbox backlog)");
-        return;
-    }
     char *buf = malloc(MQTT_FRAME_JSON_CAP);
     if (!buf) {
         return;
@@ -495,10 +492,22 @@ static void mqtt_frame_cb(const ir_frame_t *frame, void *arg)
         free(buf);
         return;
     }
-    if (s_qos > 0) {
-        s_pending++;
+    int used = esp_mqtt_client_get_outbox_size(s_client);
+    if (used + n > MQTT_FRAME_OUTBOX_LIMIT_BYTES) {
+        /* Rate-limit the log: under a continuous IR stream this can fire at
+         * capture rate and would flood the console. */
+        static int64_t s_last_drop_log_us = 0;
+        int64_t now = esp_timer_get_time();
+        if (now - s_last_drop_log_us > 1000 * 1000) {
+            s_last_drop_log_us = now;
+            ESP_LOGW(TAG, "dropping frame (outbox backlog %d bytes)", used);
+        }
+        free(buf);
+        return;
     }
-    mqtt_publish(s_topic_frame, buf, n, false);
+    /* Frames are QoS 0 (best-effort real-time, like the WebSocket push); they
+     * must not be stalled behind QoS 1/2 acks. */
+    mqtt_publish(s_topic_frame, buf, n, 0, false);
     free(buf);
 }
 
@@ -540,11 +549,6 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
                 ESP_LOGW(TAG, "fragmented command ignored (%d/%d bytes)",
                          ev->data_len, ev->total_data_len);
             }
-        }
-        break;
-    case MQTT_EVENT_PUBLISHED:
-        if (s_qos > 0 && s_pending > 0) {
-            s_pending--;
         }
         break;
     case MQTT_EVENT_ERROR:

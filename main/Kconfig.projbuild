@@ -143,13 +143,14 @@ menu "IR Web Tool Configuration"
             default "ir-web/frame"
 
         config IR_TOOL_MQTT_QOS
-            int "MQTT QoS for subscribe/publish"
+            int "MQTT QoS for subscribe/commands/status"
             default 1
             range 0 2
             help
                 QoS 0 = at most once, QoS 1 = at least once (default),
-                QoS 2 = exactly once. Frames are best-effort; use QoS 1 so the
-                outbox retransmits anything the broker did not acknowledge.
+                QoS 2 = exactly once. IR frames are always published at QoS 0
+                (best-effort real-time, same as the WebSocket push) so a slow
+                broker cannot stall the capture stream behind acks.
 
         config IR_TOOL_MQTT_PUBLISH_FRAMES
             bool "Publish captured IR frames"

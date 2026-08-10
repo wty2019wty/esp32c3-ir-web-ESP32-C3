@@ -274,7 +274,7 @@
       <input type="text" id="cfgMqttTopicStatus" maxlength="63" placeholder="ir-web/status">
       <label>红外帧主题</label>
       <input type="text" id="cfgMqttTopicFrame" maxlength="63" placeholder="ir-web/frame">
-      <label>QoS</label>
+      <label>QoS（命令/状态）</label>
       <select id="cfgMqttQos">
         <option value="0">0 - 最多一次</option>
         <option value="1" selected>1 - 至少一次（推荐）</option>
@@ -285,6 +285,7 @@
       <label style="display:flex;align-items:center;gap:8px;color:#d7dae0;font-size:12px;">
         <input type="checkbox" id="cfgMqttPubFrames"> 推送捕获的红外帧
       </label>
+      <span style="font-size:12px; color:#8a93a3;">（帧固定 QoS 0，实时尽力推送，不因等待确认而阻塞）</span>
       <label style="display:flex;align-items:center;gap:8px;color:#d7dae0;font-size:12px;">
         <input type="checkbox" id="cfgMqttPubStatus"> 连接/播放变化时推送状态
       </label>
