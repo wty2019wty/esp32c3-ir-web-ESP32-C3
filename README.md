@@ -215,12 +215,14 @@ idf.py menuconfig   # → "IR Web Tool Configuration"
 
 #### 1. 启用与配置
 
-默认值来自 menuconfig（或改 `sdkconfig.defaults` 后重新编译），也可以在
-**Web 设置页 → MQTT 设置**直接修改（保存后 2 秒自动重启，写入 NVS 并优先于默认值）：
+MQTT 客户端代码**始终编译在固件中**；menuconfig 的 `IR_TOOL_MQTT_ENABLE`（或
+`sdkconfig.defaults`）只决定 **Web 设置页"启用 MQTT"勾选框的初始值**（默认不勾选）。
+实际启用与否完全由 Web 设置页控制：勾选并填好 Broker 地址保存后，设备重启即连接
+（写入 NVS 并优先于 menuconfig 默认值）。默认值/各选项：
 
 | 配置项 | 默认值 | 说明 |
 |---|---|---|
-| 启用 MQTT | 关 | `IR_TOOL_MQTT_ENABLE` |
+| 启用 MQTT | 关 | `IR_TOOL_MQTT_ENABLE` 仅作 Web 勾选框默认值；代码始终编译 |
 | Broker 地址 | 空（= 禁用） | 支持 `mqtt://`、`mqtts://`、`ws://`、`wss://` |
 | 用户名 / 密码 | 空（匿名） | Broker 认证，密码只存不回显 |
 | 客户端 ID | 空（自动） | 留空按 MAC 生成 `ir-web-XXXXXX` |

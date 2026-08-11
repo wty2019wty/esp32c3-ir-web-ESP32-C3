@@ -96,7 +96,11 @@ static esp_timer_handle_t s_dns_timer = NULL;
 esp_err_t mqtt_web_config_load(mqtt_web_config_t *cfg)
 {
     memset(cfg, 0, sizeof(*cfg));
+#ifdef CONFIG_IR_TOOL_MQTT_ENABLE
     cfg->enabled = CONFIG_IR_TOOL_MQTT_ENABLE;
+#else
+    cfg->enabled = false; /* MQTT compiled out by menuconfig */
+#endif
     cfg->mqtt5 = false; /* default protocol: 3.1.1 */
     cfg->tls_skip = false; /* default: verify against the built-in certificate bundle */
     cfg->topic_suffix = false; /* default: topics as configured */
@@ -898,7 +902,6 @@ static void mqtt_wifi_event_handler(void *arg, esp_event_base_t base,
 
 esp_err_t mqtt_init(void)
 {
-#if CONFIG_IR_TOOL_MQTT_ENABLE
     mqtt_web_config_t cfg;
     mqtt_web_config_load(&cfg);
 
@@ -1013,8 +1016,5 @@ esp_err_t mqtt_init(void)
              cfg.broker_uri, cid ? cid : "(auto)");
     ESP_LOGI(TAG, "MQTT topics: cmd=%s rsp=%s status=%s frame=%s",
              s_topic_cmd, s_topic_rsp, s_topic_status, s_topic_frame);
-#else
-    ESP_LOGI(TAG, "MQTT disabled by menuconfig");
-#endif
     return ESP_OK;
 }
