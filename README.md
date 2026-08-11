@@ -220,7 +220,7 @@ idf.py menuconfig   # → "IR Web Tool Configuration"
 
 | 配置项 | 默认值 | 说明 |
 |---|---|---|
-| 启用 MQTT | 开 | `IR_TOOL_MQTT_ENABLE` |
+| 启用 MQTT | 关 | `IR_TOOL_MQTT_ENABLE` |
 | Broker 地址 | 空（= 禁用） | 支持 `mqtt://`、`mqtts://`、`ws://`、`wss://` |
 | 用户名 / 密码 | 空（匿名） | Broker 认证，密码只存不回显 |
 | 客户端 ID | 空（自动） | 留空按 MAC 生成 `ir-web-XXXXXX` |

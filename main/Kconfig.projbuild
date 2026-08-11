@@ -110,7 +110,7 @@ menu "IR Web Tool Configuration"
 
         config IR_TOOL_MQTT_ENABLE
             bool "Enable MQTT client"
-            default y
+            default n
             help
                 Enable the built-in MQTT client. The broker URI below still has
                 to be set for the client to connect; an empty URI disables MQTT
