@@ -768,8 +768,8 @@ static bool mqtt_dns_ok(void)
     return true;
 }
 
-/* Log the network state (STA IP + DNS servers) and broker resolution so a
- * failed MQTT connection can be diagnosed from the serial log alone. */
+/* Log the network state (STA IP + DNS servers) so a failed MQTT connection
+ * can be diagnosed from the serial log alone. */
 static void mqtt_diag_network(void)
 {
     char ip[16];
@@ -786,7 +786,6 @@ static void mqtt_diag_network(void)
             }
         }
     }
-    mqtt_dns_ok();
 }
 
 static void mqtt_start_if_needed(void)

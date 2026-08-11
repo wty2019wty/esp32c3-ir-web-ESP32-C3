@@ -116,6 +116,36 @@ static void sta_apply_static_ip(void)
         esp_netif_set_dns_info(s_sta_netif, ESP_NETIF_DNS_MAIN, &dns);
     }
     ESP_LOGI(TAG, "STA static IP applied");
+    /* Static IP without a configured DNS would leave the resolver dead
+     * (no GOT_IP event fires in static mode), so fall back to public DNS. */
+    wifi_ensure_dns();
+}
+
+/* Some routers hand out an IP via DHCP but omit the DNS server option.
+ * Without a resolver no hostname (e.g. the MQTT broker) can be resolved, so
+ * fall back to well-known public resolvers when the lease carried none.
+ * Idempotent: existing DNS servers are left untouched. */
+void wifi_ensure_dns(void)
+{
+    if (!s_sta_netif) {
+        return;
+    }
+    esp_netif_dns_info_t dns = {0};
+    if (esp_netif_get_dns_info(s_sta_netif, ESP_NETIF_DNS_MAIN, &dns) == ESP_OK &&
+        dns.ip.type == ESP_IPADDR_TYPE_V4 && dns.ip.u_addr.ip4.addr != 0) {
+        return; /* DHCP provided a working DNS server */
+    }
+    esp_netif_dns_info_t fb1 = {0}, fb2 = {0};
+    if (esp_netif_str_to_ip4("223.5.5.5", &fb1.ip.u_addr.ip4) != ESP_OK ||
+        esp_netif_str_to_ip4("119.29.29.29", &fb2.ip.u_addr.ip4) != ESP_OK) {
+        return;
+    }
+    fb1.ip.type = ESP_IPADDR_TYPE_V4;
+    fb2.ip.type = ESP_IPADDR_TYPE_V4;
+    esp_netif_set_dns_info(s_sta_netif, ESP_NETIF_DNS_MAIN, &fb1);
+    esp_netif_set_dns_info(s_sta_netif, ESP_NETIF_DNS_BACKUP, &fb2);
+    ESP_LOGW(TAG, "no DNS server configured, using public fallback " IPSTR " / " IPSTR,
+             IP2STR(&fb1.ip.u_addr.ip4), IP2STR(&fb2.ip.u_addr.ip4));
 }
 
 static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data)
@@ -168,6 +198,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
         snprintf(s_sta_ip, sizeof(s_sta_ip), IPSTR, IP2STR(&ev->ip_info.ip));
         ESP_LOGI(TAG, "STA got IP: %s", s_sta_ip);
         s_sta_connected = true;
+        wifi_ensure_dns();
     }
 }
 
