@@ -19,6 +19,7 @@ typedef struct {
     uint32_t sta_gw;
     uint32_t sta_mask;
     uint32_t sta_dns;
+    uint32_t sta_dns2;                        /* optional backup resolver */
 } wifi_web_config_t;
 
 /**

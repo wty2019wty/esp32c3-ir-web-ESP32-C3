@@ -218,7 +218,9 @@
       <label>网关</label>
       <input type="text" id="cfgStaGw" class="ip" placeholder="192.168.1.1">
       <label>DNS</label>
-      <input type="text" id="cfgStaDns" class="ip" placeholder="可留空">
+      <input type="text" id="cfgStaDns" class="ip" placeholder="主 DNS">
+      <label>备用 DNS</label>
+      <input type="text" id="cfgStaDns2" class="ip" placeholder="可留空">
     </div>
     <div class="row" style="margin-top:12px;">
       <button id="cfgSaveBtn" onclick="saveWifiCfg()">保存并重启</button>
@@ -1047,6 +1049,7 @@ async function loadWifiCfg() {
     $('cfgStaMask').value = c.sta_mask;
     $('cfgStaGw').value = c.sta_gw;
     $('cfgStaDns').value = c.sta_dns;
+    $('cfgStaDns2').value = c.sta_dns2;
     try {
       const w = await rpc('webcfg');
       $('cfgWebUi').checked = !!w.web_ui;
@@ -1095,11 +1098,13 @@ async function saveWifiCfg() {
   const maskV = $('cfgStaMask').value.trim();
   const gwV = $('cfgStaGw').value.trim();
   const dnsV = $('cfgStaDns').value.trim();
+  const dns2V = $('cfgStaDns2').value.trim();
   if (!staDhcp) {
     if (!validIp(ipV)) { $('cfgStatus').textContent = '静态 IP 格式错误'; return; }
     if (maskV && !validIp(maskV)) { $('cfgStatus').textContent = '子网掩码格式错误'; return; }
     if (gwV && !validIp(gwV)) { $('cfgStatus').textContent = '网关格式错误'; return; }
     if (dnsV && !validIp(dnsV)) { $('cfgStatus').textContent = 'DNS 格式错误'; return; }
+    if (dns2V && !validIp(dns2V)) { $('cfgStatus').textContent = '备用 DNS 格式错误'; return; }
   }
   const body = {
     ap_ssid: $('cfgApSsid').value.trim(),
@@ -1110,7 +1115,8 @@ async function saveWifiCfg() {
     sta_ip: ipV,
     sta_mask: maskV || '255.255.255.0',
     sta_gw: gwV,
-    sta_dns: dnsV
+    sta_dns: dnsV,
+    sta_dns2: dns2V
   };
   try {
     const d = await rpc('wificfg', body);

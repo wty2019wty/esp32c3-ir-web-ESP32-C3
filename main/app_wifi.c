@@ -74,6 +74,7 @@ esp_err_t wifi_web_config_load(wifi_web_config_t *cfg)
     nvs_get_u32(h, "sta_gw", &cfg->sta_gw);
     nvs_get_u32(h, "sta_mask", &cfg->sta_mask);
     nvs_get_u32(h, "sta_dns", &cfg->sta_dns);
+    nvs_get_u32(h, "sta_dns2", &cfg->sta_dns2);
     nvs_close(h);
     return ESP_OK;
 }
@@ -91,6 +92,7 @@ esp_err_t wifi_web_config_save(const wifi_web_config_t *cfg)
     if (err == ESP_OK) err = nvs_set_u32(h, "sta_gw", cfg->sta_gw);
     if (err == ESP_OK) err = nvs_set_u32(h, "sta_mask", cfg->sta_mask);
     if (err == ESP_OK) err = nvs_set_u32(h, "sta_dns", cfg->sta_dns);
+    if (err == ESP_OK) err = nvs_set_u32(h, "sta_dns2", cfg->sta_dns2);
     if (err == ESP_OK) err = nvs_commit(h);
     nvs_close(h);
     return err;
@@ -115,25 +117,36 @@ static void sta_apply_static_ip(void)
         dns.ip.u_addr.ip4.addr = s_web_cfg.sta_dns;
         esp_netif_set_dns_info(s_sta_netif, ESP_NETIF_DNS_MAIN, &dns);
     }
+    if (s_web_cfg.sta_dns2) {
+        esp_netif_dns_info_t dns = {0};
+        dns.ip.type = ESP_IPADDR_TYPE_V4;
+        dns.ip.u_addr.ip4.addr = s_web_cfg.sta_dns2;
+        esp_netif_set_dns_info(s_sta_netif, ESP_NETIF_DNS_BACKUP, &dns);
+    }
     ESP_LOGI(TAG, "STA static IP applied");
     /* Static IP without a configured DNS would leave the resolver dead
      * (no GOT_IP event fires in static mode), so fall back to public DNS. */
     wifi_ensure_dns();
 }
 
-/* Some routers hand out an IP via DHCP but omit the DNS server option.
- * Without a resolver no hostname (e.g. the MQTT broker) can be resolved, so
- * fall back to well-known public resolvers when the lease carried none.
- * Idempotent: existing DNS servers are left untouched. */
+/* Some routers hand out an IP via DHCP but omit (or send only one) DNS
+ * server option. Without a resolver no hostname (e.g. the MQTT broker) can
+ * be resolved, so ensure a usable main + backup pair:
+ *  - no main DNS  -> fill both slots with public resolvers
+ *  - main present but no backup -> fill only the backup slot
+ * Idempotent: existing DNS servers are never overwritten. */
 void wifi_ensure_dns(void)
 {
     if (!s_sta_netif) {
         return;
     }
-    esp_netif_dns_info_t dns = {0};
-    if (esp_netif_get_dns_info(s_sta_netif, ESP_NETIF_DNS_MAIN, &dns) == ESP_OK &&
-        dns.ip.type == ESP_IPADDR_TYPE_V4 && dns.ip.u_addr.ip4.addr != 0) {
-        return; /* DHCP provided a working DNS server */
+    esp_netif_dns_info_t main_dns = {0}, back_dns = {0};
+    bool have_main = esp_netif_get_dns_info(s_sta_netif, ESP_NETIF_DNS_MAIN, &main_dns) == ESP_OK &&
+                     main_dns.ip.type == ESP_IPADDR_TYPE_V4 && main_dns.ip.u_addr.ip4.addr != 0;
+    bool have_back = esp_netif_get_dns_info(s_sta_netif, ESP_NETIF_DNS_BACKUP, &back_dns) == ESP_OK &&
+                     back_dns.ip.type == ESP_IPADDR_TYPE_V4 && back_dns.ip.u_addr.ip4.addr != 0;
+    if (have_main && have_back) {
+        return;
     }
     esp_netif_dns_info_t fb1 = {0}, fb2 = {0};
     if (esp_netif_str_to_ip4("223.5.5.5", &fb1.ip.u_addr.ip4) != ESP_OK ||
@@ -142,10 +155,18 @@ void wifi_ensure_dns(void)
     }
     fb1.ip.type = ESP_IPADDR_TYPE_V4;
     fb2.ip.type = ESP_IPADDR_TYPE_V4;
-    esp_netif_set_dns_info(s_sta_netif, ESP_NETIF_DNS_MAIN, &fb1);
-    esp_netif_set_dns_info(s_sta_netif, ESP_NETIF_DNS_BACKUP, &fb2);
-    ESP_LOGW(TAG, "no DNS server configured, using public fallback " IPSTR " / " IPSTR,
-             IP2STR(&fb1.ip.u_addr.ip4), IP2STR(&fb2.ip.u_addr.ip4));
+    if (!have_main) {
+        esp_netif_set_dns_info(s_sta_netif, ESP_NETIF_DNS_MAIN, &fb1);
+        esp_netif_set_dns_info(s_sta_netif, ESP_NETIF_DNS_BACKUP, &fb2);
+        ESP_LOGW(TAG, "no DNS server configured, using public fallback " IPSTR " / " IPSTR,
+                 IP2STR(&fb1.ip.u_addr.ip4), IP2STR(&fb2.ip.u_addr.ip4));
+    } else {
+        esp_netif_dns_info_t *fill =
+            (main_dns.ip.u_addr.ip4.addr == fb1.ip.u_addr.ip4.addr) ? &fb2 : &fb1;
+        esp_netif_set_dns_info(s_sta_netif, ESP_NETIF_DNS_BACKUP, fill);
+        ESP_LOGW(TAG, "no backup DNS server, adding public fallback " IPSTR,
+                 IP2STR(&fill->ip.u_addr.ip4));
+    }
 }
 
 static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data)
