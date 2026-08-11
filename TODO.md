@@ -358,3 +358,24 @@
 ### 本轮构建验证
 - `idf.py clean && idf.py build`（IDF v6.0.2）：**0 warning / 0 error**；
   `esp32c3-ir-web.bin` 0x12a560 字节，app 分区 70% 空闲。
+
+---
+
+## 🔧 第 5 轮修复记录（wsorigin 三问题）
+
+> 复审查出 3 个问题，全部已修复并增量构建验证（0 warning / 0 error）。
+
+### 1. wsorigin JSON 序列化未转义 → 已修复
+- `app_web_rpc.c` 读回响应改用 **cJSON 构建**（`{"origin":...}` 自动转义），
+  任意字符都不可能破坏 JSON；
+- `web_origin_set` 增加 **`"`/`\` 字符校验**（拒绝写入，返回 `origin contains invalid char`）；
+- 前端 `saveWsOrigin` 正则补尾部锚点：`/^https?:\/\/[^\s"'\\/]+$/i`。
+
+### 2. wsorigin 未加入 MQTT 命令黑名单 → 已修复
+- `app_mqtt.c` 黑名单追加 `wsorigin`（与 authcfg/wificfg/webcfg/mqttcfg/logout 同级），
+  MQTT 客户端无法再篡改 Origin 白名单锁死 Web UI；
+- 前端 MQTT 设置卡说明 + README 命令表/安全章节同步补 `wsorigin`。
+
+### 3. web_origin_allowed 每次连接读 NVS → 已修复
+- `app_web.c` 增加 RAM 缓存 `s_ws_origin[]` + `s_ws_origin_loaded`（三态，仿 `s_web_ui`），
+  首次使用时加载一次，`web_origin_set` 成功后同步更新；每连接握手不再触碰闪存。

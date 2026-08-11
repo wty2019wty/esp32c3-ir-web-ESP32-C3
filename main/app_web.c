@@ -66,6 +66,9 @@ esp_err_t web_ui_enabled_set(bool enabled, const char **err)
  * this must stay an opt-in allow-list rather than a hard check. */
 #define WEB_ORIGIN_MAX 256
 
+static char s_ws_origin[WEB_ORIGIN_MAX];
+static int s_ws_origin_loaded = 0; /* 0 = not loaded yet, 1 = cached */
+
 char *web_origin_get(void)
 {
     char *buf = malloc(WEB_ORIGIN_MAX);
@@ -93,6 +96,12 @@ esp_err_t web_origin_set(const char *origin, const char **err)
         if (err) *err = "origin too long";
         return ESP_ERR_INVALID_ARG;
     }
+    for (const char *p = origin; *p; p++) {
+        if (*p == '"' || *p == '\\') {
+            if (err) *err = "origin contains invalid char";
+            return ESP_ERR_INVALID_ARG;
+        }
+    }
     nvs_handle_t h;
     if (nvs_open(WEB_NS, NVS_READWRITE, &h) != ESP_OK) {
         if (err) *err = "nvs open failed";
@@ -105,25 +114,35 @@ esp_err_t web_origin_set(const char *origin, const char **err)
     nvs_close(h);
     if (e != ESP_OK && err) {
         *err = "nvs write failed";
+    } else if (e == ESP_OK) {
+        strlcpy(s_ws_origin, origin, sizeof(s_ws_origin));
+        s_ws_origin_loaded = 1;
     }
     return e;
 }
 
 /* Match a WS handshake Origin header against the allow-list. Empty config (the
- * default) accepts every origin. On config read failure we fail OPEN so an OOM
- * can never lock legitimate clients out of the device. */
+ * default) accepts every origin. The allow-list is cached in RAM (refreshed on
+ * set) so per-connection checks never touch flash. On cache load failure we
+ * fail OPEN so an OOM can never lock legitimate clients out of the device. */
 bool web_origin_allowed(const char *origin)
 {
     if (!origin || origin[0] == '\0') {
         return true;
     }
-    char *allowed = web_origin_get();
-    if (!allowed) {
-        return true;
+    if (!s_ws_origin_loaded) {
+        nvs_handle_t h;
+        if (nvs_open(WEB_NS, NVS_READONLY, &h) == ESP_OK) {
+            size_t len = sizeof(s_ws_origin);
+            s_ws_origin[0] = '\0';
+            if (nvs_get_str(h, WEB_KEY_WS_ORIGIN, s_ws_origin, &len) != ESP_OK) {
+                s_ws_origin[0] = '\0';
+            }
+            nvs_close(h);
+        }
+        s_ws_origin_loaded = 1;
     }
-    bool ok = allowed[0] == '\0' || strcmp(allowed, origin) == 0;
-    free(allowed);
-    return ok;
+    return s_ws_origin[0] == '\0' || strcmp(s_ws_origin, origin) == 0;
 }
 
 /* Embedded web UI (main/web/index.html via EMBED_TXTFILES) */

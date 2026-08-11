@@ -266,15 +266,15 @@ char *web_rpc_exec(const char *cmd, cJSON *body, const char **err)
             *err = "read failed";
             return NULL;
         }
-        size_t cap = strlen(o) + 32;
-        char *out = malloc(cap);
-        if (out) {
-            snprintf(out, cap, "{\"origin\":\"%s\"}", o);
-        } else {
+        cJSON *out = cJSON_CreateObject();
+        if (!out) {
+            free(o);
             *err = "out of memory";
+            return NULL;
         }
+        cJSON_AddStringToObject(out, "origin", o);
         free(o);
-        return out;
+        return cJSON_PrintUnformatted(out); /* freed by caller */
     }
 
     if (strcmp(cmd, "logout") == 0) {

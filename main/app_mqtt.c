@@ -532,7 +532,7 @@ static void mqtt_dispatch(const char *cmd, const char *id, cJSON *body)
 static bool mqtt_cmd_allowed(const char *cmd)
 {
     static const char *const blocked[] = {
-        "authcfg", "wificfg", "webcfg", "mqttcfg", "logout"
+        "authcfg", "wificfg", "webcfg", "mqttcfg", "wsorigin", "logout"
     };
     if (!cmd) {
         return true; /* missing cmd: let the dispatcher report "missing cmd" */
