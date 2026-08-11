@@ -59,29 +59,6 @@ static void format_ipv4(uint32_t ip, char *buf, size_t len)
              (unsigned)(ip >> 16) & 0xFF, (unsigned)(ip >> 24) & 0xFF);
 }
 
-static void restart_cb(void *arg)
-{
-    (void)arg;
-    ESP_LOGW(TAG, "Restarting to apply WiFi config...");
-    esp_restart();
-}
-
-static void schedule_restart(void)
-{
-    /* restart 2s later so the HTTP response is flushed first */
-    static esp_timer_handle_t t = NULL;
-    if (!t) {
-        const esp_timer_create_args_t args = {
-            .callback = restart_cb,
-            .name = "restart",
-        };
-        esp_timer_create(&args, &t);
-    }
-    if (t) {
-        esp_timer_start_once(t, 2 * 1000 * 1000);
-    }
-}
-
 /* Shared WiFi configuration cores, invoked by the WebSocket RPC dispatcher
  * (app_web_rpc.c). The REST API has been removed — all control now happens
  * over the /api/ws command channel. */
@@ -131,6 +108,10 @@ esp_err_t web_wificfg_set(cJSON *root, const char **err)
     cJSON *j = NULL;
     j = cJSON_GetObjectItem(root, "ap_ssid");
     if (cJSON_IsString(j)) {
+        if (strlen(j->valuestring) >= sizeof(cfg.ap_ssid)) {
+            *err = "ap_ssid too long";
+            return ESP_ERR_INVALID_ARG;
+        }
         strlcpy(cfg.ap_ssid, j->valuestring, sizeof(cfg.ap_ssid));
     }
     j = cJSON_GetObjectItem(root, "ap_password");
@@ -144,12 +125,20 @@ esp_err_t web_wificfg_set(cJSON *root, const char **err)
     /* null or absent: keep current password */
     j = cJSON_GetObjectItem(root, "sta_ssid");
     if (cJSON_IsString(j)) {
+        if (strlen(j->valuestring) >= sizeof(cfg.sta_ssid)) {
+            *err = "sta_ssid too long";
+            return ESP_ERR_INVALID_ARG;
+        }
         strlcpy(cfg.sta_ssid, j->valuestring, sizeof(cfg.sta_ssid));
     }
     j = cJSON_GetObjectItem(root, "sta_password");
     if (cJSON_IsString(j)) {
         if (strlen(j->valuestring) >= sizeof(cfg.sta_password)) {
             *err = "sta_password too long";
+            return ESP_ERR_INVALID_ARG;
+        }
+        if (j->valuestring[0] != '\0' && strlen(j->valuestring) < 8) {
+            *err = "sta_password needs >=8 chars or empty";
             return ESP_ERR_INVALID_ARG;
         }
         strlcpy(cfg.sta_password, j->valuestring, sizeof(cfg.sta_password));
@@ -159,23 +148,42 @@ esp_err_t web_wificfg_set(cJSON *root, const char **err)
     if (cJSON_IsBool(j)) {
         cfg.sta_dhcp = cJSON_IsTrue(j);
     }
-    /* static IP fields (only used when sta_dhcp=false) */
+    /* static IP fields (only used when sta_dhcp=false). A malformed value must
+     * be reported, not silently ignored, or the save would "succeed" while the
+     * device keeps the old address and the user only notices after reboot.
+     * An empty string is allowed and clears the field (DHCP/gateway unset). */
     uint32_t tmp;
     j = cJSON_GetObjectItem(root, "sta_ip");
-    if (cJSON_IsString(j) && parse_ipv4(j->valuestring, &tmp)) {
-        cfg.sta_ip = tmp;
+    if (cJSON_IsString(j)) {
+        if (j->valuestring[0] != '\0' && !parse_ipv4(j->valuestring, &tmp)) {
+            *err = "invalid sta_ip";
+            return ESP_ERR_INVALID_ARG;
+        }
+        cfg.sta_ip = j->valuestring[0] != '\0' ? tmp : 0;
     }
     j = cJSON_GetObjectItem(root, "sta_gw");
-    if (cJSON_IsString(j) && parse_ipv4(j->valuestring, &tmp)) {
-        cfg.sta_gw = tmp;
+    if (cJSON_IsString(j)) {
+        if (j->valuestring[0] != '\0' && !parse_ipv4(j->valuestring, &tmp)) {
+            *err = "invalid sta_gw";
+            return ESP_ERR_INVALID_ARG;
+        }
+        cfg.sta_gw = j->valuestring[0] != '\0' ? tmp : 0;
     }
     j = cJSON_GetObjectItem(root, "sta_mask");
-    if (cJSON_IsString(j) && parse_ipv4(j->valuestring, &tmp)) {
-        cfg.sta_mask = tmp;
+    if (cJSON_IsString(j)) {
+        if (j->valuestring[0] != '\0' && !parse_ipv4(j->valuestring, &tmp)) {
+            *err = "invalid sta_mask";
+            return ESP_ERR_INVALID_ARG;
+        }
+        cfg.sta_mask = j->valuestring[0] != '\0' ? tmp : 0;
     }
     j = cJSON_GetObjectItem(root, "sta_dns");
-    if (cJSON_IsString(j) && parse_ipv4(j->valuestring, &tmp)) {
-        cfg.sta_dns = tmp;
+    if (cJSON_IsString(j)) {
+        if (j->valuestring[0] != '\0' && !parse_ipv4(j->valuestring, &tmp)) {
+            *err = "invalid sta_dns";
+            return ESP_ERR_INVALID_ARG;
+        }
+        cfg.sta_dns = j->valuestring[0] != '\0' ? tmp : 0;
     }
 
     /* validation */
@@ -198,6 +206,6 @@ esp_err_t web_wificfg_set(cJSON *root, const char **err)
         return ret;
     }
 
-    schedule_restart();
+    web_schedule_restart();
     return ESP_OK;
 }

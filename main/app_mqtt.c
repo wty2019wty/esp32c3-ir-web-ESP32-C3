@@ -69,8 +69,10 @@ static volatile bool s_connected = false;
 
 /* Runtime settings resolved from NVS (menuconfig provides defaults).
  * With the per-device topic suffix enabled the effective topics embed the
- * Client ID, so they can exceed the base topic length. */
-#define MQTT_TOPIC_EFF_LEN 160
+ * Client ID, so they can exceed the base topic length. 256 comfortably covers
+ * the worst case (63-char base topic + 63-char Client ID + separator); the
+ * save path additionally rejects configurations that would not fit. */
+#define MQTT_TOPIC_EFF_LEN 256
 static char s_topic_cmd[MQTT_TOPIC_EFF_LEN];
 static char s_topic_rsp[MQTT_TOPIC_EFF_LEN];
 static char s_topic_status[MQTT_TOPIC_EFF_LEN];
@@ -197,31 +199,6 @@ esp_err_t mqtt_web_config_save(const mqtt_web_config_t *cfg)
 }
 
 /* ---------------- web RPC cores (shared with the WebSocket channel) ---------------- */
-
-static void mqtt_restart_cb(void *arg)
-{
-    (void)arg;
-    ESP_LOGW(TAG, "Restarting to apply MQTT config...");
-    esp_restart();
-}
-
-static void mqtt_schedule_restart(void)
-{
-    /* restart 2s later so the WS response is flushed first */
-    static esp_timer_handle_t t = NULL;
-    if (!t) {
-        const esp_timer_create_args_t args = {
-            .callback = mqtt_restart_cb,
-            .name = "mqtt_restart",
-        };
-        if (esp_timer_create(&args, &t) != ESP_OK) {
-            ESP_LOGE(TAG, "failed to create restart timer, restarting now");
-            esp_restart();
-            return;
-        }
-    }
-    esp_timer_start_once(t, 2 * 1000 * 1000);
-}
 
 static bool mqtt_topic_ok(const char *t)
 {
@@ -411,6 +388,22 @@ esp_err_t web_mqttcfg_set(cJSON *root, const char **err)
         *err = "client_id must not contain + # / when topic suffix is enabled";
         return ESP_ERR_INVALID_ARG;
     }
+    /* Effective topics embed the Client ID after the first path level, so with
+     * the suffix enabled the total length grows by strlen(client_id) + 1. Reject
+     * configurations that would overflow the runtime topic buffers instead of
+     * silently truncating (two devices could then collide on the same topic). */
+    if (cfg.topic_suffix) {
+        size_t suffix_len = strlen(cfg.client_id);
+        const char *const topics[] = {
+            cfg.topic_cmd, cfg.topic_rsp, cfg.topic_status, cfg.topic_frame
+        };
+        for (size_t i = 0; i < sizeof(topics) / sizeof(topics[0]); i++) {
+            if (strlen(topics[i]) + suffix_len + 1 >= MQTT_TOPIC_EFF_LEN) {
+                *err = "base topic + client id exceeds the topic length limit";
+                return ESP_ERR_INVALID_ARG;
+            }
+        }
+    }
 
     esp_err_t ret = mqtt_web_config_save(&cfg);
     if (ret != ESP_OK) {
@@ -418,12 +411,11 @@ esp_err_t web_mqttcfg_set(cJSON *root, const char **err)
         return ret;
     }
 
-    mqtt_schedule_restart();
+    web_schedule_restart();
     return ESP_OK;
 }
 
 /* ---------------- publish helpers ---------------- */
-
 /* Publish a heap/stack payload to a topic. Copies into the outbox
  * (store=true) so the caller may free the buffer right after this returns;
  * the actual network send happens inside the MQTT task. */
@@ -526,7 +518,33 @@ static void mqtt_dispatch(const char *cmd, const char *id, cJSON *body)
 
 /* Command topic payload: JSON {"id":"...","cmd":"...","body":{...}}.
  * A bare string payload is also accepted and treated as the command name
- * (e.g. "status"). The optional "id" is echoed back in the response. */
+ * (e.g. "status"). The optional "id" is echoed back in the response.
+ *
+ * Security: the MQTT command channel has no session (it cannot log in the way
+ * a WebSocket connection does), so by default it is restricted to operational
+ * read/act commands. Security-sensitive commands (changing WiFi/Web/account
+ * credentials, restart toggles, kicking sessions) are rejected. An optional
+ * "token" field may be supplied; when present it must be a valid Web session
+ * token or the command is rejected with "unauthorized". */
+
+/* Commands that change credentials / routing / auth state and are therefore
+ * rejected on the unauthenticated MQTT channel. */
+static bool mqtt_cmd_allowed(const char *cmd)
+{
+    static const char *const blocked[] = {
+        "authcfg", "wificfg", "webcfg", "mqttcfg", "logout"
+    };
+    if (!cmd) {
+        return true; /* missing cmd: let the dispatcher report "missing cmd" */
+    }
+    for (size_t i = 0; i < sizeof(blocked) / sizeof(blocked[0]); i++) {
+        if (strcmp(cmd, blocked[i]) == 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static void mqtt_handle_command(const char *payload, int len)
 {
     if (!payload || len <= 0) {
@@ -550,6 +568,20 @@ static void mqtt_handle_command(const char *payload, int len)
         if (cJSON_IsObject(jbody)) {
             body = jbody;
         }
+        /* Optional token: when present it must match the active Web session.
+         * When absent the whitelist below still gates dangerous commands, so
+         * omitting the token only enables the documented read/act commands. */
+        cJSON *jtoken = cJSON_GetObjectItem(root, "token");
+        if (cJSON_IsString(jtoken) && !web_auth_token_ok(jtoken->valuestring)) {
+            mqtt_respond(cmd, id, NULL, "unauthorized");
+            cJSON_Delete(root);
+            return;
+        }
+        if (!mqtt_cmd_allowed(cmd)) {
+            mqtt_respond(cmd, id, NULL, "command not allowed on MQTT");
+            cJSON_Delete(root);
+            return;
+        }
         mqtt_dispatch(cmd, id, body);
         cJSON_Delete(root);
         return;
@@ -562,7 +594,11 @@ static void mqtt_handle_command(const char *payload, int len)
     }
     memcpy(bare, payload, (size_t)len);
     bare[len] = '\0';
-    mqtt_dispatch(bare, NULL, NULL);
+    if (mqtt_cmd_allowed(bare)) {
+        mqtt_dispatch(bare, NULL, NULL);
+    } else {
+        mqtt_respond(bare, NULL, NULL, "command not allowed on MQTT");
+    }
     free(bare);
 }
 

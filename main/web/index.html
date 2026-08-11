@@ -155,7 +155,7 @@
   <h2>手动回放</h2>
   <div style="font-size:12px; color:#8a93a3; margin-bottom:8px;">NEC hxd（8 位十六进制，LSB 顺序）</div>
   <div class="row">
-    <input type="text" id="hxdInput" placeholder="ED127F80" maxlength="10">
+    <input type="text" id="hxdInput" placeholder="ED127F80" maxlength="8">
     <button onclick="playHxd()">回放</button>
   </div>
   <div style="font-size:12px; color:#8a93a3; margin:12px 0 8px;">原始数据（可带 Frequency 行 + 逗号分隔微秒序列）</div>
@@ -169,7 +169,7 @@
   <h2>历史记录 <span id="histCount" style="color:#8a93a3;font-weight:400;"></span></h2>
   <div class="hist-wrap">
     <table id="histTable">
-      <thead><tr><th>#</th><th>时间</th><th>类型</th><th>NEC hxd</th><th>段数</th></tr></thead>
+      <thead><tr><th>#</th><th title="开机以来经过的时间（非墙上时钟）">运行时间</th><th>类型</th><th>NEC hxd</th><th>段数</th></tr></thead>
       <tbody></tbody>
     </table>
   </div>
@@ -227,8 +227,10 @@
     <h2>MQTT 设置</h2>
     <div style="font-size:12px; color:#8a93a3; margin-bottom:10px;">
       保存后设备 2 秒后自动重启生效。MQTT 命令通道<b style="color:#ffd479;">不经过 Web 登录认证</b>，
-      请使用带账号密码的 Broker（或 TLS）。设备仅在<b style="color:#ffd479;">连接路由器（STA）</b>时
-      启动 MQTT；纯热点（SoftAP）模式下不连接。<br>
+      请使用带账号密码的 Broker（或 TLS）。出于安全考虑，MQTT 通道<b style="color:#ffd479;">禁用
+      账号/网络配置类命令</b>（authcfg / wificfg / webcfg / mqttcfg / logout），仅可执行读取与操作类
+      命令（status / play / carrier / rxpause / frames / renew）。设备仅在<b style="color:#ffd479;">连接
+      路由器（STA）</b>时启动 MQTT；纯热点（SoftAP）模式下不连接。<br>
       Broker 地址支持 <span class="mono">mqtt://</span>（TCP）、
       <span class="mono">mqtts://</span>（TLS）、
       <span class="mono">ws://</span>（MQTT over WebSocket）、
@@ -262,10 +264,14 @@
         <option value="5">MQTT 5.0</option>
       </select>
       <label>TLS 证书校验</label>
-      <select id="cfgMqttTls">
+      <select id="cfgMqttTls" onchange="updateTlsSkipWarn()">
         <option value="bundle" selected>内置证书包校验（推荐，公共 CA）</option>
         <option value="skip">跳过校验（自签名 / 内网 CA）</option>
       </select>
+      <div id="tlsSkipWarn" style="display:none; grid-column:1 / -1; margin-top:4px; padding:8px 10px; background:#3a1d1d; border:1px solid #7a3b3b; color:#ff9d9d; font-size:12px; border-radius:6px;">
+        ⚠️ 跳过校验将<strong>不验证服务器证书</strong>，连接可被中间人窃听或篡改（MITM）。
+        仅应在内网自签名证书 / 私有 CA、且网络路径可信时使用；公网或不可信网络请改回"内置证书包校验"。
+      </div>
       <label>命令主题</label>
       <input type="text" id="cfgMqttTopicCmd" maxlength="63" placeholder="ir-web/cmd">
       <label>响应主题</label>
@@ -319,6 +325,20 @@
     <div class="row" style="margin-top:12px;">
       <button onclick="saveWebUi()">保存并重启</button>
       <span id="webUiStatus"></span>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>WebSocket 安全</h2>
+    <div style="font-size:12px; color:#8a93a3; margin-bottom:10px;">
+      限制允许连接 <span class="mono">/api/ws</span> 的页面来源（Origin 白名单）。
+      <b style="color:#ffd479;">留空 = 允许任意来源</b>（默认：页面由设备自身托管，或前后端分离时由外部站点托管）。
+      填写后仅该来源的页面可连接，可阻止恶意网页向设备发起跨站 WebSocket 连接。保存后立即生效。
+    </div>
+    <div class="row">
+      <input type="text" id="cfgWsOrigin" maxlength="255" placeholder="留空 = 允许任意来源，如 https://ir.example.com" style="flex:1;min-width:0;" autocomplete="off">
+      <button onclick="saveWsOrigin()">保存</button>
+      <span id="wsOriginStatus"></span>
     </div>
   </div>
 
@@ -1000,6 +1020,7 @@ function showTab(t) {
   if (t === 'set') {
     loadWifiCfg();
     loadMqttCfg();
+    loadWsOrigin();
   }
 }
 
@@ -1058,6 +1079,10 @@ async function saveWifiCfg() {
     return;
   }
   const staPwd = $('cfgStaPwd').value;
+  if (staPwd !== '' && staPwd.length < 8) {
+    $('cfgStatus').textContent = '连接 WiFi 密码需 ≥8 位，或留空不修改';
+    return;
+  }
   if (staPwd !== '' && staPwd.length > 63) {
     $('cfgStatus').textContent = '连接 WiFi 密码过长';
     return;
@@ -1096,6 +1121,11 @@ async function saveWifiCfg() {
 
 /* ---------------- MQTT settings ---------------- */
 
+function updateTlsSkipWarn() {
+  const skip = $('cfgMqttTls').value === 'skip';
+  $('tlsSkipWarn').style.display = skip ? 'block' : 'none';
+}
+
 async function loadMqttCfg() {
   $('cfgMqttStatus').textContent = '';
   try {
@@ -1110,6 +1140,7 @@ async function loadMqttCfg() {
     $('cfgMqttClientId').value = c.client_id;
     $('cfgMqttProtocol').value = c.protocol === '5' ? '5' : '311';
     $('cfgMqttTls').value = c.tls_verify === 'skip' ? 'skip' : 'bundle';
+    updateTlsSkipWarn();
     $('cfgMqttTopicCmd').value = c.topic_cmd;
     $('cfgMqttTopicRsp').value = c.topic_rsp;
     $('cfgMqttTopicStatus').value = c.topic_status;
@@ -1133,6 +1164,10 @@ async function saveMqttCfg() {
   }
   if (topics.some(t => /[+#]/.test(t))) {
     $('cfgMqttStatus').textContent = '主题不能包含通配符 + 或 #';
+    return;
+  }
+  if ($('cfgMqttTls').value === 'skip' &&
+      !confirm('跳过 TLS 证书校验将不验证服务器身份，连接可能被中间人监听/篡改。\n\n确定仍要启用吗？')) {
     return;
   }
   const pwd = $('cfgMqttPwd').value;
@@ -1170,6 +1205,34 @@ async function saveMqttCfg() {
 }
 
 /* ---------------- auth settings ---------------- */
+
+/* WebSocket Origin allow-list (empty = allow every origin, the default). */
+async function loadWsOrigin() {
+  $('wsOriginStatus').textContent = '';
+  try {
+    const d = await rpc('wsorigin');
+    $('cfgWsOrigin').value = d.origin || '';
+  } catch (e) {
+    /* older firmware: leave the field empty */
+  }
+}
+
+async function saveWsOrigin() {
+  $('wsOriginStatus').textContent = '';
+  const v = $('cfgWsOrigin').value.trim();
+  if (v !== '' && !/^https?:\/\//i.test(v)) {
+    $('wsOriginStatus').textContent = 'Origin 需为 http(s):// 完整地址，或留空表示允许任意来源';
+    return;
+  }
+  try {
+    const d = await rpc('wsorigin', { origin: v });
+    if (d.ok) {
+      $('wsOriginStatus').textContent = v ? '已保存' : '已保存（允许任意来源）';
+    }
+  } catch (e) {
+    $('wsOriginStatus').textContent = '保存失败：' + ((e.payload && e.payload.error) || e.message || '请求失败');
+  }
+}
 
 async function saveWebUi() {
   $('webUiStatus').textContent = '';

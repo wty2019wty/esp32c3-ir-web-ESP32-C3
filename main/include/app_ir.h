@@ -14,6 +14,7 @@ typedef struct {
     bool valid;
     uint32_t seq;            /* frame sequence number */
     uint32_t timestamp_ms;   /* uptime in ms */
+    uint32_t capture_freq_hz;/* carrier frequency (Hz) at capture time */
 
     /* raw signal features */
     uint32_t seg_count;      /* number of alternating segments */

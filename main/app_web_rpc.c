@@ -249,6 +249,34 @@ char *web_rpc_exec(const char *cmd, cJSON *body, const char **err)
         return strdup(buf);
     }
 
+    if (strcmp(cmd, "wsorigin") == 0) {
+        /* {"origin":"https://ir.example.com"} = restrict WS to one origin;
+         * {"origin":null} or absent = allow all origins (default). */
+        cJSON *j = cJSON_GetObjectItem(body, "origin");
+        if (j && (cJSON_IsString(j) || cJSON_IsNull(j))) {
+            const char *e = NULL;
+            const char *origin = cJSON_IsString(j) ? j->valuestring : NULL;
+            if (web_origin_set(origin, &e) != ESP_OK) {
+                *err = e ? e : "invalid";
+                return NULL;
+            }
+        }
+        char *o = web_origin_get();
+        if (!o) {
+            *err = "read failed";
+            return NULL;
+        }
+        size_t cap = strlen(o) + 32;
+        char *out = malloc(cap);
+        if (out) {
+            snprintf(out, cap, "{\"origin\":\"%s\"}", o);
+        } else {
+            *err = "out of memory";
+        }
+        free(o);
+        return out;
+    }
+
     if (strcmp(cmd, "logout") == 0) {
         web_auth_invalidate();
         return strdup("{}");

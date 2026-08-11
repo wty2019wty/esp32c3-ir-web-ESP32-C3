@@ -5,7 +5,6 @@
 #include "app_wifi.h"
 #include "esp_http_server.h"
 #include "esp_log.h"
-#include "esp_timer.h"
 #include "esp_system.h"
 #include "nvs_flash.h"
 #include "nvs.h"
@@ -18,31 +17,10 @@
  * /api/ws endpoint stays active (front/back separation). Persisted in NVS. */
 #define WEB_NS            "ir_tool"
 #define WEB_KEY_UI_ENABLED "web_ui_enabled"
+#define WEB_KEY_WS_ORIGIN  "ws_origin"
 
 static httpd_handle_t s_server = NULL;
 static int s_web_ui = -1; /* tri-state cache (-1 = not loaded yet) */
-
-static void web_restart_cb(void *arg)
-{
-    (void)arg;
-    ESP_LOGW(TAG, "Restarting to apply web config...");
-    esp_restart();
-}
-
-static void schedule_restart(void)
-{
-    static esp_timer_handle_t t = NULL;
-    if (!t) {
-        const esp_timer_create_args_t args = {
-            .callback = web_restart_cb,
-            .name = "web_restart",
-        };
-        esp_timer_create(&args, &t);
-    }
-    if (t) {
-        esp_timer_start_once(t, 2 * 1000 * 1000);
-    }
-}
 
 /* true = serve the embedded web page; false = WS endpoint only. */
 bool web_ui_enabled_get(void)
@@ -78,8 +56,74 @@ esp_err_t web_ui_enabled_set(bool enabled, const char **err)
         return e;
     }
     s_web_ui = enabled ? 1 : 0;
-    schedule_restart();
+    web_schedule_restart();
     return ESP_OK;
+}
+
+/* Allowed WebSocket Origin for /api/ws (empty = allow all origins).
+ * Persisted in NVS; the embedded page is same-origin by default, and the
+ * front/back separation feature serves the page from an external host, so
+ * this must stay an opt-in allow-list rather than a hard check. */
+#define WEB_ORIGIN_MAX 256
+
+char *web_origin_get(void)
+{
+    char *buf = malloc(WEB_ORIGIN_MAX);
+    if (!buf) {
+        return NULL;
+    }
+    buf[0] = '\0';
+    nvs_handle_t h;
+    if (nvs_open(WEB_NS, NVS_READONLY, &h) == ESP_OK) {
+        size_t len = WEB_ORIGIN_MAX;
+        if (nvs_get_str(h, WEB_KEY_WS_ORIGIN, buf, &len) != ESP_OK) {
+            buf[0] = '\0';
+        }
+        nvs_close(h);
+    }
+    return buf;
+}
+
+esp_err_t web_origin_set(const char *origin, const char **err)
+{
+    if (!origin) {
+        origin = ""; /* allow all */
+    }
+    if (strlen(origin) >= WEB_ORIGIN_MAX) {
+        if (err) *err = "origin too long";
+        return ESP_ERR_INVALID_ARG;
+    }
+    nvs_handle_t h;
+    if (nvs_open(WEB_NS, NVS_READWRITE, &h) != ESP_OK) {
+        if (err) *err = "nvs open failed";
+        return ESP_FAIL;
+    }
+    esp_err_t e = nvs_set_str(h, WEB_KEY_WS_ORIGIN, origin);
+    if (e == ESP_OK) {
+        e = nvs_commit(h);
+    }
+    nvs_close(h);
+    if (e != ESP_OK && err) {
+        *err = "nvs write failed";
+    }
+    return e;
+}
+
+/* Match a WS handshake Origin header against the allow-list. Empty config (the
+ * default) accepts every origin. On config read failure we fail OPEN so an OOM
+ * can never lock legitimate clients out of the device. */
+bool web_origin_allowed(const char *origin)
+{
+    if (!origin || origin[0] == '\0') {
+        return true;
+    }
+    char *allowed = web_origin_get();
+    if (!allowed) {
+        return true;
+    }
+    bool ok = allowed[0] == '\0' || strcmp(allowed, origin) == 0;
+    free(allowed);
+    return ok;
 }
 
 /* Embedded web UI (main/web/index.html via EMBED_TXTFILES) */
