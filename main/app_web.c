@@ -121,6 +121,35 @@ esp_err_t web_origin_set(const char *origin, const char **err)
     return e;
 }
 
+/* Load the allow-list from NVS into the RAM cache once. On load failure we
+ * leave the cache empty and mark it loaded so a one-off NVS fault can never
+ * lock legitimate clients out of the device. */
+static void web_origin_load_cache(void)
+{
+    if (s_ws_origin_loaded) {
+        return;
+    }
+    nvs_handle_t h;
+    if (nvs_open(WEB_NS, NVS_READONLY, &h) == ESP_OK) {
+        size_t len = sizeof(s_ws_origin);
+        s_ws_origin[0] = '\0';
+        if (nvs_get_str(h, WEB_KEY_WS_ORIGIN, s_ws_origin, &len) != ESP_OK) {
+            s_ws_origin[0] = '\0';
+        }
+        nvs_close(h);
+    }
+    s_ws_origin_loaded = 1;
+}
+
+/* True when a restrictive allow-list is configured (non-empty). Used to fail
+ * closed: when the handshake Origin header cannot be read, a configured
+ * allow-list must reject rather than silently accept. */
+bool web_origin_restricted(void)
+{
+    web_origin_load_cache();
+    return s_ws_origin[0] != '\0';
+}
+
 /* Origin equality, tolerant of the two ways a hand-typed allow-list entry can
  * differ from what a browser sends: a trailing slash (browsers never include
  * one in the Origin header, but users habitually type URLs with one) and case
@@ -169,18 +198,7 @@ bool web_origin_allowed(const char *origin)
     if (!origin || origin[0] == '\0') {
         return true;
     }
-    if (!s_ws_origin_loaded) {
-        nvs_handle_t h;
-        if (nvs_open(WEB_NS, NVS_READONLY, &h) == ESP_OK) {
-            size_t len = sizeof(s_ws_origin);
-            s_ws_origin[0] = '\0';
-            if (nvs_get_str(h, WEB_KEY_WS_ORIGIN, s_ws_origin, &len) != ESP_OK) {
-                s_ws_origin[0] = '\0';
-            }
-            nvs_close(h);
-        }
-        s_ws_origin_loaded = 1;
-    }
+    web_origin_load_cache();
     return s_ws_origin[0] == '\0' || origin_same(s_ws_origin, origin);
 }
 
