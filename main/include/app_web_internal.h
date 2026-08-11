@@ -50,6 +50,7 @@ esp_err_t web_ui_enabled_set(bool enabled, const char **err); /* saves to NVS + 
 char *web_origin_get(void);                           /* allowed WS origin, "" = allow all (caller frees) */
 esp_err_t web_origin_set(const char *origin, const char **err); /* NULL/"" = allow all origins */
 bool web_origin_allowed(const char *origin);          /* match a WS handshake Origin header */
+bool web_origin_restricted(void);                     /* true = a non-empty allow-list is configured */
 
 /* ---- app_web_rpc.c (shared REST/WebSocket command execution) ---- */
 /* Execute a command on a parsed JSON body and return the REST-equivalent

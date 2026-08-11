@@ -475,43 +475,53 @@ static bool ws_peer_ip(httpd_req_t *req, char *buf, size_t len)
     return true;
 }
 
+/* Origin allow-list check, run as the WS *pre-handshake* callback. This is the
+ * only point where esp_http_server still exposes the handshake headers: once
+ * the 101 response is sent the request aux is re-initialized for raw frame
+ * processing, so the per-frame ws_handler() can never read "Origin" again
+ * (httpd_req_get_hdr_value_* would find no headers -> olen == 0 -> the old
+ * in-handler check silently allowed every origin).
+ *
+ * Browsers always send an Origin header here; header-less clients (native
+ * apps/scripts) are accepted by design — see web_origin_allowed(). When an
+ * allow-list is configured and the header cannot be read (oversized/unparsable)
+ * we fail closed: an unverifiable origin must not slip past the list.
+ */
+#if CONFIG_HTTPD_WS_PRE_HANDSHAKE_CB_SUPPORT
+static esp_err_t ws_pre_handshake_cb(httpd_req_t *req)
+{
+    size_t olen = httpd_req_get_hdr_value_len(req, "Origin");
+    if (olen == 0) {
+        return ESP_OK; /* no Origin header: no cross-site browser authority to defend */
+    }
+    char origin[256];
+    size_t want = olen < sizeof(origin) - 1 ? olen : sizeof(origin) - 1;
+    if (httpd_req_get_hdr_value_str(req, "Origin", origin, want + 1) != ESP_OK) {
+        if (web_origin_restricted()) {
+            ESP_LOGW(TAG, "ws: unreadable Origin header rejected (allow-list active)");
+            httpd_resp_send_err(req, HTTPD_403_FORBIDDEN, "origin not allowed");
+            return ESP_FAIL;
+        }
+        return ESP_OK;
+    }
+    if (!web_origin_allowed(origin)) {
+        ESP_LOGW(TAG, "ws: origin \"%s\" rejected", origin);
+        /* Reject before the 101 handshake, so the client receives a clean
+         * HTTP 403 and the connection is never upgraded. */
+        httpd_resp_send_err(req, HTTPD_403_FORBIDDEN, "origin not allowed");
+        return ESP_FAIL;
+    }
+    return ESP_OK;
+}
+#endif /* CONFIG_HTTPD_WS_PRE_HANDSHAKE_CB_SUPPORT */
+
 static esp_err_t ws_handler(httpd_req_t *req)
 {
     int fd = httpd_req_to_sockfd(req);
     httpd_ws_frame_t frame = {0};
 
-    /* Origin check (handshake only — no Origin header on subsequent frames).
-     * Configurable allow-list; empty (default) accepts every origin because the
-     * front/back separation feature serves the page from an external host.
-     * Browsers always send an Origin header here; header-less clients (native
-     * apps/scripts) are accepted by design — see web_origin_allowed(). */
-    size_t olen = httpd_req_get_hdr_value_len(req, "Origin");
-    if (olen > 0) {
-        char origin[256];
-        size_t want = olen < sizeof(origin) - 1 ? olen : sizeof(origin) - 1;
-        if (httpd_req_get_hdr_value_str(req, "Origin", origin, want + 1) == ESP_OK) {
-            if (!web_origin_allowed(origin)) {
-                ESP_LOGW(TAG, "ws: origin \"%s\" rejected", origin);
-                /* esp_http_server sends the 101 handshake before invoking the
-                 * handler, so an HTTP 403 here would be written as plain HTTP
-                 * bytes onto the upgraded socket. Send a proper WebSocket close
-                 * frame (1008 policy violation, RFC 6455 §7.4.1) instead. */
-                uint8_t close_payload[2 + sizeof("forbidden") - 1];
-                close_payload[0] = (uint8_t)(1008 >> 8);
-                close_payload[1] = (uint8_t)(1008 & 0xFF);
-                memcpy(close_payload + 2, "forbidden", sizeof("forbidden") - 1);
-                httpd_ws_frame_t cf = {
-                    .final = true,
-                    .fragmented = false,
-                    .type = HTTPD_WS_TYPE_CLOSE,
-                    .payload = close_payload,
-                    .len = sizeof(close_payload),
-                };
-                httpd_ws_send_frame(req, &cf);
-                return ESP_FAIL; /* server drops the connection */
-            }
-        }
-    }
+    /* Origin validation happens in ws_pre_handshake_cb() (before the 101), not
+     * here: after the upgrade this handler runs with no handshake headers. */
 
     esp_err_t err = httpd_ws_recv_frame(req, &frame, 0);
     if (err != ESP_OK) {
@@ -702,6 +712,9 @@ esp_err_t web_ws_register(httpd_handle_t server)
         .handler = ws_handler,
         .is_websocket = true,
         .handle_ws_control_frames = true,
+#if CONFIG_HTTPD_WS_PRE_HANDSHAKE_CB_SUPPORT
+        .ws_pre_handshake_cb = ws_pre_handshake_cb,
+#endif
     };
     return httpd_register_uri_handler(server, &ws_uri);
 }
