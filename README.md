@@ -416,8 +416,7 @@ c.loop_forever()
   Broker 的账号密码/TLS；请勿在公网匿名 Broker 上暴露命令主题。出于安全考虑，MQTT 通道
   **禁用账号/网络配置类命令**（`authcfg` / `wificfg` / `webcfg` / `mqttcfg` / `wsorigin` / `logout`，
   回复 `error:"command not allowed on MQTT"`），仅可执行读取与操作类命令
-  （`status` / `play` / `carrier` / `rxpause` / `frames` / `renew`）；命令信封可附带
-  可选 `token` 字段，填写时必须是当前有效的 Web 会话 token，否则命令被拒（`unauthorized`）。
+  （`status` / `play` / `carrier` / `rxpause` / `frames` / `renew`）。
 
 ### 前后端分离
 

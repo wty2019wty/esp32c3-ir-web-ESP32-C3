@@ -521,11 +521,9 @@ static void mqtt_dispatch(const char *cmd, const char *id, cJSON *body)
  * (e.g. "status"). The optional "id" is echoed back in the response.
  *
  * Security: the MQTT command channel has no session (it cannot log in the way
- * a WebSocket connection does), so by default it is restricted to operational
- * read/act commands. Security-sensitive commands (changing WiFi/Web/account
- * credentials, restart toggles, kicking sessions) are rejected. An optional
- * "token" field may be supplied; when present it must be a valid Web session
- * token or the command is rejected with "unauthorized". */
+ * a WebSocket connection does), so it is restricted to operational read/act
+ * commands. Security-sensitive commands (changing WiFi/Web/account credentials,
+ * the WS origin allow-list, restart toggles, kicking sessions) are rejected. */
 
 /* Commands that change credentials / routing / auth state and are therefore
  * rejected on the unauthenticated MQTT channel. */
@@ -567,15 +565,6 @@ static void mqtt_handle_command(const char *payload, int len)
         cJSON *jbody = cJSON_GetObjectItem(root, "body");
         if (cJSON_IsObject(jbody)) {
             body = jbody;
-        }
-        /* Optional token: when present it must match the active Web session.
-         * When absent the whitelist below still gates dangerous commands, so
-         * omitting the token only enables the documented read/act commands. */
-        cJSON *jtoken = cJSON_GetObjectItem(root, "token");
-        if (cJSON_IsString(jtoken) && !web_auth_token_ok(jtoken->valuestring)) {
-            mqtt_respond(cmd, id, NULL, "unauthorized");
-            cJSON_Delete(root);
-            return;
         }
         if (!mqtt_cmd_allowed(cmd)) {
             mqtt_respond(cmd, id, NULL, "command not allowed on MQTT");

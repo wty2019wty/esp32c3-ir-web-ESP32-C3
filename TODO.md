@@ -275,10 +275,12 @@
 ### #1 MQTT 命令通道无认证（严重）→ 已修复
 - `app_mqtt.c`：`mqtt_handle_command` 增加**命令白名单**（`authcfg`/`wificfg`/
   `webcfg`/`mqttcfg`/`logout` 在 MQTT 通道返回 `command not allowed on MQTT`，
-  裸命令名路径同样拦截）+ **可选 `token` 校验**（携带时必须是当前有效 Web 会话
-  token，否则 `unauthorized`）。保留 `status/play/carrier/rxpause/frames/renew`
+  裸命令名路径同样拦截）。保留 `status/play/carrier/rxpause/frames/renew`
   等读取/操作类命令，**不破坏 README 已承诺的裸命令协议**。
 - 前端设置页 MQTT 卡片说明同步更新；README「安全」小节加粗提示并更新命令表。
+- 2026-08-11 第 5 轮复核：**移除**原"可选 `token` 字段"设计——白名单已堵死全部
+  敏感命令，token 只增加拒绝路径、从不解锁任何命令（冗余）；协议简化，README
+  安全章节同步删除 token 说明。
 
 ### #2 认证 JSON 注入（高）→ 已修复
 - `web_authcfg_get_json` 改用 **cJSON 构建**（任何用户名都能被正确转义）；
