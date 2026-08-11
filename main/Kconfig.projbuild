@@ -111,14 +111,15 @@ menu "IR Web Tool Configuration"
     menu "MQTT Client"
 
         config IR_TOOL_MQTT_ENABLE
-            bool "Enable MQTT client"
-            default y
+            bool "MQTT enabled by default (Web settings checkbox initial value)"
+            default n
             help
-                Enable the built-in MQTT client. The broker URI below still has
-                to be set for the client to connect; an empty URI disables MQTT
-                at runtime even with this option enabled. All values can also
-                be changed from the Web settings page (persisted in NVS and
-                taking priority over these defaults).
+                MQTT client code is always compiled in; this option only sets the
+                initial value of the "启用 MQTT" checkbox on the Web settings page.
+                The checkbox (and the broker URI below) controls the actual runtime
+                enable state, persisted in NVS and taking priority over this default.
+                The broker URI below still has to be set for the client to connect;
+                an empty URI disables MQTT at runtime regardless.
 
         config IR_TOOL_MQTT_BROKER_URI
             string "Broker URI (empty = MQTT disabled)"

@@ -215,12 +215,14 @@ idf.py menuconfig   # → "IR Web Tool Configuration"
 
 #### 1. 启用与配置
 
-默认值来自 menuconfig（或改 `sdkconfig.defaults` 后重新编译），也可以在
-**Web 设置页 → MQTT 设置**直接修改（保存后 2 秒自动重启，写入 NVS 并优先于默认值）：
+MQTT 客户端代码**始终编译在固件中**；menuconfig 的 `IR_TOOL_MQTT_ENABLE`（或
+`sdkconfig.defaults`）只决定 **Web 设置页"启用 MQTT"勾选框的初始值**（默认不勾选）。
+实际启用与否完全由 Web 设置页控制：勾选并填好 Broker 地址保存后，设备重启即连接
+（写入 NVS 并优先于 menuconfig 默认值）。默认值/各选项：
 
 | 配置项 | 默认值 | 说明 |
 |---|---|---|
-| 启用 MQTT | 开 | `IR_TOOL_MQTT_ENABLE` |
+| 启用 MQTT | 关 | `IR_TOOL_MQTT_ENABLE` 仅作 Web 勾选框默认值；代码始终编译 |
 | Broker 地址 | 空（= 禁用） | 支持 `mqtt://`、`mqtts://`、`ws://`、`wss://` |
 | 用户名 / 密码 | 空（匿名） | Broker 认证，密码只存不回显 |
 | 客户端 ID | 空（自动） | 留空按 MAC 生成 `ir-web-XXXXXX` |
@@ -282,6 +284,20 @@ MQTT 的 WebSocket 是设备**出站客户端连接**，与设备内置 `/api/ws
 
 也支持直接发送裸命令名（如 `status`）。
 
+**`fpub` 用法示例（运行时开关帧推送，无需重启）：**
+
+```json
+{"id":"p1","cmd":"fpub"}                            // 仅查询：返回当前状态
+{"id":"p2","cmd":"fpub","body":{}}                  // 同上，仅查询
+{"id":"p3","cmd":"fpub","body":{"enabled":true}}    // 开启帧推送
+{"id":"p4","cmd":"fpub","body":{"enabled":false}}   // 关闭帧推送
+fpub                                               // 裸命令名：仅查询
+```
+
+`fpub` 只改内存中的运行时常量、**不写 NVS**，断电/重启后恢复 Web 设置页保存的
+「推送帧」配置；同时不受 `qos`、`publish_status` 等其它设置影响。与 WebSocket 推送
+相互独立：该命令只控制 MQTT 帧推送，不影响 `/api/ws` 的帧推送。
+
 **支持的 `cmd`（发到 `ir-web/cmd`）：**
 
 | cmd | body | 说明 |
@@ -291,6 +307,7 @@ MQTT 的 WebSocket 是设备**出站客户端连接**，与设备内置 `/api/ws
 | `carrier` | `{"freq":38000}` | 设置载波频率并持久化 |
 | `rxpause` | `{"enabled":true}` | 回放时是否暂停接收 |
 | `frames` | `{"since":N}` | 增量拉取帧历史；超 48KB 返回 `"truncated":true`，按 `last_seq` 继续拉取 |
+| `fpub` | `{"enabled":true}` | **运行时**开关红外帧推送（不写 NVS，重启恢复保存的「推送帧」配置）；缺省 `enabled` 时仅返回当前状态 `{"publish_frames":true}` |
 | ~~`renew`~~ | 空 | **MQTT 通道禁用**（续期 Web 会话属会话敏感操作，MQTT 无会话故无用；仅 WebSocket 通道可执行） |
 | ~~`wificfg`~~ / ~~`authcfg`~~ / ~~`webcfg`~~ / ~~`mqttcfg`~~ / ~~`wsorigin`~~ / ~~`logout`~~ | — | **MQTT 通道禁用**（配置/凭据/会话敏感命令，回复 `command not allowed on MQTT`；仅 WebSocket 通道可执行） |
 
@@ -337,7 +354,8 @@ MQTT 的 WebSocket 是设备**出站客户端连接**，与设备内置 `/api/ws
 每捕获一帧红外信号立即发布一帧 JSON（与 WebSocket 推送的帧对象完全一致），
 **固定 QoS 0**、由独立发布任务直接同步发送（QoS 0 的发布在调用任务内完成，
 独立任务避免拖慢 IR 采集任务，尤其在 TLS broker 上），队列深度 4，
-积压时丢弃新帧并限频告警（每秒最多一条日志）：
+积压时丢弃新帧并限频告警（每秒最多一条日志）。运行时可用 `fpub` 命令随时
+开/关本推送（见上文命令表，不写 NVS）：
 
 ```json
 {

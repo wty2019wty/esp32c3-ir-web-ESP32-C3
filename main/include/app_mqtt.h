@@ -35,14 +35,15 @@ typedef struct {
  * Initialize the MQTT client.
  *
  * Loads the web-editable configuration from NVS (menuconfig values as
- * defaults), creates the esp-mqtt client and hooks it to the WiFi/IP events
+ * defaults — IR_TOOL_MQTT_ENABLE only sets the default of the Web "启用 MQTT"
+ * checkbox), creates the esp-mqtt client and hooks it to the WiFi/IP events
  * so it connects whenever the station interface is up and stops when it goes
  * down. In SoftAP-only mode the client is created but never started (no route
  * to the broker).
  * Must be called after nvs_flash_init() and wifi_init().
  *
- * Returns ESP_OK even when MQTT is disabled by menuconfig / the enabled flag
- * / an empty broker URI (the client is simply left inactive).
+ * Returns ESP_OK even when MQTT is disabled (enabled flag off / empty broker
+ * URI): the client is simply left inactive.
  */
 esp_err_t mqtt_init(void);
 
