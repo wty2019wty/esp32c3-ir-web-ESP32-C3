@@ -20,9 +20,13 @@
   input[type=text] { width: 220px; font-family: Consolas, monospace; }
   select { width: 220px; }
   button { background: #2f6fed; color: #fff; border: 0; border-radius: 6px; padding: 8px 14px;
-           font-size: 13px; cursor: pointer; }
-  button:hover { background: #3b7dff; }
+           font-size: 13px; cursor: pointer; -webkit-tap-highlight-color: transparent;
+           touch-action: manipulation; }
+  button:active { filter: brightness(0.85); }
   button:disabled { background: #3a3f4a; cursor: default; }
+  @media (hover: hover) and (pointer: fine) {
+    button:hover { background: #3b7dff; }
+  }
   textarea { width: 100%; background: #0f1115; color: #e8eaed; border: 1px solid #333a47;
              border-radius: 6px; padding: 8px; font-family: Consolas, monospace; font-size: 13px; }
   pre { background: #0f1115; border: 1px solid #2a2f3a; border-radius: 6px; padding: 10px;
@@ -32,7 +36,9 @@
   th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid #262b35; }
   th { color: #8a93a3; font-weight: 500; }
   tr.sel { background: #1d3a6e; }
-  tr:hover { background: #232936; cursor: pointer; }
+  @media (hover: hover) and (pointer: fine) {
+    tr:hover { background: #232936; cursor: pointer; }
+  }
   .mono { font-family: Consolas, monospace; }
   .badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 12px; margin-left: 6px; }
   .badge.ap { background: #1f5c2e; color: #7ee08a; }
@@ -64,16 +70,20 @@
   #pwdOverlay input { width: 100%; margin-bottom: 8px; box-sizing: border-box; }
   #reconnectBtn { margin-left: auto; }
   .connbtn { background: #3a3f4a; }
-  .connbtn:hover { background: #2f6fed; }
   #logoutBtn { background: #3a3f4a; }
-  #logoutBtn:hover { background: #5c1f1f; }
+  @media (hover: hover) and (pointer: fine) {
+    .connbtn:hover { background: #2f6fed; }
+    #logoutBtn:hover { background: #5c1f1f; }
+  }
   #footer { margin-top: 24px; padding-top: 16px; border-top: 1px solid #2a2f3a;
             font-size: 13px; color: #9aa3b3; text-align: center; line-height: 1.8; }
   #footer .footerlink { display: inline-block; background: #1a1d24; border: 1px solid #2f6fed;
             color: #a6c8ff; border-radius: 8px; padding: 8px 14px; margin: 4px;
             text-decoration: none; font-weight: 600; word-break: break-all; }
   #footer .footerlink svg { vertical-align: -3px; margin-right: 4px; }
-  #footer .footerlink:hover { background: #2f6fed; color: #fff; }
+  @media (hover: hover) and (pointer: fine) {
+    #footer .footerlink:hover { background: #2f6fed; color: #fff; }
+  }
 
   /* ---- mobile responsive ---- */
   @media (max-width: 640px) {
