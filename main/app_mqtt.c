@@ -284,6 +284,12 @@ char *web_mqttcfg_get_json(void)
     cJSON_AddStringToObject(root, "topic_frame", cfg.topic_frame);
     cJSON_AddNumberToObject(root, "qos", cfg.qos);
     cJSON_AddBoolToObject(root, "publish_frames", cfg.publish_frames);
+    /* The MQTT "fpub" command can override "publish_frames" at runtime (memory
+     * only, until reboot). Report that live value separately so the web UI can
+     * show the effective state instead of diverging from actual behavior. */
+    if (s_client) {
+        cJSON_AddBoolToObject(root, "publish_frames_runtime", s_publish_frames);
+    }
     cJSON_AddBoolToObject(root, "publish_status", cfg.publish_status);
 
     char *s = cJSON_PrintUnformatted(root);
