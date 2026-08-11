@@ -274,9 +274,11 @@
 
 ### #1 MQTT 命令通道无认证（严重）→ 已修复
 - `app_mqtt.c`：`mqtt_handle_command` 增加**命令白名单**（`authcfg`/`wificfg`/
-  `webcfg`/`mqttcfg`/`logout` 在 MQTT 通道返回 `command not allowed on MQTT`，
-  裸命令名路径同样拦截）。保留 `status/play/carrier/rxpause/frames/renew`
+  `webcfg`/`mqttcfg`/`logout`/`renew` 在 MQTT 通道返回 `command not allowed on MQTT`，
+  裸命令名路径同样拦截）。保留 `status/play/carrier/rxpause/frames`
   等读取/操作类命令，**不破坏 README 已承诺的裸命令协议**。
+  `renew` 原保留供 MQTT 续期，但 MQTT 无会话（续期无意义），且让未认证通道触碰 Web
+  会话 TTL 违背"MQTT 不碰会话状态"的安全模型，故一并禁用（第 5 轮复核后移除）。
 - 前端设置页 MQTT 卡片说明同步更新；README「安全」小节加粗提示并更新命令表。
 - 2026-08-11 第 5 轮复核：**移除**原"可选 `token` 字段"设计——白名单已堵死全部
   敏感命令，token 只增加拒绝路径、从不解锁任何命令（冗余）；协议简化，README

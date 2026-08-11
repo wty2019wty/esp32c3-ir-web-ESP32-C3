@@ -523,14 +523,17 @@ static void mqtt_dispatch(const char *cmd, const char *id, cJSON *body)
  * Security: the MQTT command channel has no session (it cannot log in the way
  * a WebSocket connection does), so it is restricted to operational read/act
  * commands. Security-sensitive commands (changing WiFi/Web/account credentials,
- * the WS origin allow-list, restart toggles, kicking sessions) are rejected. */
+ * the WS origin allow-list, restart toggles, kicking sessions) are rejected.
+ * "renew" is rejected too: it refreshes the Web session TTL, and letting the
+ * unauthenticated MQTT channel touch Web session state would allow anyone with
+ * broker access to extend the admin's session indefinitely. */
 
-/* Commands that change credentials / routing / auth state and are therefore
+/* Commands that change credentials / routing / session state and are therefore
  * rejected on the unauthenticated MQTT channel. */
 static bool mqtt_cmd_allowed(const char *cmd)
 {
     static const char *const blocked[] = {
-        "authcfg", "wificfg", "webcfg", "mqttcfg", "wsorigin", "logout"
+        "authcfg", "wificfg", "webcfg", "mqttcfg", "wsorigin", "logout", "renew"
     };
     if (!cmd) {
         return true; /* missing cmd: let the dispatcher report "missing cmd" */

@@ -151,7 +151,9 @@ esp_err_t web_wificfg_set(cJSON *root, const char **err)
     /* static IP fields (only used when sta_dhcp=false). A malformed value must
      * be reported, not silently ignored, or the save would "succeed" while the
      * device keeps the old address and the user only notices after reboot.
-     * An empty string is allowed and clears the field (DHCP/gateway unset). */
+     * Convention (matches the password fields): absent/null = keep the current
+     * value; empty string "" = clear the field. Automation clients that want to
+     * leave a field untouched must send null/omit it, not "". */
     uint32_t tmp;
     j = cJSON_GetObjectItem(root, "sta_ip");
     if (cJSON_IsString(j)) {

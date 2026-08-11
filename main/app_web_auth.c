@@ -32,11 +32,14 @@ typedef struct {
 
 /* Per-client-IP lockout: consecutive failures from one source IP lock that IP
  * (not the whole device), so a LAN attacker cannot lock the admin out globally.
- * Entries are created on failure and cleared on success. */
+ * Entries are created on failure and cleared on success. The table is a bounded
+ * LRU cache: when it is full the least-recently-used entry is evicted instead
+ * of degrading to a whole-device lockout. */
 typedef struct {
     uint32_t ip;            /* peer IP, host byte order; 0 = free slot */
     int fails;              /* consecutive failed logins from this IP */
     int64_t lock_until;     /* 0 = not locked */
+    int64_t last_used;      /* last access time (us since boot), for LRU eviction */
 } auth_ip_lock_t;
 
 static char s_token[AUTH_TOKEN_LEN + 1] = ""; /* single active session token */
@@ -65,20 +68,30 @@ static uint32_t auth_parse_ip(const char *s)
 
 static auth_ip_lock_t *auth_ip_lock_find(uint32_t ip, bool create)
 {
+    int64_t now = esp_timer_get_time();
     auth_ip_lock_t *free_slot = NULL;
+    auth_ip_lock_t *oldest = NULL;
     for (int i = 0; i < LOGIN_LOCK_IP_MAX; i++) {
         if (s_ip_locks[i].ip == ip) {
+            s_ip_locks[i].last_used = now;
             return &s_ip_locks[i];
         }
         if (!free_slot && s_ip_locks[i].ip == 0) {
             free_slot = &s_ip_locks[i];
         }
+        if (!oldest || s_ip_locks[i].last_used < oldest->last_used) {
+            oldest = &s_ip_locks[i];
+        }
     }
-    if (create && free_slot) {
-        free_slot->ip = ip;
-        free_slot->fails = 0;
-        free_slot->lock_until = 0;
-        return free_slot;
+    if (create) {
+        /* Free slot preferred; otherwise evict the least-recently-used entry so
+         * a full table degrades to per-IP churn, never a whole-device lock. */
+        auth_ip_lock_t *slot = free_slot ? free_slot : oldest;
+        slot->ip = ip;
+        slot->fails = 0;
+        slot->lock_until = 0;
+        slot->last_used = now;
+        return slot;
     }
     return NULL;
 }
@@ -294,7 +307,8 @@ esp_err_t web_auth_login(const char *user, const char *pass, const char *peer_ip
     if (!ok) {
         if (ip) {
             /* create a per-IP entry (the lock check above only looks for an
-             * existing one); if the table is full fall back to the global count */
+             * existing one); with LRU eviction this always succeeds for a known
+             * IP, so the global counter below only serves unknown peers */
             lock = auth_ip_lock_find(ip, true);
         }
         if (lock) {

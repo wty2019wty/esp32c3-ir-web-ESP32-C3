@@ -228,8 +228,8 @@
     <div style="font-size:12px; color:#8a93a3; margin-bottom:10px;">
       保存后设备 2 秒后自动重启生效。MQTT 命令通道<b style="color:#ffd479;">不经过 Web 登录认证</b>，
       请使用带账号密码的 Broker（或 TLS）。出于安全考虑，MQTT 通道<b style="color:#ffd479;">禁用
-      账号/网络配置类命令</b>（authcfg / wificfg / webcfg / mqttcfg / wsorigin / logout），仅可执行读取与操作类
-      命令（status / play / carrier / rxpause / frames / renew）。设备仅在<b style="color:#ffd479;">连接
+      账号/网络配置类命令</b>（authcfg / wificfg / webcfg / mqttcfg / wsorigin / logout / renew），
+      仅可执行读取与操作类命令（status / play / carrier / rxpause / frames）。设备仅在<b style="color:#ffd479;">连接
       路由器（STA）</b>时启动 MQTT；纯热点（SoftAP）模式下不连接。<br>
       Broker 地址支持 <span class="mono">mqtt://</span>（TCP）、
       <span class="mono">mqtts://</span>（TLS）、

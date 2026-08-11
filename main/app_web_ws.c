@@ -149,10 +149,10 @@ static void ws_client_ack(int fd, uint32_t id)
 
 static bool ws_has_authed_clients(void)
 {
-    bool has = false;
-    if (!s_ws_mutex) {
-        return false;
+    if (!s_ws_mutex || !web_auth_session_live()) {
+        return false; /* no live session: nothing to push to anyone */
     }
+    bool has = false;
     if (xSemaphoreTake(s_ws_mutex, portMAX_DELAY) != pdTRUE) {
         return false;
     }
@@ -271,6 +271,14 @@ static void ws_send_text_all(const char *json)
     if (!s_ws_server || !s_ws_mutex) {
         return;
     }
+    /* Session TTL check on the push path too: without it a connection
+     * authenticated just before the 24h expiry would keep receiving status/frame
+     * pushes indefinitely until it happened to send a command. On expiry
+     * web_auth_session_live() invalidates the session and bumps the generation,
+     * so every client's gen check below fails from here on. */
+    if (!web_auth_session_live()) {
+        return;
+    }
     if (xSemaphoreTake(s_ws_mutex, portMAX_DELAY) != pdTRUE) {
         return;
     }
@@ -302,6 +310,11 @@ static esp_err_t ws_reply_text(httpd_req_t *req, const char *json)
 static void ws_send_status_locked(void)
 {
     if (!s_status_inner || !s_ws_server) {
+        return;
+    }
+    /* Same TTL gate as ws_send_text_all: an expired session gets no more
+     * status pushes (the gen bump on invalidation then stops all clients). */
+    if (!web_auth_session_live()) {
         return;
     }
     size_t cap = strlen(s_status_inner) + 64;
@@ -469,7 +482,9 @@ static esp_err_t ws_handler(httpd_req_t *req)
 
     /* Origin check (handshake only — no Origin header on subsequent frames).
      * Configurable allow-list; empty (default) accepts every origin because the
-     * front/back separation feature serves the page from an external host. */
+     * front/back separation feature serves the page from an external host.
+     * Browsers always send an Origin header here; header-less clients (native
+     * apps/scripts) are accepted by design — see web_origin_allowed(). */
     size_t olen = httpd_req_get_hdr_value_len(req, "Origin");
     if (olen > 0) {
         char origin[256];
@@ -477,8 +492,23 @@ static esp_err_t ws_handler(httpd_req_t *req)
         if (httpd_req_get_hdr_value_str(req, "Origin", origin, want + 1) == ESP_OK) {
             if (!web_origin_allowed(origin)) {
                 ESP_LOGW(TAG, "ws: origin \"%s\" rejected", origin);
-                httpd_resp_send_err(req, HTTPD_403_FORBIDDEN, "Origin not allowed");
-                return ESP_FAIL;
+                /* esp_http_server sends the 101 handshake before invoking the
+                 * handler, so an HTTP 403 here would be written as plain HTTP
+                 * bytes onto the upgraded socket. Send a proper WebSocket close
+                 * frame (1008 policy violation, RFC 6455 §7.4.1) instead. */
+                uint8_t close_payload[2 + sizeof("forbidden") - 1];
+                close_payload[0] = (uint8_t)(1008 >> 8);
+                close_payload[1] = (uint8_t)(1008 & 0xFF);
+                memcpy(close_payload + 2, "forbidden", sizeof("forbidden") - 1);
+                httpd_ws_frame_t cf = {
+                    .final = true,
+                    .fragmented = false,
+                    .type = HTTPD_WS_TYPE_CLOSE,
+                    .payload = close_payload,
+                    .len = sizeof(close_payload),
+                };
+                httpd_ws_send_frame(req, &cf);
+                return ESP_FAIL; /* server drops the connection */
             }
         }
     }
