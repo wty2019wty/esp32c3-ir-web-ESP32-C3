@@ -84,9 +84,20 @@ static auth_ip_lock_t *auth_ip_lock_find(uint32_t ip, bool create)
         }
     }
     if (create) {
-        /* Free slot preferred; otherwise evict the least-recently-used entry so
-         * a full table degrades to per-IP churn, never a whole-device lock. */
-        auth_ip_lock_t *slot = free_slot ? free_slot : oldest;
+        /* Free slot preferred; otherwise evict a non-locked entry first, and
+         * only fall back to the least-recently-used entry when every slot is
+         * still locked. Evicting a locked entry would let a multi-IP attacker
+         * clear an active lockout by churning the table. */
+        auth_ip_lock_t *slot = free_slot;
+        if (!slot) {
+            slot = oldest;
+            for (int i = 0; i < LOGIN_LOCK_IP_MAX; i++) {
+                if (s_ip_locks[i].lock_until <= now) {
+                    slot = &s_ip_locks[i];
+                    break;
+                }
+            }
+        }
         slot->ip = ip;
         slot->fails = 0;
         slot->lock_until = 0;

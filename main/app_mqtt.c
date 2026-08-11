@@ -535,11 +535,13 @@ static void mqtt_dispatch(const char *cmd, const char *id, cJSON *body)
  * set, absent/other = just report the current state. */
 static void mqtt_handle_fpub(const char *id, cJSON *body)
 {
-    cJSON *j = cJSON_GetObjectItem(body, "enabled");
-    if (cJSON_IsBool(j)) {
-        s_publish_frames = cJSON_IsTrue(j);
-        ESP_LOGI(TAG, "frame publish runtime toggle -> %s",
-                 s_publish_frames ? "on" : "off");
+    if (body) {
+        cJSON *j = cJSON_GetObjectItem(body, "enabled");
+        if (cJSON_IsBool(j)) {
+            s_publish_frames = cJSON_IsTrue(j);
+            ESP_LOGI(TAG, "frame publish runtime toggle -> %s",
+                     s_publish_frames ? "on" : "off");
+        }
     }
     char buf[48];
     snprintf(buf, sizeof(buf), "{\"publish_frames\":%s}",
