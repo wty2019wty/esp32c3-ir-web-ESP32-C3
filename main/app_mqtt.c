@@ -525,6 +525,24 @@ static void mqtt_dispatch(const char *cmd, const char *id, cJSON *body)
     mqtt_respond(cmd, id, data, err);
 }
 
+/* Runtime frame-publish toggle (MQTT-only, does not touch web_rpc_exec).
+ * Turns the IR frame push on/off at runtime without writing NVS; a reboot
+ * restores the saved "publish_frames" config. Body {"enabled":true|false} to
+ * set, absent/other = just report the current state. */
+static void mqtt_handle_fpub(const char *id, cJSON *body)
+{
+    cJSON *j = cJSON_GetObjectItem(body, "enabled");
+    if (cJSON_IsBool(j)) {
+        s_publish_frames = cJSON_IsTrue(j);
+        ESP_LOGI(TAG, "frame publish runtime toggle -> %s",
+                 s_publish_frames ? "on" : "off");
+    }
+    char buf[48];
+    snprintf(buf, sizeof(buf), "{\"publish_frames\":%s}",
+             s_publish_frames ? "true" : "false");
+    mqtt_respond("fpub", id, strdup(buf), NULL);
+}
+
 /* Command topic payload: JSON {"id":"...","cmd":"...","body":{...}}.
  * A bare string payload is also accepted and treated as the command name
  * (e.g. "status"). The optional "id" is echoed back in the response.
@@ -547,7 +565,7 @@ static void mqtt_dispatch(const char *cmd, const char *id, cJSON *body)
 static bool mqtt_cmd_allowed(const char *cmd)
 {
     static const char *const allowed[] = {
-        "status", "frames", "play", "carrier", "rxpause"
+        "status", "frames", "play", "carrier", "rxpause", "fpub"
     };
     if (!cmd) {
         return true; /* missing cmd: let the dispatcher report "missing cmd" */
@@ -588,6 +606,11 @@ static void mqtt_handle_command(const char *payload, int len)
             cJSON_Delete(root);
             return;
         }
+        if (strcmp(cmd, "fpub") == 0) {
+            mqtt_handle_fpub(id, body);
+            cJSON_Delete(root);
+            return;
+        }
         mqtt_dispatch(cmd, id, body);
         cJSON_Delete(root);
         return;
@@ -601,7 +624,11 @@ static void mqtt_handle_command(const char *payload, int len)
     memcpy(bare, payload, (size_t)len);
     bare[len] = '\0';
     if (mqtt_cmd_allowed(bare)) {
-        mqtt_dispatch(bare, NULL, NULL);
+        if (strcmp(bare, "fpub") == 0) {
+            mqtt_handle_fpub(NULL, NULL);
+        } else {
+            mqtt_dispatch(bare, NULL, NULL);
+        }
     } else {
         mqtt_respond(bare, NULL, NULL, "command not allowed on MQTT");
     }
