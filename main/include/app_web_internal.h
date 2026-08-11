@@ -17,6 +17,7 @@ extern "C" {
 /* ---- app_web_util.c (shared JSON helpers) ---- */
 char *web_status_json(void);            /* caller frees */
 int web_frame_to_json(const ir_frame_t *f, char *buf, size_t cap);
+void web_schedule_restart(void);        /* reboot ~2s later so the response flushes first */
 
 /* ---- app_web_api_ir.c (IR command cores, WS-only) ---- */
 esp_err_t web_ir_play_exec(cJSON *root);              /* {"type","freq?",value/data/seq} -> ESP_OK if accepted */
@@ -29,20 +30,26 @@ esp_err_t web_wificfg_set(cJSON *root, const char **err);
 
 /* ---- app_web_auth.c (login / token auth / account config) ---- */
 bool web_auth_token_ok(const char *token);
-void web_auth_invalidate(void);                       /* clear token + bump session generation */
-uint32_t web_auth_get_gen(void);                      /* current session generation */
-char *web_authcfg_get_json(void);                     /* caller frees */
+bool web_auth_session_live(void);                 /* token exists and unexpired; invalidates on expiry */
+void web_auth_invalidate(void);                   /* clear token + bump session generation */
+uint32_t web_auth_get_gen(void);                  /* current session generation */
+char *web_authcfg_get_json(void);                 /* caller frees */
 esp_err_t web_authcfg_set(cJSON *root, bool *invalidated, const char **err);
-bool web_auth_single_session_get(void);               /* true = every login kicks out older sessions (default on) */
+bool web_auth_single_session_get(void);           /* true = every login kicks out older sessions (default on) */
 esp_err_t web_auth_renew(uint32_t *expires_in);
-/* WS login (the only unauthenticated operation). Returns a malloc'd complete
+/* WS login (the only unauthenticated operation). peer_ip feeds the per-IP
+ * failure lockout (NULL/unknown = global fallback). Returns a malloc'd complete
  * response JSON with "type":"login" (caller frees); ESP_OK = success, caller
- * must then mark the connection as authenticated. */
-esp_err_t web_auth_login(const char *user, const char *pass, char **out_json);
+ * must then mark the connection as authenticated (and only when *out_json). */
+esp_err_t web_auth_login(const char *user, const char *pass, const char *peer_ip,
+                         char **out_json);
 
 /* ---- app_web.c (HTTP server bootstrap + web UI toggle) ---- */
 bool web_ui_enabled_get(void);                        /* true = serve embedded page (default) */
 esp_err_t web_ui_enabled_set(bool enabled, const char **err); /* saves to NVS + schedules restart */
+char *web_origin_get(void);                           /* allowed WS origin, "" = allow all (caller frees) */
+esp_err_t web_origin_set(const char *origin, const char **err); /* NULL/"" = allow all origins */
+bool web_origin_allowed(const char *origin);          /* match a WS handshake Origin header */
 
 /* ---- app_web_rpc.c (shared REST/WebSocket command execution) ---- */
 /* Execute a command on a parsed JSON body and return the REST-equivalent

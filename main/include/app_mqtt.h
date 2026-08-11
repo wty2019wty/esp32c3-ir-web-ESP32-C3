@@ -17,6 +17,7 @@ typedef struct {
     bool enabled;
     bool mqtt5;                            /* false = MQTT 3.1.1, true = MQTT 5.0 */
     bool tls_skip;                         /* false = verify against built-in cert bundle */
+    bool topic_suffix;                     /* true = auto-append Client ID to topics */
     char broker_uri[MQTT_CFG_BROKER_LEN];  /* empty = MQTT disabled */
     char username[MQTT_CFG_STR_LEN];       /* empty = anonymous */
     char password[MQTT_CFG_STR_LEN];       /* empty = no password */

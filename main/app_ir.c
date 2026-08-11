@@ -105,10 +105,15 @@ static void ir_analyze(const rmt_symbol_word_t *sym, size_t num, ir_frame_t *f)
         }
     }
 
-    /* trim leading idle and the trailing idle-to-timeout tail */
+    /* Trim leading idle and the trailing idle-to-timeout tail. With the
+     * active-low VS1838B output, carrier bursts read as level 0 and idle (no
+     * carrier) as level 1, so a level-1 head segment is leading idle regardless
+     * of its duration. The duration-only check (>15000us) would miss a short
+     * 10-15ms leading idle (fast re-press / RMT tail), leaving a space as the
+     * first stored segment and flipping the implied playback polarity. */
     int start = 0;
     int end = n;
-    if (end - start >= 2 && s_segs[start].dur > 15000) {
+    if (end - start >= 2 && (s_segs[start].dur > 15000 || s_segs[start].level == 1)) {
         start++;
     }
     if (end - start >= 2 && s_segs[end - 1].dur > 10000) {
@@ -199,6 +204,7 @@ static void ir_task(void *arg)
         ir_analyze(ev.received_symbols, num, &fr);
         fr.valid = true;
         fr.timestamp_ms = (uint32_t)(esp_timer_get_time() / 1000);
+        fr.capture_freq_hz = ir_get_carrier_freq();
 
         /* store into latest + history ring and notify listeners (e.g.
          * WebSocket push) about the new frame (assigns seq) */

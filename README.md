@@ -110,7 +110,8 @@ idf.py menuconfig   # → "IR Web Tool Configuration"
   通过 **WS 登录**获得 session token（**该连接随即成为已认证会话**）；token 有效期为 **24 小时**，
   前端会自动续期（`renew` 命令），过期后需重新登录。
 - 登录连续失败 **5 次** 后锁定 **30 秒**（`login` 回复 `error:"too many attempts","retry_after":N`），
-  防止暴力破解。
+  防止暴力破解。锁定按**来源 IP** 分别计数，局域网内一个客户端恶意输错密码不会把
+  其他客户端（含管理员）锁在门外。
 - 支持退出登录（`logout` 命令），服务端立即作废当前 token 并关闭该连接。
 - **单设备登录**：设置页"Web 登录"卡片提供**单设备登录**开关（**默认开启**）。开启时，
   只要设备上已有活跃会话，任何一次新登录都会**生成全新 token 并递增会话代数**，
@@ -146,7 +147,7 @@ idf.py menuconfig   # → "IR Web Tool Configuration"
     —— **该连接随即成为已认证会话**，后续命令直接可用；
   - 失败回复 `{"type":"login","ok":false,"error":"bad credentials"}` 或
     `{"type":"login","ok":false,"error":"too many attempts","retry_after":N}`（连续失败 5 次锁定 30 秒）；
-  - 连续失败 5 次后锁定 30 秒，防止暴力破解。
+  - 连续失败 5 次后按来源 IP 锁定 30 秒，防止暴力破解。
 - **已有会话**：客户端刷新页面时保存的 token 仍有效，连接后发送
   `{"type":"auth","token":"<token>"}` 认证（`auth` 消息与 `login` 二选一）；
   服务端回复 `{"type":"auth","ok":true}`；token 无效或过期则回复 `ok:false` 并断开。
@@ -162,7 +163,8 @@ idf.py menuconfig   # → "IR Web Tool Configuration"
     - `frames`：`{"since":N}`，增量拉取；超过约 48KB 时返回 `"truncated":true`，
       `last_seq` 为实际返回的最后一帧，客户端应使用该 `last_seq` 继续拉取直至追平
     - `wificfg`：body 含配置字段 = 保存并重启（`{"restart":true}`）；body 为空 = 读取
-      （密码不回显，`ap_password_set`/`sta_password_set` 标志；密码传 `null` 表示不修改、空字符串表示清除）
+      （密码不回显，`ap_password_set`/`sta_password_set` 标志；密码传 `null` 表示不修改、空字符串表示清除）。
+      校验：非法静态 IP / 超长 SSID / 1-7 位 STA 密码会被拒绝并返回具体错误（不再静默忽略）
     - `authcfg`：body 含 `user`/`pass`/`single_session` 任一字段 = 保存设置，body 为空 = 读取
       （`{"user":...,"single_session":bool}`）。保存返回 `{"invalidated":bool}`：是否
       "变更"由服务端与已保存值比较判定，**只有 `user`/`pass` 实际发生变化才作废会话、
@@ -172,6 +174,8 @@ idf.py menuconfig   # → "IR Web Tool Configuration"
     - `logout`：退出登录，响应后服务端关闭连接
     - `webcfg`：body 含 `web_ui`（bool）= 设置"启用内置 Web 界面"开关并重启
       （`{"restart":true}`）；body 为空 = 读取（`{"web_ui":bool}`）
+    - `wsorigin`：body 含 `origin`（字符串或 `null`）= 设置 WebSocket Origin 白名单
+      （空 = 允许任意来源，默认）；body 为空 = 读取（`{"origin":string}`）。设置页"WebSocket 安全"卡片可配置。
 - **推送消息**：
   - `{"type":"status","id":N,"data":{...}}` —— **状态有变化时才推送**（字段见下），
     携带递增 `id`；客户端收到后需回复 `{"type":"ack","id":N}` 确认抄收，
@@ -192,7 +196,12 @@ idf.py menuconfig   # → "IR Web Tool Configuration"
 - **鉴权与失效**：命令与推送均要求已认证会话；退出登录或修改登录凭据会使会话
   **代数**递增，已连接的 WebSocket 会话随即失效（命令被拒、推送停止），
   防止退出登录后残留连接仍可操作设备。开启**单设备登录**（默认）时，新登录同样
-  递增会话代数，令所有旧会话立即失效。
+  递增会话代数，令所有旧会话立即失效。token 过期（24 小时）时服务端作废会话并
+  递增代数——即使连接一直保持，过期后发起的命令也会被拒，需重新登录。
+- **来源校验**：`/api/ws` 支持可选的 **Origin 白名单**（设置页"WebSocket 安全"或
+  `wsorigin` 命令，默认空 = 允许任意来源）。填写后仅匹配的页面来源能建立连接，
+  可阻止恶意网页发起跨站 WebSocket 连接；前后端分离场景请把托管页面所在的来源
+  加入白名单。
 
 `status` 推送（及 `status` 命令）中的 `data` 字段：`mode`、`ap_ip`、`sta_ip`、`ap_ssid`、
 `sta_ssid`、`sta_ip_mode`、`sta_connected`、`carrier_hz`、`rx_pause_on_play`、`playing`。
@@ -220,6 +229,7 @@ idf.py menuconfig   # → "IR Web Tool Configuration"
 | 四个主题 | `ir-web/*` | 见下方主题表 |
 | QoS | 1 | 作用于订阅/命令/状态；**帧固定 QoS 0** |
 | 推送帧 / 推送状态 | 开 | 两个独立开关 |
+| 主题自动带设备标识 | 关 | 开启后主题嵌入 Client ID，多设备部署互不干扰 |
 
 **传输方式（由 Broker 地址的 scheme 决定）**：
 
@@ -246,6 +256,19 @@ MQTT 的 WebSocket 是设备**出站客户端连接**，与设备内置 `/api/ws
 要控制设备就**向 `ir-web/cmd` 发布**并**订阅 `ir-web/rsp`** 收响应；要监视就
 **订阅 `ir-web/status` 和 `ir-web/frame`**。
 
+**开启"主题自动带设备标识"后**，实际主题会在第一级路径后插入 Client ID
+（Client ID 留空时按 MAC 自动生成，每台设备唯一）：
+
+| 配置的主题 | 开启后的实际主题（示例 Client ID `esp-a1b2c3`） |
+|---|---|
+| `ir-web/cmd` | `ir-web/esp-a1b2c3/cmd` |
+| `ir-web/rsp` | `ir-web/esp-a1b2c3/rsp` |
+| `ir-web/status` | `ir-web/esp-a1b2c3/status` |
+| `ir-web/frame` | `ir-web/esp-a1b2c3/frame` |
+
+适合多台设备连接同一 Broker：命令、响应、状态（含 LWT）、红外帧都按设备隔离，
+互不覆盖、互不串扰。开启后启动日志会打印四个实际主题，便于核对。
+
 #### 3. 命令协议（控制设备）
 
 命令 JSON 信封与 WebSocket 完全一致（`cmd` / `body` 字段相同），额外支持可选 `id`
@@ -268,11 +291,8 @@ MQTT 的 WebSocket 是设备**出站客户端连接**，与设备内置 `/api/ws
 | `carrier` | `{"freq":38000}` | 设置载波频率并持久化 |
 | `rxpause` | `{"enabled":true}` | 回放时是否暂停接收 |
 | `frames` | `{"since":N}` | 增量拉取帧历史；超 48KB 返回 `"truncated":true`，按 `last_seq` 继续拉取 |
-| `wificfg` | 含配置字段 = 保存并重启；空 = 读取 | WiFi 配置，密码不回显（`ap_password_set`/`sta_password_set`；`null`=不改、`""`=清除） |
-| `authcfg` | 含 `user`/`pass`/`single_session` = 保存；空 = 读取 | 登录设置；返回 `{"invalidated":bool}` |
-| `webcfg` | `{"web_ui":bool}` = 保存并重启；空 = 读取 | 是否启用内置 Web 页面 |
-| `mqttcfg` | 含任意 MQTT 字段 = 保存并重启；空 = 读取 | 读取返回 `enabled/protocol/tls_verify/broker_uri/username/password_set/client_id/topic_cmd/topic_rsp/topic_status/topic_frame/qos/publish_frames/publish_status` |
-| `renew` / `logout` | 空 | 会话续期 / 退出登录（WebSocket 会话相关，MQTT 下一般用不到） |
+| `renew` | 空 | 会话续期（WebSocket 会话相关，MQTT 下一般用不到） |
+| ~~`wificfg`~~ / ~~`authcfg`~~ / ~~`webcfg`~~ / ~~`mqttcfg`~~ / ~~`wsorigin`~~ / ~~`logout`~~ | — | **MQTT 通道禁用**（配置/凭据/会话敏感命令，回复 `command not allowed on MQTT`；仅 WebSocket 通道可执行） |
 
 **响应格式（发布到 `ir-web/rsp`）：**
 
@@ -315,7 +335,8 @@ MQTT 的 WebSocket 是设备**出站客户端连接**，与设备内置 `/api/ws
 #### 5. 红外帧推送（`ir-web/frame`）
 
 每捕获一帧红外信号立即发布一帧 JSON（与 WebSocket 推送的帧对象完全一致），
-**固定 QoS 0**、由独立发布任务直接发送（不经 esp-mqtt outbox），队列深度 4，
+**固定 QoS 0**、由独立发布任务直接同步发送（QoS 0 的发布在调用任务内完成，
+独立任务避免拖慢 IR 采集任务，尤其在 TLS broker 上），队列深度 4，
 积压时丢弃新帧并限频告警（每秒最多一条日志）：
 
 ```json
@@ -331,7 +352,8 @@ MQTT 的 WebSocket 是设备**出站客户端连接**，与设备内置 `/api/ws
 
 字段：`seq`（递增序号）、`ts`（uptime 毫秒）、`nec`（NEC 解码结果：`ok`/`repeat`/
 `ext` 16 位地址/`chksum`/`bits`/`addr`/`cmd`/`raw`/`hxd` LSB 十六进制）、`feat`
-（波形特征：总时长、脉冲数、最小/最大脉冲、引导码、尾间隙、段数）、`freq`（载波）、
+（波形特征：总时长、脉冲数、最小/最大脉冲、引导码、尾间隙、段数）、`freq`
+（**采集瞬间**的载波频率，之后修改全局载波不会改写历史帧的标签）、
 `durs`（交替电平微秒序列，首段为载波开）。NEC 解码失败时 `nec.ok=false`。
 示例中 `durs` 已省略大部分（`seg_count` 为实际段数）。
 
@@ -379,10 +401,22 @@ c.loop_forever()
 #### 7. 注意事项与限制
 
 - 仅在 **STA 连接路由器**时启动 MQTT；纯 SoftAP 模式不连接；
+- **多设备部署**：同一 Broker 下多台设备务必保持默认 Client ID（自动按 MAC 生成）
+  或每台设置不同 ID，并开启"主题自动带设备标识"；否则主题互相覆盖、命令会被所有
+  设备同时执行；
 - 红外帧固定 QoS 0（实时尽力而为，同 WebSocket 推送语义），命令/状态按配置 QoS 发送；
 - 帧 JSON 可达数 KB，MQTT 收发缓冲已设为 12288 字节（`buffer.size`），整帧单包发送；
+  若某帧 JSON 超过 12288 字节则无法单包发送，将被丢弃并在响应主题发布错误响应；
+  **命令负载同样受该上限约束**——超过上限的命令会被忽略，设备在响应主题回发
+  `{"ok":false,"error":"command too large"}`。帧大小与 `IR_TOOL_MAX_RX_SEGS` 成正比，
+  如需传输更大帧请同步增大 `buffer.size`；
+- **协议版本**：Broker 只支持 3.1.1 而设备配置为 5.0（或反之）时，客户端会持续重连失败，
+  需在设置页把协议改为与 Broker 匹配的版本后重启；
 - **安全**：MQTT 命令通道不经过 Web 登录认证（无 WebSocket 的 token 机制），安全性依赖
-  Broker 的账号密码/TLS；请勿在公网匿名 Broker 上暴露命令主题。
+  Broker 的账号密码/TLS；请勿在公网匿名 Broker 上暴露命令主题。出于安全考虑，MQTT 通道
+  **禁用账号/网络配置类命令**（`authcfg` / `wificfg` / `webcfg` / `mqttcfg` / `wsorigin` / `logout`，
+  回复 `error:"command not allowed on MQTT"`），仅可执行读取与操作类命令
+  （`status` / `play` / `carrier` / `rxpause` / `frames` / `renew`）。
 
 ### 前后端分离
 
