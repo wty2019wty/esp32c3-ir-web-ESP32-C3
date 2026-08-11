@@ -291,7 +291,7 @@ MQTT 的 WebSocket 是设备**出站客户端连接**，与设备内置 `/api/ws
 | `carrier` | `{"freq":38000}` | 设置载波频率并持久化 |
 | `rxpause` | `{"enabled":true}` | 回放时是否暂停接收 |
 | `frames` | `{"since":N}` | 增量拉取帧历史；超 48KB 返回 `"truncated":true`，按 `last_seq` 继续拉取 |
-| `renew` | 空 | 会话续期（WebSocket 会话相关，MQTT 下一般用不到） |
+| ~~`renew`~~ | 空 | **MQTT 通道禁用**（续期 Web 会话属会话敏感操作，MQTT 无会话故无用；仅 WebSocket 通道可执行） |
 | ~~`wificfg`~~ / ~~`authcfg`~~ / ~~`webcfg`~~ / ~~`mqttcfg`~~ / ~~`wsorigin`~~ / ~~`logout`~~ | — | **MQTT 通道禁用**（配置/凭据/会话敏感命令，回复 `command not allowed on MQTT`；仅 WebSocket 通道可执行） |
 
 **响应格式（发布到 `ir-web/rsp`）：**
@@ -414,9 +414,9 @@ c.loop_forever()
   需在设置页把协议改为与 Broker 匹配的版本后重启；
 - **安全**：MQTT 命令通道不经过 Web 登录认证（无 WebSocket 的 token 机制），安全性依赖
   Broker 的账号密码/TLS；请勿在公网匿名 Broker 上暴露命令主题。出于安全考虑，MQTT 通道
-  **禁用账号/网络配置类命令**（`authcfg` / `wificfg` / `webcfg` / `mqttcfg` / `wsorigin` / `logout`，
+  **禁用账号/网络配置与会话类命令**（`authcfg` / `wificfg` / `webcfg` / `mqttcfg` / `wsorigin` / `logout` / `renew`，
   回复 `error:"command not allowed on MQTT"`），仅可执行读取与操作类命令
-  （`status` / `play` / `carrier` / `rxpause` / `frames` / `renew`）。
+  （`status` / `play` / `carrier` / `rxpause` / `frames`）。
 
 ### 前后端分离
 

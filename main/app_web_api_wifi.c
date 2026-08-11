@@ -68,11 +68,12 @@ char *web_wificfg_get_json(void)
 {
     wifi_web_config_t cfg;
     wifi_web_config_load(&cfg);
-    char ip[16], gw[16], mask[16], dns[16];
+    char ip[16], gw[16], mask[16], dns[16], dns2[16];
     format_ipv4(cfg.sta_ip, ip, sizeof(ip));
     format_ipv4(cfg.sta_gw, gw, sizeof(gw));
     format_ipv4(cfg.sta_mask, mask, sizeof(mask));
     format_ipv4(cfg.sta_dns, dns, sizeof(dns));
+    format_ipv4(cfg.sta_dns2, dns2, sizeof(dns2));
 
     /* Built with cJSON so every value is JSON-escaped: an SSID containing a
      * quote or control character must not break the settings page. */
@@ -91,6 +92,7 @@ char *web_wificfg_get_json(void)
     cJSON_AddStringToObject(root, "sta_gw", gw);
     cJSON_AddStringToObject(root, "sta_mask", mask);
     cJSON_AddStringToObject(root, "sta_dns", dns);
+    cJSON_AddStringToObject(root, "sta_dns2", dns2);
 
     char *s = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
@@ -151,7 +153,9 @@ esp_err_t web_wificfg_set(cJSON *root, const char **err)
     /* static IP fields (only used when sta_dhcp=false). A malformed value must
      * be reported, not silently ignored, or the save would "succeed" while the
      * device keeps the old address and the user only notices after reboot.
-     * An empty string is allowed and clears the field (DHCP/gateway unset). */
+     * Convention (matches the password fields): absent/null = keep the current
+     * value; empty string "" = clear the field. Automation clients that want to
+     * leave a field untouched must send null/omit it, not "". */
     uint32_t tmp;
     j = cJSON_GetObjectItem(root, "sta_ip");
     if (cJSON_IsString(j)) {
@@ -184,6 +188,14 @@ esp_err_t web_wificfg_set(cJSON *root, const char **err)
             return ESP_ERR_INVALID_ARG;
         }
         cfg.sta_dns = j->valuestring[0] != '\0' ? tmp : 0;
+    }
+    j = cJSON_GetObjectItem(root, "sta_dns2");
+    if (cJSON_IsString(j)) {
+        if (j->valuestring[0] != '\0' && !parse_ipv4(j->valuestring, &tmp)) {
+            *err = "invalid sta_dns2";
+            return ESP_ERR_INVALID_ARG;
+        }
+        cfg.sta_dns2 = j->valuestring[0] != '\0' ? tmp : 0;
     }
 
     /* validation */

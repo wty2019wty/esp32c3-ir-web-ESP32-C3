@@ -44,6 +44,9 @@
   .tabbtn.active { background: #2f6fed; color: #fff; border-color: #2f6fed; }
   .formgrid { display: grid; grid-template-columns: 190px 1fr; gap: 9px 12px; align-items: center; }
   .formgrid label { color: #8a93a3; font-size: 13px; }
+  .formgrid input[type=text],
+  .formgrid input[type=password],
+  .formgrid select { width: 100%; }
   input.ip { width: 170px; }
   .kv { display: grid; grid-template-columns: 130px 1fr; gap: 4px 10px; font-size: 13.5px; }
   .kv b { color: #8a93a3; font-weight: 500; }
@@ -77,7 +80,7 @@
     body { padding: 10px; }
     h1 { font-size: 17px; }
     .card { padding: 12px; }
-    input[type=number], input[type=text] { width: 100% !important; min-width: 0; }
+    input[type=number], input[type=text], select { width: 100% !important; min-width: 0; }
     input.ip { width: 100% !important; }
     .formgrid { grid-template-columns: 1fr; gap: 4px 0; }
     .formgrid label { margin-top: 8px; }
@@ -215,7 +218,9 @@
       <label>网关</label>
       <input type="text" id="cfgStaGw" class="ip" placeholder="192.168.1.1">
       <label>DNS</label>
-      <input type="text" id="cfgStaDns" class="ip" placeholder="可留空">
+      <input type="text" id="cfgStaDns" class="ip" placeholder="主 DNS">
+      <label>备用 DNS</label>
+      <input type="text" id="cfgStaDns2" class="ip" placeholder="可留空">
     </div>
     <div class="row" style="margin-top:12px;">
       <button id="cfgSaveBtn" onclick="saveWifiCfg()">保存并重启</button>
@@ -228,8 +233,8 @@
     <div style="font-size:12px; color:#8a93a3; margin-bottom:10px;">
       保存后设备 2 秒后自动重启生效。MQTT 命令通道<b style="color:#ffd479;">不经过 Web 登录认证</b>，
       请使用带账号密码的 Broker（或 TLS）。出于安全考虑，MQTT 通道<b style="color:#ffd479;">禁用
-      账号/网络配置类命令</b>（authcfg / wificfg / webcfg / mqttcfg / wsorigin / logout），仅可执行读取与操作类
-      命令（status / play / carrier / rxpause / frames / renew）。设备仅在<b style="color:#ffd479;">连接
+      账号/网络配置类命令</b>（authcfg / wificfg / webcfg / mqttcfg / wsorigin / logout / renew），
+      仅可执行读取与操作类命令（status / play / carrier / rxpause / frames）。设备仅在<b style="color:#ffd479;">连接
       路由器（STA）</b>时启动 MQTT；纯热点（SoftAP）模式下不连接。<br>
       Broker 地址支持 <span class="mono">mqtt://</span>（TCP）、
       <span class="mono">mqtts://</span>（TLS）、
@@ -1026,6 +1031,7 @@ function showTab(t) {
 
 async function loadWifiCfg() {
   $('cfgStatus').textContent = '';
+  $('cfgSaveBtn').disabled = false;
   try {
     const c = await rpc('wificfg');
     $('cfgApSsid').value = c.ap_ssid;
@@ -1043,6 +1049,7 @@ async function loadWifiCfg() {
     $('cfgStaMask').value = c.sta_mask;
     $('cfgStaGw').value = c.sta_gw;
     $('cfgStaDns').value = c.sta_dns;
+    $('cfgStaDns2').value = c.sta_dns2;
     try {
       const w = await rpc('webcfg');
       $('cfgWebUi').checked = !!w.web_ui;
@@ -1091,11 +1098,13 @@ async function saveWifiCfg() {
   const maskV = $('cfgStaMask').value.trim();
   const gwV = $('cfgStaGw').value.trim();
   const dnsV = $('cfgStaDns').value.trim();
+  const dns2V = $('cfgStaDns2').value.trim();
   if (!staDhcp) {
     if (!validIp(ipV)) { $('cfgStatus').textContent = '静态 IP 格式错误'; return; }
     if (maskV && !validIp(maskV)) { $('cfgStatus').textContent = '子网掩码格式错误'; return; }
     if (gwV && !validIp(gwV)) { $('cfgStatus').textContent = '网关格式错误'; return; }
     if (dnsV && !validIp(dnsV)) { $('cfgStatus').textContent = 'DNS 格式错误'; return; }
+    if (dns2V && !validIp(dns2V)) { $('cfgStatus').textContent = '备用 DNS 格式错误'; return; }
   }
   const body = {
     ap_ssid: $('cfgApSsid').value.trim(),
@@ -1106,7 +1115,8 @@ async function saveWifiCfg() {
     sta_ip: ipV,
     sta_mask: maskV || '255.255.255.0',
     sta_gw: gwV,
-    sta_dns: dnsV
+    sta_dns: dnsV,
+    sta_dns2: dns2V
   };
   try {
     const d = await rpc('wificfg', body);
@@ -1128,6 +1138,7 @@ function updateTlsSkipWarn() {
 
 async function loadMqttCfg() {
   $('cfgMqttStatus').textContent = '';
+  $('cfgMqttSaveBtn').disabled = false;
   try {
     const c = await rpc('mqttcfg');
     $('cfgMqttEnable').checked = !!c.enabled;

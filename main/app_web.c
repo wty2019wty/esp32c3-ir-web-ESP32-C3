@@ -121,10 +121,49 @@ esp_err_t web_origin_set(const char *origin, const char **err)
     return e;
 }
 
+/* Origin equality, tolerant of the two ways a hand-typed allow-list entry can
+ * differ from what a browser sends: a trailing slash (browsers never include
+ * one in the Origin header, but users habitually type URLs with one) and case
+ * (RFC 6454: scheme and host are case-insensitive). Exact matching would
+ * silently reject a legitimately configured entry. */
+static bool origin_same(const char *a, const char *b)
+{
+    size_t la = strlen(a), lb = strlen(b);
+    while (la > 0 && a[la - 1] == '/') {
+        la--;
+    }
+    while (lb > 0 && b[lb - 1] == '/') {
+        lb--;
+    }
+    if (la != lb) {
+        return false;
+    }
+    for (size_t i = 0; i < la; i++) {
+        char ca = a[i], cb = b[i];
+        if (ca >= 'A' && ca <= 'Z') {
+            ca = (char)(ca + ('a' - 'A'));
+        }
+        if (cb >= 'A' && cb <= 'Z') {
+            cb = (char)(cb + ('a' - 'A'));
+        }
+        if (ca != cb) {
+            return false;
+        }
+    }
+    return true;
+}
+
 /* Match a WS handshake Origin header against the allow-list. Empty config (the
  * default) accepts every origin. The allow-list is cached in RAM (refreshed on
  * set) so per-connection checks never touch flash. On cache load failure we
- * fail OPEN so an OOM can never lock legitimate clients out of the device. */
+ * fail OPEN so an OOM can never lock legitimate clients out of the device.
+ *
+ * This is browser CSRF protection only: a browser always sends an Origin header
+ * on a WebSocket connection, so a cross-origin page can only connect if its
+ * origin is allow-listed. Clients that send no Origin header at all (native
+ * apps, scripts) are not checked — they carry no ambient browser authority, so
+ * there is no cross-site attack to defend against; the WS login/token mechanism
+ * remains the authentication boundary for them. */
 bool web_origin_allowed(const char *origin)
 {
     if (!origin || origin[0] == '\0') {
@@ -142,7 +181,7 @@ bool web_origin_allowed(const char *origin)
         }
         s_ws_origin_loaded = 1;
     }
-    return s_ws_origin[0] == '\0' || strcmp(s_ws_origin, origin) == 0;
+    return s_ws_origin[0] == '\0' || origin_same(s_ws_origin, origin);
 }
 
 /* Embedded web UI (main/web/index.html via EMBED_TXTFILES) */

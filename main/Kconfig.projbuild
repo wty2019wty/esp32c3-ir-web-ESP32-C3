@@ -6,6 +6,17 @@ menu "IR Web Tool Configuration"
         help
             VS1838B demodulated baseband output, idle high.
 
+    config IR_TOOL_RX_ACTIVE_LOW
+        bool "IR receiver output is active-low (idle high)"
+        default y
+        help
+            Demodulated IR receivers like the VS1838B output an idle-high /
+            active-low baseband: carrier bursts read as logic 0 and idle as
+            logic 1. The frame decoder relies on this to identify and trim the
+            leading idle regardless of duration. Disable this for active-high
+            receivers (idle low), in which case only a long leading idle is
+            trimmed by duration and the first burst is never mistaken for idle.
+
     config IR_TOOL_IR_TX_GPIO
         int "IR transmitter GPIO (needs transistor driver)"
         default 3

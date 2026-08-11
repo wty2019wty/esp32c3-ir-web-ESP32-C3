@@ -19,6 +19,7 @@ typedef struct {
     uint32_t sta_gw;
     uint32_t sta_mask;
     uint32_t sta_dns;
+    uint32_t sta_dns2;                        /* optional backup resolver */
 } wifi_web_config_t;
 
 /**
@@ -46,3 +47,4 @@ bool wifi_get_sta_ip(char *buf, size_t len);
 const char *wifi_sta_ip_mode(void);     /* "dhcp" / "static" / "-" */
 const char *wifi_ap_ssid(void);
 const char *wifi_sta_ssid(void);
+void wifi_ensure_dns(void);             /* fall back to public DNS when DHCP gave none */

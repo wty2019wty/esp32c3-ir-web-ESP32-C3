@@ -207,7 +207,8 @@ char *web_rpc_exec(const char *cmd, cJSON *body, const char **err)
             cJSON_GetObjectItem(body, "sta_ip") ||
             cJSON_GetObjectItem(body, "sta_gw") ||
             cJSON_GetObjectItem(body, "sta_mask") ||
-            cJSON_GetObjectItem(body, "sta_dns");
+            cJSON_GetObjectItem(body, "sta_dns") ||
+            cJSON_GetObjectItem(body, "sta_dns2");
         if (has_set) {
             const char *e = NULL;
             if (web_wificfg_set(body, &e) != ESP_OK) {
@@ -274,7 +275,9 @@ char *web_rpc_exec(const char *cmd, cJSON *body, const char **err)
         }
         cJSON_AddStringToObject(out, "origin", o);
         free(o);
-        return cJSON_PrintUnformatted(out); /* freed by caller */
+        char *json = cJSON_PrintUnformatted(out); /* freed by caller */
+        cJSON_Delete(out);
+        return json;
     }
 
     if (strcmp(cmd, "logout") == 0) {
