@@ -81,7 +81,7 @@ static char s_topic_rsp[MQTT_TOPIC_EFF_LEN];
 static char s_topic_status[MQTT_TOPIC_EFF_LEN];
 static char s_topic_frame[MQTT_TOPIC_EFF_LEN];
 static int s_qos = 1;
-static bool s_publish_frames = true;
+static volatile bool s_publish_frames = true;
 static bool s_publish_status = true;
 static QueueHandle_t s_frame_queue = NULL;
 
