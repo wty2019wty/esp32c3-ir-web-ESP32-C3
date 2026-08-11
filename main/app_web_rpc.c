@@ -207,7 +207,8 @@ char *web_rpc_exec(const char *cmd, cJSON *body, const char **err)
             cJSON_GetObjectItem(body, "sta_ip") ||
             cJSON_GetObjectItem(body, "sta_gw") ||
             cJSON_GetObjectItem(body, "sta_mask") ||
-            cJSON_GetObjectItem(body, "sta_dns");
+            cJSON_GetObjectItem(body, "sta_dns") ||
+            cJSON_GetObjectItem(body, "sta_dns2");
         if (has_set) {
             const char *e = NULL;
             if (web_wificfg_set(body, &e) != ESP_OK) {
@@ -249,6 +250,36 @@ char *web_rpc_exec(const char *cmd, cJSON *body, const char **err)
         return strdup(buf);
     }
 
+    if (strcmp(cmd, "wsorigin") == 0) {
+        /* {"origin":"https://ir.example.com"} = restrict WS to one origin;
+         * {"origin":null} or absent = allow all origins (default). */
+        cJSON *j = cJSON_GetObjectItem(body, "origin");
+        if (j && (cJSON_IsString(j) || cJSON_IsNull(j))) {
+            const char *e = NULL;
+            const char *origin = cJSON_IsString(j) ? j->valuestring : NULL;
+            if (web_origin_set(origin, &e) != ESP_OK) {
+                *err = e ? e : "invalid";
+                return NULL;
+            }
+        }
+        char *o = web_origin_get();
+        if (!o) {
+            *err = "read failed";
+            return NULL;
+        }
+        cJSON *out = cJSON_CreateObject();
+        if (!out) {
+            free(o);
+            *err = "out of memory";
+            return NULL;
+        }
+        cJSON_AddStringToObject(out, "origin", o);
+        free(o);
+        char *json = cJSON_PrintUnformatted(out); /* freed by caller */
+        cJSON_Delete(out);
+        return json;
+    }
+
     if (strcmp(cmd, "logout") == 0) {
         web_auth_invalidate();
         return strdup("{}");
@@ -274,7 +305,8 @@ char *web_rpc_exec(const char *cmd, cJSON *body, const char **err)
     if (strcmp(cmd, "mqttcfg") == 0) {
         /* present any config field => set; otherwise => get */
         static const char *const set_fields[] = {
-            "enabled", "protocol", "tls_verify", "broker_uri", "username", "password", "client_id",
+            "enabled", "protocol", "tls_verify", "topic_suffix",
+            "broker_uri", "username", "password", "client_id",
             "topic_cmd", "topic_rsp", "topic_status", "topic_frame",
             "qos", "publish_frames", "publish_status"
         };

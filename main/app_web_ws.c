@@ -10,6 +10,8 @@
 #include "cJSON.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+#include "lwip/sockets.h"
+#include "lwip/inet.h"
 
 #define TAG "web"
 
@@ -100,10 +102,15 @@ static void ws_client_add(int fd, bool authed)
     xSemaphoreGive(s_ws_mutex);
 }
 
-/* True when the client authenticated against the current session generation;
- * false after logout / credential changes invalidate the session. */
+/* True when the client authenticated against the current session generation AND
+ * the session is still live (token not expired). The TTL check matters: without
+ * it a connection authenticated before the 24h expiry would keep issuing commands
+ * indefinitely, contradicting the documented session lifetime. */
 static bool ws_client_gen_ok(int fd)
 {
+    if (!web_auth_session_live()) {
+        return false; /* session expired/invalidated: reject every client */
+    }
     uint32_t cur = web_auth_get_gen();
     bool ok = false;
     if (!s_ws_mutex || fd < 0) {
@@ -142,10 +149,10 @@ static void ws_client_ack(int fd, uint32_t id)
 
 static bool ws_has_authed_clients(void)
 {
-    bool has = false;
-    if (!s_ws_mutex) {
-        return false;
+    if (!s_ws_mutex || !web_auth_session_live()) {
+        return false; /* no live session: nothing to push to anyone */
     }
+    bool has = false;
     if (xSemaphoreTake(s_ws_mutex, portMAX_DELAY) != pdTRUE) {
         return false;
     }
@@ -264,6 +271,14 @@ static void ws_send_text_all(const char *json)
     if (!s_ws_server || !s_ws_mutex) {
         return;
     }
+    /* Session TTL check on the push path too: without it a connection
+     * authenticated just before the 24h expiry would keep receiving status/frame
+     * pushes indefinitely until it happened to send a command. On expiry
+     * web_auth_session_live() invalidates the session and bumps the generation,
+     * so every client's gen check below fails from here on. */
+    if (!web_auth_session_live()) {
+        return;
+    }
     if (xSemaphoreTake(s_ws_mutex, portMAX_DELAY) != pdTRUE) {
         return;
     }
@@ -295,6 +310,11 @@ static esp_err_t ws_reply_text(httpd_req_t *req, const char *json)
 static void ws_send_status_locked(void)
 {
     if (!s_status_inner || !s_ws_server) {
+        return;
+    }
+    /* Same TTL gate as ws_send_text_all: an expired session gets no more
+     * status pushes (the gen bump on invalidation then stops all clients). */
+    if (!web_auth_session_live()) {
         return;
     }
     size_t cap = strlen(s_status_inner) + 64;
@@ -432,10 +452,66 @@ void web_ws_close_fn(httpd_handle_t hd, int sockfd)
     close(sockfd);
 }
 
+/* Best-effort peer IP of a WS client ("a.b.c.d"), used for the per-IP login
+ * failure lockout. Returns false when the address cannot be resolved. */
+static bool ws_peer_ip(httpd_req_t *req, char *buf, size_t len)
+{
+    if (!req || !buf || len < 16) {
+        return false;
+    }
+    int fd = httpd_req_to_sockfd(req);
+    if (fd < 0) {
+        return false;
+    }
+    struct sockaddr_in addr;
+    socklen_t alen = sizeof(addr);
+    if (getpeername(fd, (struct sockaddr *)&addr, &alen) != 0) {
+        return false;
+    }
+    uint32_t ip = ntohl(addr.sin_addr.s_addr);
+    snprintf(buf, len, "%lu.%lu.%lu.%lu",
+             (unsigned long)((ip >> 24) & 0xFF), (unsigned long)((ip >> 16) & 0xFF),
+             (unsigned long)((ip >> 8) & 0xFF), (unsigned long)(ip & 0xFF));
+    return true;
+}
+
 static esp_err_t ws_handler(httpd_req_t *req)
 {
     int fd = httpd_req_to_sockfd(req);
     httpd_ws_frame_t frame = {0};
+
+    /* Origin check (handshake only — no Origin header on subsequent frames).
+     * Configurable allow-list; empty (default) accepts every origin because the
+     * front/back separation feature serves the page from an external host.
+     * Browsers always send an Origin header here; header-less clients (native
+     * apps/scripts) are accepted by design — see web_origin_allowed(). */
+    size_t olen = httpd_req_get_hdr_value_len(req, "Origin");
+    if (olen > 0) {
+        char origin[256];
+        size_t want = olen < sizeof(origin) - 1 ? olen : sizeof(origin) - 1;
+        if (httpd_req_get_hdr_value_str(req, "Origin", origin, want + 1) == ESP_OK) {
+            if (!web_origin_allowed(origin)) {
+                ESP_LOGW(TAG, "ws: origin \"%s\" rejected", origin);
+                /* esp_http_server sends the 101 handshake before invoking the
+                 * handler, so an HTTP 403 here would be written as plain HTTP
+                 * bytes onto the upgraded socket. Send a proper WebSocket close
+                 * frame (1008 policy violation, RFC 6455 §7.4.1) instead. */
+                uint8_t close_payload[2 + sizeof("forbidden") - 1];
+                close_payload[0] = (uint8_t)(1008 >> 8);
+                close_payload[1] = (uint8_t)(1008 & 0xFF);
+                memcpy(close_payload + 2, "forbidden", sizeof("forbidden") - 1);
+                httpd_ws_frame_t cf = {
+                    .final = true,
+                    .fragmented = false,
+                    .type = HTTPD_WS_TYPE_CLOSE,
+                    .payload = close_payload,
+                    .len = sizeof(close_payload),
+                };
+                httpd_ws_send_frame(req, &cf);
+                return ESP_FAIL; /* server drops the connection */
+            }
+        }
+    }
 
     esp_err_t err = httpd_ws_recv_frame(req, &frame, 0);
     if (err != ESP_OK) {
@@ -504,13 +580,18 @@ static esp_err_t ws_handler(httpd_req_t *req)
         cJSON *p = cJSON_GetObjectItem(root, "pass");
         const char *user = cJSON_IsString(u) ? u->valuestring : NULL;
         const char *pass = cJSON_IsString(p) ? p->valuestring : NULL;
+        char peer[16] = "";
+        ws_peer_ip(req, peer, sizeof(peer));
         char *out = NULL;
-        esp_err_t lret = web_auth_login(user, pass, &out);
+        esp_err_t lret = web_auth_login(user, pass, peer[0] ? peer : NULL, &out);
         if (out) {
             ws_reply_text(req, out);
             free(out);
         }
-        if (lret == ESP_OK) {
+        /* Only mark the connection authenticated when the login truly succeeded
+         * AND the client received its token. On OOM (ESP_ERR_NO_MEM) out is NULL
+         * and marking it authed would leave a session that can never prove itself. */
+        if (lret == ESP_OK && out) {
             ws_client_add(fd, true);
             ESP_LOGI(TAG, "ws: client fd %d logged in", fd);
             ws_push_status_now(); /* deliver current status immediately */
@@ -554,23 +635,30 @@ static esp_err_t ws_handler(httpd_req_t *req)
         cJSON *bodyobj = cJSON_IsObject(body) ? body : root;
         const char *err = NULL;
         char *data = web_rpc_exec(cmdstr, bodyobj, &err);
+        /* Build with cJSON (like mqtt_respond) so arbitrary command data / error
+         * strings can never break out of the response JSON. */
+        cJSON *resp = cJSON_CreateObject();
         char *reply = NULL;
+        if (resp) {
+            cJSON_AddStringToObject(resp, "type", "resp");
+            cJSON_AddNumberToObject(resp, "id", id->valuedouble);
+            if (data) {
+                cJSON_AddBoolToObject(resp, "ok", true);
+                cJSON *result = cJSON_Parse(data);
+                if (result) {
+                    cJSON_AddItemToObject(resp, "data", result);
+                } else {
+                    cJSON_AddStringToObject(resp, "data", data);
+                }
+            } else {
+                cJSON_AddBoolToObject(resp, "ok", false);
+                cJSON_AddStringToObject(resp, "error", err ? err : "failed");
+            }
+            reply = cJSON_PrintUnformatted(resp);
+            cJSON_Delete(resp);
+        }
         if (data) {
-            size_t cap = strlen(data) + 96;
-            reply = malloc(cap);
-            if (reply) {
-                snprintf(reply, cap, "{\"type\":\"resp\",\"id\":%ld,\"ok\":true,\"data\":%s}",
-                         (long)id->valuedouble, data);
-            }
             free(data);
-        } else {
-            const char *msg = err ? err : "failed";
-            size_t cap = strlen(msg) + 64;
-            reply = malloc(cap);
-            if (reply) {
-                snprintf(reply, cap, "{\"type\":\"resp\",\"id\":%ld,\"ok\":false,\"error\":\"%s\"}",
-                         (long)id->valuedouble, msg);
-            }
         }
         if (reply) {
             ws_reply_text(req, reply);

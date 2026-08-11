@@ -6,9 +6,37 @@
 #include "app_wifi.h"
 #include "esp_http_server.h"
 #include "esp_log.h"
+#include "esp_timer.h"
+#include "esp_system.h"
 #include "cJSON.h"
 
 #define TAG "web"
+
+/* Shared "apply config -> restart in 2s" helper. Used by the WiFi / Web / MQTT
+ * config setters so the HTTP/WS response flushes before the reboot. */
+static void web_restart_timer_cb(void *arg)
+{
+    (void)arg;
+    ESP_LOGW(TAG, "Restarting to apply config...");
+    esp_restart();
+}
+
+void web_schedule_restart(void)
+{
+    static esp_timer_handle_t t = NULL;
+    if (!t) {
+        const esp_timer_create_args_t args = {
+            .callback = web_restart_timer_cb,
+            .name = "web_restart",
+        };
+        if (esp_timer_create(&args, &t) != ESP_OK) {
+            ESP_LOGE(TAG, "failed to create restart timer, restarting now");
+            esp_restart();
+            return;
+        }
+    }
+    esp_timer_start_once(t, 2 * 1000 * 1000);
+}
 
 /* Build the status object as a JSON string (caller frees). */
 char *web_status_json(void)
@@ -54,7 +82,7 @@ int web_frame_to_json(const ir_frame_t *f, char *buf, size_t cap)
         (unsigned long)f->min_pulse_us, (unsigned long)f->max_pulse_us,
         (unsigned long)f->leader_pulse_us, (unsigned long)f->leader_space_us,
         (unsigned long)f->last_gap_us, (unsigned long)f->seg_count,
-        (unsigned long)ir_get_carrier_freq());
+        (unsigned long)f->capture_freq_hz);
     if (off < 0 || off >= (int)cap) {
         return -1;
     }

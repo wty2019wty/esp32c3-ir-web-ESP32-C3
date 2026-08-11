@@ -18,6 +18,9 @@
 #include "nvs_flash.h"
 #include "nvs.h"
 #include "cJSON.h"
+#include "lwip/netdb.h"
+#include "lwip/sockets.h"
+#include "lwip/ip4_addr.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
@@ -33,10 +36,10 @@
 
 /* Frame publish queue. IR frames are best-effort real-time data (same
  * semantics as the WebSocket push) and are sent at QoS 0 from a dedicated
- * publisher task, NOT through the esp-mqtt outbox: esp-mqtt's task loop only
- * drains one outbox message per poll-read cycle (default 1 s), which would
- * throttle a continuous IR stream to ~1 frame/second. With a dedicated task,
- * throughput is limited only by the network. */
+ * publisher task. QoS-0 publishes go out synchronously in the calling task, so
+ * doing them on the IR receive task would stall captures while the (possibly
+ * TLS) network send runs; the dedicated task keeps the send off the IR task
+ * and lets throughput be limited only by the network. */
 #define MQTT_FRAME_QUEUE_DEPTH 4
 
 typedef struct {
@@ -50,6 +53,7 @@ typedef struct {
 #define KEY_ENABLE "mqtt_enable"
 #define KEY_PROTO  "mqtt_proto"
 #define KEY_TLS    "mqtt_tls"
+#define KEY_TSFX   "mqtt_tsfx"
 #define KEY_BROKER "mqtt_broker"
 #define KEY_USER   "mqtt_user"
 #define KEY_PWD    "mqtt_pwd"
@@ -66,15 +70,26 @@ static esp_mqtt_client_handle_t s_client = NULL;
 static bool s_started = false;
 static volatile bool s_connected = false;
 
-/* Runtime settings resolved from NVS (menuconfig provides defaults) */
-static char s_topic_cmd[MQTT_CFG_STR_LEN];
-static char s_topic_rsp[MQTT_CFG_STR_LEN];
-static char s_topic_status[MQTT_CFG_STR_LEN];
-static char s_topic_frame[MQTT_CFG_STR_LEN];
+/* Runtime settings resolved from NVS (menuconfig provides defaults).
+ * With the per-device topic suffix enabled the effective topics embed the
+ * Client ID, so they can exceed the base topic length. 256 comfortably covers
+ * the worst case (63-char base topic + 63-char Client ID + separator); the
+ * save path additionally rejects configurations that would not fit. */
+#define MQTT_TOPIC_EFF_LEN 256
+static char s_topic_cmd[MQTT_TOPIC_EFF_LEN];
+static char s_topic_rsp[MQTT_TOPIC_EFF_LEN];
+static char s_topic_status[MQTT_TOPIC_EFF_LEN];
+static char s_topic_frame[MQTT_TOPIC_EFF_LEN];
 static int s_qos = 1;
 static bool s_publish_frames = true;
 static bool s_publish_status = true;
 static QueueHandle_t s_frame_queue = NULL;
+
+/* Broker hostname (scheme stripped) for DNS diagnostics. */
+static char s_broker_host[256] = { 0 };
+/* One-shot/periodic timer that re-checks DNS while the broker hostname stays
+ * unresolved, so the client starts as soon as the network path is up. */
+static esp_timer_handle_t s_dns_timer = NULL;
 
 /* ---------------- NVS config load / save ---------------- */
 
@@ -84,6 +99,7 @@ esp_err_t mqtt_web_config_load(mqtt_web_config_t *cfg)
     cfg->enabled = CONFIG_IR_TOOL_MQTT_ENABLE;
     cfg->mqtt5 = false; /* default protocol: 3.1.1 */
     cfg->tls_skip = false; /* default: verify against the built-in certificate bundle */
+    cfg->topic_suffix = false; /* default: topics as configured */
     strlcpy(cfg->broker_uri, CONFIG_IR_TOOL_MQTT_BROKER_URI, sizeof(cfg->broker_uri));
     strlcpy(cfg->username, CONFIG_IR_TOOL_MQTT_USERNAME, sizeof(cfg->username));
     strlcpy(cfg->password, CONFIG_IR_TOOL_MQTT_PASSWORD, sizeof(cfg->password));
@@ -111,6 +127,10 @@ esp_err_t mqtt_web_config_load(mqtt_web_config_t *cfg)
     v8 = 0;
     if (nvs_get_u8(h, KEY_TLS, &v8) == ESP_OK) {
         cfg->tls_skip = v8 != 0;
+    }
+    v8 = 0;
+    if (nvs_get_u8(h, KEY_TSFX, &v8) == ESP_OK) {
+        cfg->topic_suffix = v8 != 0;
     }
     size_t len;
     len = sizeof(cfg->broker_uri);
@@ -170,6 +190,7 @@ esp_err_t mqtt_web_config_save(const mqtt_web_config_t *cfg)
     esp_err_t err = nvs_set_u8(h, KEY_ENABLE, cfg->enabled ? 1 : 0);
     if (err == ESP_OK) err = nvs_set_u8(h, KEY_PROTO, cfg->mqtt5 ? 1 : 0);
     if (err == ESP_OK) err = nvs_set_u8(h, KEY_TLS, cfg->tls_skip ? 1 : 0);
+    if (err == ESP_OK) err = nvs_set_u8(h, KEY_TSFX, cfg->topic_suffix ? 1 : 0);
     if (err == ESP_OK) err = nvs_set_str(h, KEY_BROKER, cfg->broker_uri);
     if (err == ESP_OK) err = nvs_set_str(h, KEY_USER, cfg->username);
     if (err == ESP_OK) err = nvs_set_str(h, KEY_PWD, cfg->password);
@@ -188,29 +209,6 @@ esp_err_t mqtt_web_config_save(const mqtt_web_config_t *cfg)
 
 /* ---------------- web RPC cores (shared with the WebSocket channel) ---------------- */
 
-static void mqtt_restart_cb(void *arg)
-{
-    (void)arg;
-    ESP_LOGW(TAG, "Restarting to apply MQTT config...");
-    esp_restart();
-}
-
-static void mqtt_schedule_restart(void)
-{
-    /* restart 2s later so the WS response is flushed first */
-    static esp_timer_handle_t t = NULL;
-    if (!t) {
-        const esp_timer_create_args_t args = {
-            .callback = mqtt_restart_cb,
-            .name = "mqtt_restart",
-        };
-        esp_timer_create(&args, &t);
-    }
-    if (t) {
-        esp_timer_start_once(t, 2 * 1000 * 1000);
-    }
-}
-
 static bool mqtt_topic_ok(const char *t)
 {
     if (!t || t[0] == '\0') {
@@ -224,6 +222,36 @@ static bool mqtt_topic_ok(const char *t)
     return true;
 }
 
+/* Replace characters that are invalid inside an MQTT topic filter
+ * (wildcards +/# and the level separator /) so the Client ID can be embedded. */
+static void mqtt_topic_sanitize(const char *in, char *out, size_t out_sz)
+{
+    size_t i = 0;
+    for (; in[i] != '\0' && i + 1 < out_sz; i++) {
+        char c = in[i];
+        out[i] = (c == '+' || c == '#' || c == '/') ? '-' : c;
+    }
+    out[i] = '\0';
+}
+
+/* Insert the per-device suffix right after the first path level:
+ * "ir-web/cmd" + "esp-a1b2c3" -> "ir-web/esp-a1b2c3/cmd". */
+static void mqtt_effective_topic(const char *base, const char *suffix, bool enabled,
+                                 char *out, size_t out_sz)
+{
+    if (!enabled || !suffix || suffix[0] == '\0') {
+        strlcpy(out, base, out_sz);
+        return;
+    }
+    const char *slash = strchr(base, '/');
+    if (slash) {
+        int root_len = (int)(slash - base + 1);
+        snprintf(out, out_sz, "%.*s%s/%s", root_len, base, suffix, slash + 1);
+    } else {
+        snprintf(out, out_sz, "%s/%s", base, suffix);
+    }
+}
+
 /* Current (NVS) MQTT configuration as a JSON string (caller frees).
  * Passwords are never echoed back, only a password_set flag. */
 char *web_mqttcfg_get_json(void)
@@ -231,28 +259,32 @@ char *web_mqttcfg_get_json(void)
     mqtt_web_config_t cfg;
     mqtt_web_config_load(&cfg);
 
-    char *buf = malloc(2048);
-    if (!buf) {
+    /* Built with cJSON so every value is JSON-escaped: the set path rejects
+     * quotes/backslashes, but menuconfig defaults and control characters are
+     * not validated and must not be able to break the settings page. */
+    cJSON *root = cJSON_CreateObject();
+    if (!root) {
         return NULL;
     }
-    int n = snprintf(buf, 2048,
-        "{\"enabled\":%s,\"protocol\":\"%s\",\"tls_verify\":\"%s\","
-        "\"broker_uri\":\"%s\",\"username\":\"%s\","
-        "\"password_set\":%s,\"client_id\":\"%s\","
-        "\"topic_cmd\":\"%s\",\"topic_rsp\":\"%s\",\"topic_status\":\"%s\","
-        "\"topic_frame\":\"%s\",\"qos\":%d,"
-        "\"publish_frames\":%s,\"publish_status\":%s}",
-        cfg.enabled ? "true" : "false",
-        cfg.mqtt5 ? "5" : "311",
-        cfg.tls_skip ? "skip" : "bundle",
-        cfg.broker_uri, cfg.username, cfg.password[0] ? "true" : "false",
-        cfg.client_id,
-        cfg.topic_cmd, cfg.topic_rsp, cfg.topic_status, cfg.topic_frame,
-        cfg.qos,
-        cfg.publish_frames ? "true" : "false",
-        cfg.publish_status ? "true" : "false");
-    (void)n;
-    return buf;
+    cJSON_AddBoolToObject(root, "enabled", cfg.enabled);
+    cJSON_AddStringToObject(root, "protocol", cfg.mqtt5 ? "5" : "311");
+    cJSON_AddStringToObject(root, "tls_verify", cfg.tls_skip ? "skip" : "bundle");
+    cJSON_AddBoolToObject(root, "topic_suffix", cfg.topic_suffix);
+    cJSON_AddStringToObject(root, "broker_uri", cfg.broker_uri);
+    cJSON_AddStringToObject(root, "username", cfg.username);
+    cJSON_AddBoolToObject(root, "password_set", cfg.password[0] != '\0');
+    cJSON_AddStringToObject(root, "client_id", cfg.client_id);
+    cJSON_AddStringToObject(root, "topic_cmd", cfg.topic_cmd);
+    cJSON_AddStringToObject(root, "topic_rsp", cfg.topic_rsp);
+    cJSON_AddStringToObject(root, "topic_status", cfg.topic_status);
+    cJSON_AddStringToObject(root, "topic_frame", cfg.topic_frame);
+    cJSON_AddNumberToObject(root, "qos", cfg.qos);
+    cJSON_AddBoolToObject(root, "publish_frames", cfg.publish_frames);
+    cJSON_AddBoolToObject(root, "publish_status", cfg.publish_status);
+
+    char *s = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    return s;
 }
 
 /* Apply an MQTT configuration from a JSON body and schedule a restart.
@@ -288,6 +320,10 @@ esp_err_t web_mqttcfg_set(cJSON *root, const char **err)
             *err = "tls_verify invalid";
             return ESP_ERR_INVALID_ARG;
         }
+    }
+    j = cJSON_GetObjectItem(root, "topic_suffix");
+    if (cJSON_IsBool(j)) {
+        cfg.topic_suffix = cJSON_IsTrue(j);
     }
 
     static const char *const str_fields[] = {
@@ -352,6 +388,31 @@ esp_err_t web_mqttcfg_set(cJSON *root, const char **err)
         *err = "topics must be non-empty and contain no wildcards (+/#)";
         return ESP_ERR_INVALID_ARG;
     }
+    /* With the topic suffix enabled the Client ID is embedded in topics, where
+     * / + # are not allowed. Rejecting them here keeps the topic suffix an
+     * exact copy of the Client ID, so two IDs that differ only in those
+     * characters (e.g. "a/b" vs "a-b") cannot collapse onto the same topics. */
+    if (cfg.topic_suffix && cfg.client_id[0] != '\0' &&
+        strpbrk(cfg.client_id, "/+#")) {
+        *err = "client_id must not contain + # / when topic suffix is enabled";
+        return ESP_ERR_INVALID_ARG;
+    }
+    /* Effective topics embed the Client ID after the first path level, so with
+     * the suffix enabled the total length grows by strlen(client_id) + 1. Reject
+     * configurations that would overflow the runtime topic buffers instead of
+     * silently truncating (two devices could then collide on the same topic). */
+    if (cfg.topic_suffix) {
+        size_t suffix_len = strlen(cfg.client_id);
+        const char *const topics[] = {
+            cfg.topic_cmd, cfg.topic_rsp, cfg.topic_status, cfg.topic_frame
+        };
+        for (size_t i = 0; i < sizeof(topics) / sizeof(topics[0]); i++) {
+            if (strlen(topics[i]) + suffix_len + 1 >= MQTT_TOPIC_EFF_LEN) {
+                *err = "base topic + client id exceeds the topic length limit";
+                return ESP_ERR_INVALID_ARG;
+            }
+        }
+    }
 
     esp_err_t ret = mqtt_web_config_save(&cfg);
     if (ret != ESP_OK) {
@@ -359,12 +420,11 @@ esp_err_t web_mqttcfg_set(cJSON *root, const char **err)
         return ret;
     }
 
-    mqtt_schedule_restart();
+    web_schedule_restart();
     return ESP_OK;
 }
 
 /* ---------------- publish helpers ---------------- */
-
 /* Publish a heap/stack payload to a topic. Copies into the outbox
  * (store=true) so the caller may free the buffer right after this returns;
  * the actual network send happens inside the MQTT task. */
@@ -467,7 +527,39 @@ static void mqtt_dispatch(const char *cmd, const char *id, cJSON *body)
 
 /* Command topic payload: JSON {"id":"...","cmd":"...","body":{...}}.
  * A bare string payload is also accepted and treated as the command name
- * (e.g. "status"). The optional "id" is echoed back in the response. */
+ * (e.g. "status"). The optional "id" is echoed back in the response.
+ *
+ * Security: the MQTT command channel has no session (it cannot log in the way
+ * a WebSocket connection does), so it is restricted to operational read/act
+ * commands. Security-sensitive commands (changing WiFi/Web/account credentials,
+ * the WS origin allow-list, restart toggles, kicking sessions) are rejected.
+ * "renew" is rejected too: it refreshes the Web session TTL, and letting the
+ * unauthenticated MQTT channel touch Web session state would allow anyone with
+ * broker access to extend the admin's session indefinitely.
+ *
+ * This is an allowlist (default-deny), not a blocklist: a command added to
+ * web_rpc_exec() is NOT exposed on the unauthenticated MQTT channel until it
+ * is deliberately added here. */
+
+/* Commands safe to run on the unauthenticated MQTT channel. Every other
+ * web_rpc_exec() command is rejected; keep this list in sync with the
+ * operational (read/act, non-config) commands. */
+static bool mqtt_cmd_allowed(const char *cmd)
+{
+    static const char *const allowed[] = {
+        "status", "frames", "play", "carrier", "rxpause"
+    };
+    if (!cmd) {
+        return true; /* missing cmd: let the dispatcher report "missing cmd" */
+    }
+    for (size_t i = 0; i < sizeof(allowed) / sizeof(allowed[0]); i++) {
+        if (strcmp(cmd, allowed[i]) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static void mqtt_handle_command(const char *payload, int len)
 {
     if (!payload || len <= 0) {
@@ -491,6 +583,11 @@ static void mqtt_handle_command(const char *payload, int len)
         if (cJSON_IsObject(jbody)) {
             body = jbody;
         }
+        if (!mqtt_cmd_allowed(cmd)) {
+            mqtt_respond(cmd, id, NULL, "command not allowed on MQTT");
+            cJSON_Delete(root);
+            return;
+        }
         mqtt_dispatch(cmd, id, body);
         cJSON_Delete(root);
         return;
@@ -503,7 +600,11 @@ static void mqtt_handle_command(const char *payload, int len)
     }
     memcpy(bare, payload, (size_t)len);
     bare[len] = '\0';
-    mqtt_dispatch(bare, NULL, NULL);
+    if (mqtt_cmd_allowed(bare)) {
+        mqtt_dispatch(bare, NULL, NULL);
+    } else {
+        mqtt_respond(bare, NULL, NULL, "command not allowed on MQTT");
+    }
     free(bare);
 }
 
@@ -567,7 +668,13 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
     case MQTT_EVENT_CONNECTED:
         ESP_LOGI(TAG, "connected to broker");
         s_connected = true;
-        esp_mqtt_client_subscribe_single(s_client, s_topic_cmd, s_qos);
+        {
+            int sub_id = esp_mqtt_client_subscribe_single(s_client, s_topic_cmd, s_qos);
+            if (sub_id < 0) {
+                ESP_LOGW(TAG, "failed to subscribe to \"%s\" (msg_id=%d)",
+                         s_topic_cmd, sub_id);
+            }
+        }
         mqtt_publish_status();
         break;
     case MQTT_EVENT_DISCONNECTED:
@@ -581,8 +688,13 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
             if (ev->total_data_len == ev->data_len) {
                 mqtt_handle_command(ev->data, ev->data_len);
             } else {
-                ESP_LOGW(TAG, "fragmented command ignored (%d/%d bytes)",
+                /* Payload larger than the MQTT receive buffer arrives
+                 * fragmented and cannot be reassembled, so the command cannot
+                 * run. Publish an error instead of silently dropping it, so
+                 * automation clients do not mistake the no-op for success. */
+                ESP_LOGW(TAG, "command too large, ignoring (%d of %d bytes)",
                          ev->data_len, ev->total_data_len);
+                mqtt_respond(NULL, NULL, NULL, "command too large");
             }
         }
         break;
@@ -598,17 +710,135 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
 
 /* ---------------- WiFi lifecycle hooks ---------------- */
 
+/* Strip the scheme (mqtt://, mqtts://, tcp://, ssl://, ws://, wss://) off a
+ * broker URI to get the bare hostname used for DNS diagnostics. */
+static void mqtt_uri_host(const char *uri, char *out, size_t out_sz)
+{
+    const char *p = strstr(uri, "://");
+    const char *host = p ? p + 3 : uri;
+    size_t i = 0;
+    while (host[i] != '\0' && host[i] != ':' && host[i] != '/' &&
+           host[i] != '?' && i + 1 < out_sz) {
+        out[i] = host[i];
+        i++;
+    }
+    out[i] = '\0';
+}
+
+/* Resolve the broker hostname with lwIP's resolver. When this fails the only
+ * clue esp-mqtt gives is a bare "transport connect" error, so log the root
+ * cause (DNS vs network) explicitly here. Returns true when the name resolves. */
+static const char *mqtt_gai_strerror(int rc)
+{
+    switch (rc) {
+    case EAI_NONAME: return "host not found";
+    case EAI_SERVICE: return "service not supported";
+    case EAI_FAIL: return "non-recoverable failure";
+    case EAI_MEMORY: return "out of memory";
+    case EAI_FAMILY: return "address family not supported";
+    default: return "unknown";
+    }
+}
+
+static bool mqtt_dns_ok(void)
+{
+    if (s_broker_host[0] == '\0') {
+        return true; /* no hostname to check */
+    }
+    struct addrinfo hints = { 0 };
+    struct addrinfo *res = NULL;
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+
+    int rc = getaddrinfo(s_broker_host, NULL, &hints, &res);
+    if (rc != 0) {
+        ESP_LOGE(TAG, "DNS: cannot resolve broker \"%s\": %s (%d)",
+                 s_broker_host, mqtt_gai_strerror(rc), rc);
+        return false;
+    }
+    for (struct addrinfo *ai = res; ai != NULL; ai = ai->ai_next) {
+        if (ai->ai_family == AF_INET) {
+            struct sockaddr_in *sa = (struct sockaddr_in *)ai->ai_addr;
+            char ip[16] = { 0 };
+            ip4addr_ntoa_r((ip4_addr_t *)&sa->sin_addr, ip, sizeof(ip));
+            ESP_LOGI(TAG, "DNS: broker \"%s\" resolves to %s", s_broker_host, ip);
+        }
+    }
+    freeaddrinfo(res);
+    return true;
+}
+
+/* Log the network state (STA IP + DNS servers) so a failed MQTT connection
+ * can be diagnosed from the serial log alone. */
+static void mqtt_diag_network(void)
+{
+    char ip[16];
+    if (wifi_get_sta_ip(ip, sizeof(ip))) {
+        ESP_LOGI(TAG, "station IP: %s", ip);
+    }
+    esp_netif_t *nif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    if (nif) {
+        for (int i = ESP_NETIF_DNS_MAIN; i <= ESP_NETIF_DNS_MAX; i++) {
+            esp_netif_dns_info_t dns;
+            if (esp_netif_get_dns_info(nif, (esp_netif_dns_type_t)i, &dns) == ESP_OK &&
+                dns.ip.type == ESP_IPADDR_TYPE_V4) {
+                ESP_LOGI(TAG, "DNS server[%d]: " IPSTR, i, IP2STR(&dns.ip.u_addr.ip4));
+            }
+        }
+    }
+}
+
 static void mqtt_start_if_needed(void)
 {
     if (!s_client || s_started) {
         return;
     }
+
+    /* Network readiness gate: never hand the URI to esp-mqtt (which would then
+     * spam a bare transport error every reconnect) until the station link, IP
+     * and broker DNS resolution are all actually up. */
+    if (!wifi_is_sta_connected()) {
+        ESP_LOGW(TAG, "MQTT start deferred: station not connected");
+        return;
+    }
+    char ip[16];
+    if (!wifi_get_sta_ip(ip, sizeof(ip))) {
+        ESP_LOGW(TAG, "MQTT start deferred: no station IP yet");
+        return;
+    }
+
+    mqtt_diag_network();
+
+    if (!mqtt_dns_ok()) {
+        ESP_LOGW(TAG, "MQTT start deferred: broker hostname unresolved, retrying");
+        if (s_dns_timer) {
+            esp_timer_start_periodic(s_dns_timer, 10 * 1000 * 1000);
+        }
+        return;
+    }
+    if (s_dns_timer) {
+        esp_timer_stop(s_dns_timer);
+    }
+
     if (esp_mqtt_client_start(s_client) == ESP_OK) {
         s_started = true;
         ESP_LOGI(TAG, "MQTT client started");
     } else {
         ESP_LOGE(TAG, "MQTT client failed to start");
     }
+}
+
+/* Periodically re-run the readiness check while the broker hostname is
+ * unresolved (or the station link is down), so the client connects on its own
+ * once DNS / network recovers instead of staying dead until a reboot. */
+static void mqtt_dns_timer_cb(void *arg)
+{
+    (void)arg;
+    if (!s_client || s_started || !wifi_is_sta_connected()) {
+        esp_timer_stop(s_dns_timer);
+        return;
+    }
+    mqtt_start_if_needed();
 }
 
 static void mqtt_stop_if_running(void)
@@ -630,6 +860,9 @@ static void mqtt_wifi_event_handler(void *arg, esp_event_base_t base,
     if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         mqtt_start_if_needed();
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
+        if (s_dns_timer) {
+            esp_timer_stop(s_dns_timer);
+        }
         mqtt_stop_if_running();
     }
 }
@@ -647,16 +880,15 @@ esp_err_t mqtt_init(void)
         return ESP_OK;
     }
 
-    strlcpy(s_topic_cmd, cfg.topic_cmd, sizeof(s_topic_cmd));
-    strlcpy(s_topic_rsp, cfg.topic_rsp, sizeof(s_topic_rsp));
-    strlcpy(s_topic_status, cfg.topic_status, sizeof(s_topic_status));
-    strlcpy(s_topic_frame, cfg.topic_frame, sizeof(s_topic_frame));
-    s_qos = cfg.qos;
-    s_publish_frames = cfg.publish_frames;
-    s_publish_status = cfg.publish_status;
+    /* Cache the bare broker hostname for DNS diagnostics. */
+    mqtt_uri_host(cfg.broker_uri, s_broker_host, sizeof(s_broker_host));
 
-    /* Client ID: configured value, or auto-generate one from the MAC. */
+    /* Client ID: configured value, or auto-generate one from the MAC.
+     * s_topic_suffix holds the full sanitized Client ID (validated at save
+     * time to contain no / + #), so it is never silently truncated and two
+     * devices with distinct Client IDs always get distinct topic suffixes. */
     static char s_client_id[32];
+    static char s_topic_suffix[MQTT_CFG_STR_LEN];
     const char *cid = cfg.client_id[0] ? cfg.client_id : NULL;
     if (!cid) {
         uint8_t mac[6];
@@ -666,6 +898,29 @@ esp_err_t mqtt_init(void)
             cid = s_client_id;
         }
     }
+    if (cid) {
+        /* Sanitization is a no-op for validated Client IDs, but keep it as a
+         * guard for the auto-generated/MAC path. */
+        mqtt_topic_sanitize(cid, s_topic_suffix, sizeof(s_topic_suffix));
+    } else {
+        /* No Client ID at all: suffixing would collapse every device onto the
+         * same topics (the exact cross-talk it exists to prevent), so disable
+         * it rather than fall back to a constant suffix. */
+        ESP_LOGW(TAG, "no Client ID available, disabling topic suffix");
+        cfg.topic_suffix = false;
+    }
+
+    mqtt_effective_topic(cfg.topic_cmd, s_topic_suffix, cfg.topic_suffix,
+                         s_topic_cmd, sizeof(s_topic_cmd));
+    mqtt_effective_topic(cfg.topic_rsp, s_topic_suffix, cfg.topic_suffix,
+                         s_topic_rsp, sizeof(s_topic_rsp));
+    mqtt_effective_topic(cfg.topic_status, s_topic_suffix, cfg.topic_suffix,
+                         s_topic_status, sizeof(s_topic_status));
+    mqtt_effective_topic(cfg.topic_frame, s_topic_suffix, cfg.topic_suffix,
+                         s_topic_frame, sizeof(s_topic_frame));
+    s_qos = cfg.qos;
+    s_publish_frames = cfg.publish_frames;
+    s_publish_status = cfg.publish_status;
 
     esp_mqtt_client_config_t mqtt_cfg = {
         .broker.address.uri = cfg.broker_uri,
@@ -698,14 +953,21 @@ esp_err_t mqtt_init(void)
     esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
                                mqtt_wifi_event_handler, NULL);
 
+    esp_timer_create_args_t targs = {
+        .callback = mqtt_dns_timer_cb,
+        .name = "mqtt_dns",
+    };
+    esp_timer_create(&targs, &s_dns_timer);
+
     ir_set_frame_cb(mqtt_frame_cb, NULL);
     ir_set_play_cb(mqtt_play_cb, NULL);
 
-    /* Dedicated frame publisher: keeps the IR capture task non-blocking and
-     * bypasses the esp-mqtt outbox / 1-message-per-poll-cycle throttle. */
+    /* Dedicated frame publisher: keeps the IR capture task non-blocking.
+     * Stack sized like esp-mqtt's own task (6144): QoS-0 publishes send
+     * synchronously here, and the mbedTLS path needs headroom on TLS brokers. */
     s_frame_queue = xQueueCreate(MQTT_FRAME_QUEUE_DEPTH, sizeof(mqtt_frame_msg_t *));
     if (s_frame_queue &&
-        xTaskCreate(mqtt_frame_pub_task, "mqtt_pub", 4096, NULL, 5, NULL) != pdPASS) {
+        xTaskCreate(mqtt_frame_pub_task, "mqtt_pub", 6144, NULL, 5, NULL) != pdPASS) {
         ESP_LOGW(TAG, "failed to create frame publisher task");
         vQueueDelete(s_frame_queue);
         s_frame_queue = NULL;
@@ -722,6 +984,8 @@ esp_err_t mqtt_init(void)
     ESP_LOGI(TAG, "MQTT configured: protocol=%s tls=%s broker=%s client_id=%s",
              cfg.mqtt5 ? "5.0" : "3.1.1", cfg.tls_skip ? "skip-verify" : "bundle",
              cfg.broker_uri, cid ? cid : "(auto)");
+    ESP_LOGI(TAG, "MQTT topics: cmd=%s rsp=%s status=%s frame=%s",
+             s_topic_cmd, s_topic_rsp, s_topic_status, s_topic_frame);
 #else
     ESP_LOGI(TAG, "MQTT disabled by menuconfig");
 #endif
