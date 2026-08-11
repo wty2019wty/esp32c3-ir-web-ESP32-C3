@@ -274,7 +274,9 @@ char *web_rpc_exec(const char *cmd, cJSON *body, const char **err)
         }
         cJSON_AddStringToObject(out, "origin", o);
         free(o);
-        return cJSON_PrintUnformatted(out); /* freed by caller */
+        char *json = cJSON_PrintUnformatted(out); /* freed by caller */
+        cJSON_Delete(out);
+        return json;
     }
 
     if (strcmp(cmd, "logout") == 0) {

@@ -526,24 +526,29 @@ static void mqtt_dispatch(const char *cmd, const char *id, cJSON *body)
  * the WS origin allow-list, restart toggles, kicking sessions) are rejected.
  * "renew" is rejected too: it refreshes the Web session TTL, and letting the
  * unauthenticated MQTT channel touch Web session state would allow anyone with
- * broker access to extend the admin's session indefinitely. */
+ * broker access to extend the admin's session indefinitely.
+ *
+ * This is an allowlist (default-deny), not a blocklist: a command added to
+ * web_rpc_exec() is NOT exposed on the unauthenticated MQTT channel until it
+ * is deliberately added here. */
 
-/* Commands that change credentials / routing / session state and are therefore
- * rejected on the unauthenticated MQTT channel. */
+/* Commands safe to run on the unauthenticated MQTT channel. Every other
+ * web_rpc_exec() command is rejected; keep this list in sync with the
+ * operational (read/act, non-config) commands. */
 static bool mqtt_cmd_allowed(const char *cmd)
 {
-    static const char *const blocked[] = {
-        "authcfg", "wificfg", "webcfg", "mqttcfg", "wsorigin", "logout", "renew"
+    static const char *const allowed[] = {
+        "status", "frames", "play", "carrier", "rxpause"
     };
     if (!cmd) {
         return true; /* missing cmd: let the dispatcher report "missing cmd" */
     }
-    for (size_t i = 0; i < sizeof(blocked) / sizeof(blocked[0]); i++) {
-        if (strcmp(cmd, blocked[i]) == 0) {
-            return false;
+    for (size_t i = 0; i < sizeof(allowed) / sizeof(allowed[0]); i++) {
+        if (strcmp(cmd, allowed[i]) == 0) {
+            return true;
         }
     }
-    return true;
+    return false;
 }
 
 static void mqtt_handle_command(const char *payload, int len)
