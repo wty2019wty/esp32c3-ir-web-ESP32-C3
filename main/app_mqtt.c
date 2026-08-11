@@ -18,6 +18,9 @@
 #include "nvs_flash.h"
 #include "nvs.h"
 #include "cJSON.h"
+#include "lwip/netdb.h"
+#include "lwip/sockets.h"
+#include "lwip/ip4_addr.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
@@ -81,6 +84,12 @@ static int s_qos = 1;
 static bool s_publish_frames = true;
 static bool s_publish_status = true;
 static QueueHandle_t s_frame_queue = NULL;
+
+/* Broker hostname (scheme stripped) for DNS diagnostics. */
+static char s_broker_host[256] = { 0 };
+/* One-shot/periodic timer that re-checks DNS while the broker hostname stays
+ * unresolved, so the client starts as soon as the network path is up. */
+static esp_timer_handle_t s_dns_timer = NULL;
 
 /* ---------------- NVS config load / save ---------------- */
 
@@ -701,17 +710,136 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
 
 /* ---------------- WiFi lifecycle hooks ---------------- */
 
+/* Strip the scheme (mqtt://, mqtts://, tcp://, ssl://, ws://, wss://) off a
+ * broker URI to get the bare hostname used for DNS diagnostics. */
+static void mqtt_uri_host(const char *uri, char *out, size_t out_sz)
+{
+    const char *p = strstr(uri, "://");
+    const char *host = p ? p + 3 : uri;
+    size_t i = 0;
+    while (host[i] != '\0' && host[i] != ':' && host[i] != '/' &&
+           host[i] != '?' && i + 1 < out_sz) {
+        out[i] = host[i];
+        i++;
+    }
+    out[i] = '\0';
+}
+
+/* Resolve the broker hostname with lwIP's resolver. When this fails the only
+ * clue esp-mqtt gives is a bare "transport connect" error, so log the root
+ * cause (DNS vs network) explicitly here. Returns true when the name resolves. */
+static const char *mqtt_gai_strerror(int rc)
+{
+    switch (rc) {
+    case EAI_NONAME: return "host not found";
+    case EAI_SERVICE: return "service not supported";
+    case EAI_FAIL: return "non-recoverable failure";
+    case EAI_MEMORY: return "out of memory";
+    case EAI_FAMILY: return "address family not supported";
+    default: return "unknown";
+    }
+}
+
+static bool mqtt_dns_ok(void)
+{
+    if (s_broker_host[0] == '\0') {
+        return true; /* no hostname to check */
+    }
+    struct addrinfo hints = { 0 };
+    struct addrinfo *res = NULL;
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+
+    int rc = getaddrinfo(s_broker_host, NULL, &hints, &res);
+    if (rc != 0) {
+        ESP_LOGE(TAG, "DNS: cannot resolve broker \"%s\": %s (%d)",
+                 s_broker_host, mqtt_gai_strerror(rc), rc);
+        return false;
+    }
+    for (struct addrinfo *ai = res; ai != NULL; ai = ai->ai_next) {
+        if (ai->ai_family == AF_INET) {
+            struct sockaddr_in *sa = (struct sockaddr_in *)ai->ai_addr;
+            char ip[16] = { 0 };
+            ip4addr_ntoa_r((ip4_addr_t *)&sa->sin_addr, ip, sizeof(ip));
+            ESP_LOGI(TAG, "DNS: broker \"%s\" resolves to %s", s_broker_host, ip);
+        }
+    }
+    freeaddrinfo(res);
+    return true;
+}
+
+/* Log the network state (STA IP + DNS servers) and broker resolution so a
+ * failed MQTT connection can be diagnosed from the serial log alone. */
+static void mqtt_diag_network(void)
+{
+    char ip[16];
+    if (wifi_get_sta_ip(ip, sizeof(ip))) {
+        ESP_LOGI(TAG, "station IP: %s", ip);
+    }
+    esp_netif_t *nif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    if (nif) {
+        for (int i = ESP_NETIF_DNS_MAIN; i <= ESP_NETIF_DNS_MAX; i++) {
+            esp_netif_dns_info_t dns;
+            if (esp_netif_get_dns_info(nif, (esp_netif_dns_type_t)i, &dns) == ESP_OK &&
+                dns.ip.type == ESP_IPADDR_TYPE_V4) {
+                ESP_LOGI(TAG, "DNS server[%d]: " IPSTR, i, IP2STR(&dns.ip.u_addr.ip4));
+            }
+        }
+    }
+    mqtt_dns_ok();
+}
+
 static void mqtt_start_if_needed(void)
 {
     if (!s_client || s_started) {
         return;
     }
+
+    /* Network readiness gate: never hand the URI to esp-mqtt (which would then
+     * spam a bare transport error every reconnect) until the station link, IP
+     * and broker DNS resolution are all actually up. */
+    if (!wifi_is_sta_connected()) {
+        ESP_LOGW(TAG, "MQTT start deferred: station not connected");
+        return;
+    }
+    char ip[16];
+    if (!wifi_get_sta_ip(ip, sizeof(ip))) {
+        ESP_LOGW(TAG, "MQTT start deferred: no station IP yet");
+        return;
+    }
+
+    mqtt_diag_network();
+
+    if (!mqtt_dns_ok()) {
+        ESP_LOGW(TAG, "MQTT start deferred: broker hostname unresolved, retrying");
+        if (s_dns_timer) {
+            esp_timer_start_periodic(s_dns_timer, 10 * 1000 * 1000);
+        }
+        return;
+    }
+    if (s_dns_timer) {
+        esp_timer_stop(s_dns_timer);
+    }
+
     if (esp_mqtt_client_start(s_client) == ESP_OK) {
         s_started = true;
         ESP_LOGI(TAG, "MQTT client started");
     } else {
         ESP_LOGE(TAG, "MQTT client failed to start");
     }
+}
+
+/* Periodically re-run the readiness check while the broker hostname is
+ * unresolved (or the station link is down), so the client connects on its own
+ * once DNS / network recovers instead of staying dead until a reboot. */
+static void mqtt_dns_timer_cb(void *arg)
+{
+    (void)arg;
+    if (!s_client || s_started || !wifi_is_sta_connected()) {
+        esp_timer_stop(s_dns_timer);
+        return;
+    }
+    mqtt_start_if_needed();
 }
 
 static void mqtt_stop_if_running(void)
@@ -733,6 +861,9 @@ static void mqtt_wifi_event_handler(void *arg, esp_event_base_t base,
     if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         mqtt_start_if_needed();
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
+        if (s_dns_timer) {
+            esp_timer_stop(s_dns_timer);
+        }
         mqtt_stop_if_running();
     }
 }
@@ -749,6 +880,9 @@ esp_err_t mqtt_init(void)
         ESP_LOGI(TAG, "MQTT disabled (enabled=%d, broker URI empty)", cfg.enabled);
         return ESP_OK;
     }
+
+    /* Cache the bare broker hostname for DNS diagnostics. */
+    mqtt_uri_host(cfg.broker_uri, s_broker_host, sizeof(s_broker_host));
 
     /* Client ID: configured value, or auto-generate one from the MAC.
      * s_topic_suffix holds the full sanitized Client ID (validated at save
@@ -819,6 +953,12 @@ esp_err_t mqtt_init(void)
                                mqtt_wifi_event_handler, NULL);
     esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
                                mqtt_wifi_event_handler, NULL);
+
+    esp_timer_create_args_t targs = {
+        .callback = mqtt_dns_timer_cb,
+        .name = "mqtt_dns",
+    };
+    esp_timer_create(&targs, &s_dns_timer);
 
     ir_set_frame_cb(mqtt_frame_cb, NULL);
     ir_set_play_cb(mqtt_play_cb, NULL);
