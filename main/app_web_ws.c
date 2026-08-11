@@ -17,6 +17,15 @@
 
 #if CONFIG_HTTPD_WS_SUPPORT
 
+/* The /api/ws Origin allow-list can only be enforced before the 101 upgrade,
+ * where the handshake headers are still readable. Without the pre-handshake
+ * callback the check would silently compile away (the per-frame ws_handler
+ * runs after the upgrade with no headers), turning the whitelist into a no-op
+ * while the settings page still advertises it. Fail the build instead. */
+#if !CONFIG_HTTPD_WS_PRE_HANDSHAKE_CB_SUPPORT
+#error "CONFIG_HTTPD_WS_PRE_HANDSHAKE_CB_SUPPORT must be enabled: the /api/ws Origin allow-list cannot be enforced without it"
+#endif
+
 #define WS_MAX_CLIENTS 6
 
 /* Idle connections get reaped by consumer-router NAT timeouts, which shows up
