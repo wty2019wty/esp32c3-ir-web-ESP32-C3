@@ -6,6 +6,13 @@
       <span v-else class="badge gray">未选择遥控器</span>
     </div>
 
+    <div v-if="state.status" class="row muted" style="font-size:12.5px">
+      <span>模式 {{ state.status.mode || '-' }}</span>
+      <span>IP {{ ipText }}</span>
+      <span>载波 {{ state.status.carrier_hz || state.carrier }} Hz</span>
+      <span v-if="state.status.playing" class="badge yellow">回放中</span>
+    </div>
+
     <div class="row">
       <label class="lbl">遥控器</label>
       <select v-model="state.device" style="flex:1">
@@ -54,6 +61,11 @@ const sendingId = ref(null)
 
 const devices = computed(() => [...new Set(state.codes.map((c) => c.device))])
 const activeCodes = computed(() => state.codes.filter((c) => c.device === state.device))
+const ipText = computed(() => {
+  const s = state.status
+  if (!s) return '-'
+  return s.sta_ip || s.ap_ip || '-'
+})
 
 async function send(c) {
   if (!state.conn.connected) {

@@ -2,7 +2,6 @@
   <div class="card">
     <div class="row" style="justify-content: space-between">
       <h2 style="margin:0">MQTT 连接</h2>
-      <span :class="badgeClass">{{ badgeText }}</span>
     </div>
 
     <div class="row">
@@ -79,18 +78,6 @@ onConn((s) => {
 })
 
 const connected = computed(() => state.conn.connected)
-const deviceOffline = computed(() => state.deviceOnline === false)
-const deviceOnline = computed(() => state.deviceOnline === true)
-const badgeClass = computed(() => {
-  if (!connected.value) return state.conn.state === 'error' ? 'badge red' : 'badge gray'
-  if (deviceOffline.value) return 'badge yellow'
-  return deviceOnline.value ? 'badge green' : 'badge blue'
-})
-const badgeText = computed(() => {
-  if (!connected.value) return state.conn.state === 'error' ? `错误: ${state.conn.error}` : '未连接'
-  if (deviceOffline.value) return '已连接 · 设备离线'
-  return deviceOnline.value ? '已连接 · 设备在线' : '已连接 · 探测中'
-})
 
 function toggle() {
   if (connected.value) {
