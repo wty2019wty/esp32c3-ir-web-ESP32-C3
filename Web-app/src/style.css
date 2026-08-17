@@ -68,6 +68,7 @@ button.ghost { background: #232936; border: 1px solid var(--border); }
 button.ghost:hover { background: #2b3240; }
 button.sm { padding: 4px 10px; font-size: 12px; }
 button.active { background: #3b7dff; box-shadow: 0 0 0 2px rgba(59, 125, 255, .35); }
+button.flash { background: var(--green); color: var(--green-text); }
 
 .badge {
   display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 12px; white-space: nowrap;

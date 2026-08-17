@@ -2,12 +2,20 @@
   <div class="card">
     <div class="row" style="justify-content: space-between">
       <h2 style="margin:0">学习模式</h2>
-      <button class="sm" :class="{ active: state.learning }" @click="toggleLearning" :disabled="!connected">
-        {{ state.learning ? '停止监听' : '开始监听' }}
-      </button>
+      <div class="row" style="margin:0">
+        <button class="sm ghost" @click="toggleFramePush" :disabled="!connected" :class="{ active: framePushOn }">
+          推送帧: {{ framePushOn === null ? '未知' : framePushOn ? '开' : '关' }}
+        </button>
+        <button class="sm ghost" @click="pullHistory" :disabled="!connected || pulling">{{ pulling ? '拉取中…' : '拉取历史帧' }}</button>
+        <button class="sm" :class="{ active: state.learning }" @click="toggleLearning" :disabled="!connected">
+          {{ state.learning ? '停止监听' : '开始监听' }}
+        </button>
+      </div>
     </div>
     <div class="muted" style="margin-bottom:8px">
-      需要设备开启「推送帧」（Web 设置页 MQTT → 推送帧，或命令 <span class="mono">fpub {"enabled":true}</span>）。
+      捕获方式：监听「帧主题」推送（需设备开推送帧，或 <span class="mono">fpub {"enabled":true}</span>）；
+      也可用「拉取历史帧」直接读设备 RAM 历史（<span class="mono">frames</span> 命令，无需推送帧）。
+      设备须处于 STA 模式且 MQTT 已连接同一 broker。
     </div>
 
     <div v-if="state.lastFrame" class="card" style="padding:10px 12px; background:var(--bg)">
@@ -52,13 +60,32 @@
 
 <script setup>
 import { reactive, ref, computed } from 'vue'
-import { state } from '../store'
+import { state, pushFrame } from '../store'
+import { sendCmd, setFramePublish } from '../mqtt'
 import { saveCode, genId } from '../kv'
 
 const emit = defineEmits(['saved', 'toast'])
 
 const connected = computed(() => state.conn.connected)
 const devices = computed(() => [...new Set(state.codes.map((c) => c.device))])
+const pulling = ref(false)
+const framePushOn = ref(null)
+
+// fpub 查询 + 开关（MQTT 专用命令，不写 NVS）
+async function toggleFramePush() {
+  if (!connected.value) {
+    emit('toast', '请先连接 broker')
+    return
+  }
+  const next = framePushOn.value !== true
+  try {
+    const r = await setFramePublish(next)
+    framePushOn.value = r.result?.publish_frames === true
+    emit('toast', `帧推送 -> ${framePushOn.value ? '开' : '关'}`)
+  } catch (e) {
+    emit('toast', `fpub 失败: ${e.message}`)
+  }
+}
 
 const saveForm = reactive({ device: '', name: '', note: '', type: 'hxd' })
 
@@ -90,6 +117,38 @@ function toggleLearning() {
   if (!connected.value) {
     state.learning = false
     emit('toast', '请先连接 broker')
+    return
+  }
+  // 开始监听时先主动拉一次设备历史，避免"等推送没反应"
+  pullHistory()
+}
+
+// 用 frames 命令增量拉取设备 RAM 历史帧（不依赖推送帧 / 不受 topic_suffix 影响）
+async function pullHistory() {
+  if (!connected.value) {
+    emit('toast', '请先连接 broker')
+    return
+  }
+  if (pulling.value) return
+  pulling.value = true
+  let since = state.frames.length ? state.frames[0].seq : 0
+  let total = 0
+  try {
+    for (let i = 0; i < 8; i++) {
+      const r = await sendCmd('frames', { since })
+      const res = r.result || {}
+      const list = res.frames || []
+      for (const f of list) pushFrame(f)
+      total += list.length
+      const lastSeq = res.last_seq
+      since = typeof lastSeq === 'number' ? lastSeq : since
+      if (!res.truncated || list.length === 0) break
+    }
+    emit('toast', total ? `拉取到 ${total} 帧` : '设备历史为空（先按遥控器对准接收头按键）')
+  } catch (e) {
+    emit('toast', `拉取历史失败: ${e.message}`)
+  } finally {
+    pulling.value = false
   }
 }
 

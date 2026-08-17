@@ -26,7 +26,13 @@
 
       <span style="flex:1"></span>
       <label class="lbl">回放暂停接收</label>
-      <button class="sm ghost" @click="toggleRxPause" :disabled="!connected" :title="'当前: ' + (state.status?.rx_pause_on_play ? '开' : '关')">
+      <button
+        class="sm ghost"
+        :class="{ flash: flashRxPause }"
+        @click="toggleRxPause"
+        :disabled="!connected"
+        :title="'当前: ' + (state.status?.rx_pause_on_play ? '开' : '关')"
+      >
         {{ state.status?.rx_pause_on_play ? '开' : '关' }}
       </button>
     </div>
@@ -34,11 +40,12 @@
 </template>
 
 <script setup>
-import { ref, computed, watch, nextTick } from 'vue'
+import { ref, computed, watch } from 'vue'
 import { sendCmd } from '../mqtt'
 import { state, pushPlayLog } from '../store'
 
 const carrierInput = ref('38000')
+const flashRxPause = ref(false)
 
 watch(
   () => state.status?.carrier_hz,
@@ -75,8 +82,17 @@ async function applyCarrier() {
 async function toggleRxPause() {
   const cur = !!state.status?.rx_pause_on_play
   try {
-    await sendCmd('rxpause', { enabled: !cur })
-    pushPlayLog(`回放暂停接收 -> ${!cur ? '开' : '关'}`, true)
+    // 设备响应携带新的开关状态，必须用它回写本地状态：
+    // MQTT 通道在 rxpause 后不会主动推送 status，不回写界面就永远不变。
+    const r = await sendCmd('rxpause', { enabled: !cur })
+    const next =
+      typeof r.result?.rx_pause_on_play === 'boolean'
+        ? r.result.rx_pause_on_play
+        : !cur
+    state.status = { ...(state.status || {}), rx_pause_on_play: next }
+    pushPlayLog(`回放暂停接收 -> ${next ? '开' : '关'}`, true)
+    flashRxPause.value = true
+    setTimeout(() => (flashRxPause.value = false), 600)
   } catch (e) {
     pushPlayLog(`rxpause 失败: ${e.message}`, false)
   }

@@ -38,16 +38,13 @@ function emit(name, payload) {
 function onMessage(topic, payloadBuf) {
   const text = payloadBuf.toString()
   if (topic === cfg.topicStatus) {
-    let data = null
-    try {
-      data = JSON.parse(text)
-    } catch {
-      data = { offline: true }
-    }
-    if (data && data.offline === 'offline') {
+    // 设备 LWT 遗嘱是裸字符串 "offline"；正常状态是 JSON 对象
+    if (text === 'offline') {
       emit('status', { offline: true })
-    } else if (data) {
-      emit('status', data)
+    } else {
+      try {
+        emit('status', JSON.parse(text))
+      } catch { /* ignore */ }
     }
     return
   }
@@ -176,6 +173,11 @@ export function playFrame(seqNo, freq) {
 
 export function setCarrier(freq) {
   return sendCmd('carrier', { freq })
+}
+
+// 运行时开关 MQTT 帧推送（设备端 fpub 命令，不写 NVS；缺省 enabled 仅查询当前状态）
+export function setFramePublish(enabled) {
+  return sendCmd('fpub', enabled == null ? {} : { enabled })
 }
 
 export function onStatus(fn) { listeners.status.push(fn) }
