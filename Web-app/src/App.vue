@@ -29,13 +29,17 @@ import DeviceStatus from './components/DeviceStatus.vue'
 import LearnPanel from './components/LearnPanel.vue'
 import CodeLibrary from './components/CodeLibrary.vue'
 import RemotePad from './components/RemotePad.vue'
-import { onStatus, onFrame, onConn, disconnect } from './mqtt'
+import { onStatus, onFrame, onConn, disconnect, sendCmd } from './mqtt'
 import { state } from './store'
 
 const connPanel = ref(null)
 const lib = ref(null)
 const toasts = ref([])
 let toastTimer = null
+let pollTimer = null
+let probing = false
+
+const PROBE_INTERVAL_MS = 12000
 
 function toast(text) {
   toasts.value.push({ text, id: Date.now() })
@@ -52,13 +56,53 @@ function onSaved() {
   lib.value?.load()
 }
 
+// 主动探测设备在线状态：status 命令有响应=在线，超时/失败=离线。
+// 这是必要的——设备正常断开（重启）不触发 LWT，仅靠 status 主题会把
+// 残留的 retained 在线状态误判为"设备在线"。
+async function probeDevice() {
+  if (!state.conn.connected || probing) return
+  probing = true
+  try {
+    const r = await sendCmd('status')
+    state.deviceOnline = true
+    if (r.result && !r.result.offline) state.status = r.result
+    if (r.result?.carrier_hz) state.carrier = r.result.carrier_hz
+  } catch {
+    state.deviceOnline = false
+  } finally {
+    probing = false
+  }
+}
+
+function stopPolling() {
+  if (pollTimer) {
+    clearInterval(pollTimer)
+    pollTimer = null
+  }
+}
+
 onMounted(() => {
   onConn((s) => {
     state.conn = s
+    if (s.connected) {
+      // 连接建立后立刻探测一次，并定时轮询保活判定
+      probeDevice()
+      if (!pollTimer) pollTimer = setInterval(probeDevice, PROBE_INTERVAL_MS)
+    } else {
+      stopPolling()
+      state.deviceOnline = null
+    }
   })
   onStatus((data) => {
-    state.status = data
-    if (data && data.carrier_hz) state.carrier = data.carrier_hz
+    if (data && data.offline) {
+      // LWT：设备异常掉线
+      state.deviceOnline = false
+    } else {
+      // retained 在线状态 / 播放变化推送
+      state.deviceOnline = true
+      state.status = data
+      if (data && data.carrier_hz) state.carrier = data.carrier_hz
+    }
   })
   onFrame((frame) => {
     // 始终记录帧列表；但只有「监听中」才把最新帧显示到学习面板，
@@ -69,5 +113,8 @@ onMounted(() => {
   })
 })
 
-onBeforeUnmount(() => disconnect())
+onBeforeUnmount(() => {
+  stopPolling()
+  disconnect()
+})
 </script>

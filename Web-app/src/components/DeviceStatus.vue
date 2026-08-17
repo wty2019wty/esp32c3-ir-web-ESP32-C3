@@ -54,7 +54,7 @@ watch(
   }
 )
 
-const offline = computed(() => !!state.status?.offline)
+const offline = computed(() => state.deviceOnline === false)
 const connected = computed(() => state.conn.connected)
 const ipText = computed(() => {
   const s = state.status

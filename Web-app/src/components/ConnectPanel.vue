@@ -79,17 +79,17 @@ onConn((s) => {
 })
 
 const connected = computed(() => state.conn.connected)
-const deviceOffline = computed(() => !!state.status?.offline)
-const hasStatus = computed(() => !!state.status)
+const deviceOffline = computed(() => state.deviceOnline === false)
+const deviceOnline = computed(() => state.deviceOnline === true)
 const badgeClass = computed(() => {
   if (!connected.value) return state.conn.state === 'error' ? 'badge red' : 'badge gray'
   if (deviceOffline.value) return 'badge yellow'
-  return hasStatus.value ? 'badge green' : 'badge blue'
+  return deviceOnline.value ? 'badge green' : 'badge blue'
 })
 const badgeText = computed(() => {
   if (!connected.value) return state.conn.state === 'error' ? `错误: ${state.conn.error}` : '未连接'
   if (deviceOffline.value) return '已连接 · 设备离线'
-  return hasStatus.value ? '已连接 · 设备在线' : '已连接'
+  return deviceOnline.value ? '已连接 · 设备在线' : '已连接 · 探测中'
 })
 
 function toggle() {

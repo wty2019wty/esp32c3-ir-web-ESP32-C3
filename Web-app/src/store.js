@@ -6,6 +6,9 @@ export const state = reactive({
   conn: { connected: false, state: 'idle', error: '' },
   // 设备实时状态（status 主题）
   status: null,
+  // 设备在线判定：null=未知 true=在线 false=离线
+  // 由 status 主题（retained/推送/LWT）+ 主动 status 命令轮询共同维护
+  deviceOnline: null,
   // 捕获的红外帧（frame 主题）
   learning: false,
   lastFrame: null,
