@@ -1,0 +1,23 @@
+{
+  "name": "ir-web-remote",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "红外万能遥控器前端：MQTT over WebSocket + Cloudflare KV 码库",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "deploy:worker": "wrangler deploy",
+    "deploy:pages": "wrangler pages deploy dist"
+  },
+  "dependencies": {
+    "mqtt": "^5.10.1",
+    "vue": "^3.4.38"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "^5.1.4",
+    "vite": "^5.4.8",
+    "wrangler": "^3.80.0"
+  }
+}

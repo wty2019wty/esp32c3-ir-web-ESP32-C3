@@ -1,0 +1,16 @@
+name = "ir-web-remote"
+main = "worker/index.js"
+compatibility_date = "2024-09-01"
+
+# 红外码库 KV 命名空间（部署前在 CF 控制台创建或运行 wrangler kv namespace create CODE_LIB，填入 id）
+[[kv_namespaces]]
+binding = "CODE_LIB"
+id = "REPLACE_WITH_YOUR_KV_NAMESPACE_ID"
+
+# 前端静态资源（npm run build 生成的 dist），与 Worker 同域部署
+[assets]
+directory = "./dist"
+binding = "ASSETS"
+not_found_handling = "single-page-application"
+
+# 本地开发（wrangler dev 时的 MQTT WS 允许同源，无需额外配置）

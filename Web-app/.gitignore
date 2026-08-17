@@ -2,3 +2,12 @@
 .env
 .edgeone/*
 .tef_dist/*
+
+# Node / Vite
+node_modules/
+dist/
+*.local
+
+# Wrangler
+.wrangler/
+.dev.vars
