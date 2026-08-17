@@ -13,9 +13,9 @@
       </div>
     </div>
     <div class="muted" style="margin-bottom:8px">
-      捕获方式：监听「帧主题」推送（需设备开推送帧，或 <span class="mono">fpub {"enabled":true}</span>）；
-      也可用「拉取历史帧」直接读设备 RAM 历史（<span class="mono">frames</span> 命令，无需推送帧）。
-      设备须处于 STA 模式且 MQTT 已连接同一 broker。
+      「开始监听」会开启一个捕获会话：清空当前帧、自动打开设备推送帧（<span class="mono">fpub</span>）、
+      并拉取一次历史；**停止监听时自动关闭推送帧**并冻结显示。也可单独用「拉取历史帧」读设备 RAM 历史
+      （<span class="mono">frames</span> 命令）。设备须处于 STA 模式且 MQTT 已连接同一 broker。
     </div>
 
     <div v-if="state.lastFrame" class="card" style="padding:10px 12px; background:var(--bg)">
@@ -32,7 +32,8 @@
       </div>
       <pre style="margin-top:6px; max-height:120px">{{ frameDetail }}</pre>
     </div>
-    <div v-else class="muted">监听中按遥控器按键，捕获的红外帧会显示在这里。</div>
+    <div v-else-if="state.learning" class="muted">监听中：按遥控器对准接收头按键，捕获的红外帧会显示在这里。</div>
+    <div v-else class="muted">点「开始监听」进入捕获会话。</div>
 
     <template v-if="state.lastFrame">
       <div class="row" style="margin-top:8px">
@@ -112,15 +113,43 @@ const canSave = computed(() => {
 })
 
 function toggleLearning() {
-  state.learning = !state.learning
-  if (!state.learning) return
   if (!connected.value) {
-    state.learning = false
     emit('toast', '请先连接 broker')
     return
   }
-  // 开始监听时先主动拉一次设备历史，避免"等推送没反应"
-  pullHistory()
+  if (state.learning) {
+    stopListening()
+  } else {
+    startListening()
+  }
+}
+
+async function startListening() {
+  // 清空本次会话的帧，从空白开始捕获
+  state.frames = []
+  state.lastFrame = null
+  state.learning = true
+  // 打开设备推送帧（失败不阻塞：仍可走拉取历史）
+  try {
+    const r = await setFramePublish(true)
+    framePushOn.value = r.result?.publish_frames === true
+  } catch {
+    framePushOn.value = true
+  }
+  emit('toast', '监听中：按遥控器对准接收头按键')
+  await pullHistory()
+}
+
+async function stopListening() {
+  state.learning = false
+  // 停止监听即关闭设备推送帧
+  try {
+    const r = await setFramePublish(false)
+    framePushOn.value = r.result?.publish_frames === false
+  } catch (e) {
+    emit('toast', `关闭推送帧失败: ${e.message}`)
+  }
+  emit('toast', `已停止监听，本次捕获 ${state.frames.length} 帧`)
 }
 
 // 用 frames 命令增量拉取设备 RAM 历史帧（不依赖推送帧 / 不受 topic_suffix 影响）

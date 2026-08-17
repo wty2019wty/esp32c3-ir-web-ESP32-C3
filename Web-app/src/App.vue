@@ -30,7 +30,7 @@ import LearnPanel from './components/LearnPanel.vue'
 import CodeLibrary from './components/CodeLibrary.vue'
 import RemotePad from './components/RemotePad.vue'
 import { onStatus, onFrame, onConn, disconnect } from './mqtt'
-import { state, pushFrame } from './store'
+import { state } from './store'
 
 const connPanel = ref(null)
 const lib = ref(null)
@@ -61,7 +61,11 @@ onMounted(() => {
     if (data && data.carrier_hz) state.carrier = data.carrier_hz
   })
   onFrame((frame) => {
-    pushFrame(frame)
+    // 始终记录帧列表；但只有「监听中」才把最新帧显示到学习面板，
+    // 让停止监听/开始监听有可感知的差别
+    state.frames.unshift(frame)
+    if (state.frames.length > 30) state.frames.length = 30
+    if (state.learning) state.lastFrame = frame
   })
 })
 
