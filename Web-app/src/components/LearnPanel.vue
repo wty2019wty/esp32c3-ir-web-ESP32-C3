@@ -142,10 +142,10 @@ async function startListening() {
 
 async function stopListening() {
   state.learning = false
-  // 停止监听即关闭设备推送帧
+  // 停止监听即关闭设备推送帧，并用设备返回的真实状态刷新按钮
   try {
     const r = await setFramePublish(false)
-    framePushOn.value = r.result?.publish_frames === false
+    framePushOn.value = r.result?.publish_frames === true
   } catch (e) {
     emit('toast', `关闭推送帧失败: ${e.message}`)
   }
