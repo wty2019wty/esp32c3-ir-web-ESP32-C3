@@ -1,26 +1,31 @@
 <template>
   <div>
-    <header class="app-header">
-      <h1>📡 IR 万能遥控器</h1>
-      <nav class="tabs">
-        <button :class="{ active: tab === 'remote' }" @click="tab = 'remote'">遥控面板</button>
-        <button :class="{ active: tab === 'learn' }" @click="tab = 'learn'">学习模式</button>
-        <button :class="{ active: tab === 'settings' }" @click="tab = 'settings'">设置</button>
-      </nav>
-      <span :class="badgeClass">{{ badgeText }}</span>
-    </header>
+    <Login v-if="!authed" @ok="onLoginOk" />
 
-    <div v-show="tab === 'remote'">
-      <RemotePad @toast="toast" />
-      <CodeLibrary ref="lib" @toast="toast" />
-    </div>
+    <template v-else>
+      <header class="app-header">
+        <h1>📡 IR 万能遥控器</h1>
+        <nav class="tabs">
+          <button :class="{ active: tab === 'remote' }" @click="tab = 'remote'">遥控面板</button>
+          <button :class="{ active: tab === 'learn' }" @click="tab = 'learn'">学习模式</button>
+          <button :class="{ active: tab === 'settings' }" @click="tab = 'settings'">设置</button>
+        </nav>
+        <span :class="badgeClass">{{ badgeText }}</span>
+        <button class="sm ghost" title="退出登录" @click="logout">退出</button>
+      </header>
 
-    <LearnPanel v-show="tab === 'learn'" @saved="onSaved" @toast="toast" />
+      <div v-show="tab === 'remote'">
+        <RemotePad @toast="toast" />
+        <CodeLibrary ref="lib" @toast="toast" />
+      </div>
 
-    <div v-show="tab === 'settings'">
-      <ConnectPanel />
-      <DeviceStatus />
-    </div>
+      <LearnPanel v-show="tab === 'learn'" @saved="onSaved" @toast="toast" />
+
+      <div v-show="tab === 'settings'">
+        <ConnectPanel />
+        <DeviceStatus />
+      </div>
+    </template>
 
     <div v-if="toasts.length" class="toast" style="right:14px; bottom:14px; top:auto; display:block">
       <div v-for="(t, i) in toasts" :key="i">{{ t.text }}</div>
@@ -35,12 +40,15 @@ import DeviceStatus from './components/DeviceStatus.vue'
 import LearnPanel from './components/LearnPanel.vue'
 import CodeLibrary from './components/CodeLibrary.vue'
 import RemotePad from './components/RemotePad.vue'
+import Login from './components/Login.vue'
 import { onStatus, onFrame, onConn, disconnect, sendCmd } from './mqtt'
 import { state } from './store'
+import { getAuthToken, clearAuth, onUnauthorized } from './kv'
 
 const lib = ref(null)
 const toasts = ref([])
 const tab = ref('remote')
+const authed = ref(!!getAuthToken())
 let toastTimer = null
 let pollTimer = null
 let probing = false
@@ -68,6 +76,22 @@ function toast(text) {
       toastTimer = null
     }, 3000)
   }
+}
+
+function onLoginOk() {
+  authed.value = true
+}
+
+function onAuthRequired() {
+  authed.value = false
+}
+
+function logout() {
+  clearAuth()
+  disconnect()
+  stopPolling()
+  state.deviceOnline = null
+  authed.value = false
 }
 
 function onSaved() {
@@ -98,6 +122,7 @@ function stopPolling() {
 }
 
 onMounted(() => {
+  onUnauthorized(onAuthRequired)
   onConn((s) => {
     state.conn = s
     if (s.connected) {

@@ -1,6 +1,10 @@
-// Cloudflare Worker KV 码库 API 客户端。
+// Cloudflare Worker KV 码库 API 客户端 + 登录认证。
 // Worker 暴露的 REST 接口见 worker/index.js，部署后与前端同源（相对路径 /api）。
 const BASE = '/api'
+
+// 认证回调：收到 401 时通知前端登出
+let onUnauthorizedHandler = null
+export function onUnauthorized(fn) { onUnauthorizedHandler = fn }
 
 // 一条码库记录
 // {
@@ -17,11 +21,25 @@ const BASE = '/api'
 // }
 
 async function request(method, path, body) {
-  const res = await fetch(`${BASE}${path}`, {
-    method,
-    headers: body != null ? { 'Content-Type': 'application/json' } : undefined,
-    body: body != null ? JSON.stringify(body) : undefined,
-  })
+  const headers = {}
+  const token = getAuthToken()
+  if (token) headers.Authorization = `Bearer ${token}`
+  if (body != null) headers['Content-Type'] = 'application/json'
+  let res
+  try {
+    res = await fetch(`${BASE}${path}`, {
+      method,
+      headers,
+      body: body != null ? JSON.stringify(body) : undefined,
+    })
+  } catch (e) {
+    throw new Error('无法访问码库服务')
+  }
+  if (res.status === 401) {
+    clearAuth()
+    if (onUnauthorizedHandler) onUnauthorizedHandler()
+    throw new Error('未登录或登录已过期')
+  }
   if (!res.ok) {
     let msg = `${res.status} ${res.statusText}`
     try {
@@ -32,6 +50,58 @@ async function request(method, path, body) {
   }
   return res.json()
 }
+
+/* ---------------- 登录态 ---------------- */
+
+const AUTH_KEY = 'ir-web-remote-auth'
+
+export function getAuthToken() {
+  try {
+    return localStorage.getItem(AUTH_KEY) || ''
+  } catch {
+    return ''
+  }
+}
+
+export function saveAuth({ token, user }) {
+  try {
+    localStorage.setItem(AUTH_KEY, JSON.stringify({ token, user }))
+  } catch { /* ignore */ }
+}
+
+export function getAuthUser() {
+  try {
+    const s = localStorage.getItem(AUTH_KEY)
+    return s ? JSON.parse(s).user : ''
+  } catch {
+    return ''
+  }
+}
+
+export function clearAuth() {
+  try {
+    localStorage.removeItem(AUTH_KEY)
+  } catch { /* ignore */ }
+}
+
+export async function login(user, pass) {
+  const res = await fetch(`${BASE}/login`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ user, pass }),
+  })
+  let data = null
+  try {
+    data = await res.json()
+  } catch { /* ignore */ }
+  if (!res.ok) {
+    throw new Error((data && data.error) || `登录失败 (${res.status})`)
+  }
+  saveAuth({ token: data.token, user: data.user })
+  return data
+}
+
+/* ---------------- 码库 API ---------------- */
 
 export async function listCodes(device) {
   const q = device ? `?device=${encodeURIComponent(device)}` : ''

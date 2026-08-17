@@ -7,10 +7,17 @@ compatibility_date = "2024-09-01"
 binding = "CODE_LIB"
 id = "REPLACE_WITH_YOUR_KV_NAMESPACE_ID"
 
+# 初始账号（仅首次部署无账号记录时用于初始化，之后以 KV 为准）
+[vars]
+ADMIN_USER = "admin"
+# ADMIN_PASS 首次初始化用：wrangler secret put ADMIN_PASS
+
 # 前端静态资源（npm run build 生成的 dist），与 Worker 同域部署
 [assets]
 directory = "./dist"
 binding = "ASSETS"
 not_found_handling = "single-page-application"
 
-# 本地开发（wrangler dev 时的 MQTT WS 允许同源，无需额外配置）
+# 部署后必须设置签名密钥：
+#   npx wrangler secret put AUTH_SECRET
+#   npx wrangler secret put ADMIN_PASS
