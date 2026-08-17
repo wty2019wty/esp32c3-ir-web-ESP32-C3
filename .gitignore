@@ -12,3 +12,11 @@ managed_components
 # Python
 __pycache__/
 *.py[cod]
+
+# Web-app Node.js 环境（避免提交大文件）
+/Web-app/.node-v24.19.0-win-x64/
+/Web-app/.node-global/
+/Web-app/.npm-cache/
+/Web-app/.node-corepack/
+/Web-app/.xdg-cache/
+/Web-app/node_modules/
