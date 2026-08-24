@@ -61,9 +61,9 @@ import LearnPanel from './components/LearnPanel.vue'
 import CodeLibrary from './components/CodeLibrary.vue'
 import RemotePad from './components/RemotePad.vue'
 import Login from './components/Login.vue'
-import { onStatus, onFrame, onConn, disconnect, sendCmd } from './mqtt'
+import { onStatus, onFrame, onConn, disconnect, sendCmd, connect, normalizeBrokerUrl } from './mqtt'
 import { state } from './store'
-import { getAuthToken, logout as kvLogout, onUnauthorized } from './kv'
+import { getAuthToken, getMqttConfig, logout as kvLogout, onUnauthorized } from './kv'
 
 const lib = ref(null)
 const toasts = ref([])
@@ -97,10 +97,35 @@ function toast(text, kind = '') {
 
 function onLoginOk() {
   authed.value = true
+  autoConnect()
 }
 
 function onAuthRequired() {
   authed.value = false
+}
+
+// 登录成功后自动拉取云端 MQTT 配置并尝试连接：
+// 配置完整（url + 账号密码齐全）才连，静默失败不打扰用户（设置页可手动排查）
+async function autoConnect() {
+  let cfg = null
+  try {
+    cfg = await getMqttConfig()
+  } catch { /* 拉取失败就当没有配置 */ }
+  if (!cfg || !cfg.url || !cfg.username || !cfg.password) return
+  let url
+  try {
+    url = normalizeBrokerUrl(cfg.url)
+  } catch { return }
+  if (!url || state.conn.connected) return
+  connect({
+    url,
+    username: cfg.username,
+    password: cfg.password,
+    topicCmd: cfg.topics?.cmd,
+    topicRsp: cfg.topics?.rsp,
+    topicStatus: cfg.topics?.status,
+    topicFrame: cfg.topics?.frame,
+  })
 }
 
 async function logout() {
@@ -141,6 +166,8 @@ function stopPolling() {
 
 onMounted(() => {
   onUnauthorized(onAuthRequired)
+  // 页面刷新时已有有效登录态：直接自动连接（onLoginOk 只覆盖「刚登录」场景）
+  if (authed.value) autoConnect()
   onConn((s) => {
     state.conn = s
     if (s.connected) {

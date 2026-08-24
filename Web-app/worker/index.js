@@ -4,6 +4,8 @@
 // 路由：
 //   POST   /api/login               登录，返回签名 token（唯一公开接口，带 IP 限流）
 //   POST   /api/logout              登出，递增 token 版本号吊销全部现有 token（需 Bearer token）
+//   GET    /api/mqtt-config         取 MQTT 连接配置（敏感字段 AES-GCM 加密存 KV，需 Bearer token）
+//   PUT    /api/mqtt-config         保存 MQTT 连接配置（需 Bearer token）
 //   GET    /api/codes               列出全部码（需 Bearer token）
 //   GET    /api/codes/:id           取单个
 //   PUT    /api/codes/:id           保存/更新
@@ -24,6 +26,7 @@ const KV_PREFIX = 'code:'
 const AUTH_PASS_KEY = 'auth:pass'   // {"salt","iter","hash"}
 const AUTH_USER_KEY = 'auth:user'
 const AUTH_VER_KEY = 'auth:ver'     // token 版本号，变更即吊销全部旧 token
+const MQTT_CFG_KEY = 'mqtt:config'  // MQTT 连接配置（敏感字段 AES-GCM 加密）
 const RL_KEY_PREFIX = 'rl:login:'   // 登录限流计数（按 IP）
 const TOKEN_TTL_MS = 24 * 3600 * 1000
 const PBKDF2_ITER = 150000
@@ -387,6 +390,103 @@ async function handleCodes(request, env, url, id) {
   return error(request, env, 'method not allowed', 405)
 }
 
+/* ---------------- MQTT 连接配置（AES-GCM 加密存储） ---------------- */
+
+// 加密密钥从 AUTH_SECRET 派生（HKDF-SHA256），不直接复用 token 签名密钥材料
+async function mqttCfgKey(env) {
+  const base = await crypto.subtle.importKey('raw', enc.encode(env.AUTH_SECRET), 'HKDF', false, ['deriveKey'])
+  return crypto.subtle.deriveKey(
+    { name: 'HKDF', hash: 'SHA-256', salt: enc.encode('mqtt-config-v1'), info: enc.encode('mqtt-cred') },
+    base,
+    { name: 'AES-GCM', length: 256 },
+    false,
+    ['encrypt', 'decrypt']
+  )
+}
+
+// 敏感字段（password）AES-GCM 加密，输出 "enc:v1:<iv-b64url>:<ct-b64url>"
+async function encryptField(env, plain) {
+  const iv = crypto.getRandomValues(new Uint8Array(12))
+  const key = await mqttCfgKey(env)
+  const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, enc.encode(plain))
+  return `enc:v1:${b64url(iv)}:${b64url(ct)}`
+}
+
+async function decryptField(env, value) {
+  const m = /^enc:v1:([^:]+):(.+)$/.exec(value || '')
+  if (!m) return value || '' // 兼容未加密的历史记录
+  try {
+    const key = await mqttCfgKey(env)
+    const pt = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: unb64url(m[1]) }, key, unb64url(m[2]))
+    return dec.decode(pt)
+  } catch {
+    return '' // 解密失败（如 AUTH_SECRET 已更换）：按无密码处理，让用户重新填写
+  }
+}
+
+// 校验并规范化 MQTT 配置。url/username 明文存储（非机密），password 加密存储。
+async function normalizeMqttConfig(env, body) {
+  if (!body || typeof body !== 'object') return null
+  const out = {}
+  out.url = String(body.url || '').trim().slice(0, 256)
+  if (!out.url) return null
+  out.username = String(body.username || '').trim().slice(0, 64)
+  const password = String(body.password ?? '')
+  // password 为空字符串表示「清除已存密码」；undefined 表示保持原值不动
+  if (password === '') {
+    out.password = ''
+  } else {
+    let plain = password
+    if (!/^enc:v1:/.test(password)) {
+      plain = await encryptField(env, password)
+    }
+    out.password = plain
+  }
+  const topics = body.topics && typeof body.topics === 'object' ? body.topics : {}
+  out.topics = {}
+  for (const k of ['cmd', 'rsp', 'status', 'frame']) {
+    out.topics[k] = String(topics[k] || '').trim().slice(0, 128)
+  }
+  return out
+}
+
+async function handleMqttConfig(request, env) {
+  const kv = env.CODE_LIB
+
+  // GET /api/mqtt-config：返回配置；password 解密后原样下发（浏览器发起 MQTT 连接必须持有明文）
+  if (request.method === 'GET') {
+    const raw = await kv.get(MQTT_CFG_KEY)
+    if (!raw) return json(request, env, { config: null })
+    try {
+      const cfg = JSON.parse(raw)
+      cfg.password = await decryptField(env, cfg.password)
+      return json(request, env, { config: cfg })
+    } catch {
+      return error(request, env, 'corrupt record', 500)
+    }
+  }
+
+  // PUT /api/mqtt-config
+  if (request.method === 'PUT') {
+    const cl = request.headers.get('content-length')
+    if (cl && Number(cl) > MAX_BODY) return error(request, env, 'body too large', 413)
+    let body
+    try {
+      body = await request.json()
+    } catch {
+      return error(request, env, 'invalid json')
+    }
+    const rec = await normalizeMqttConfig(env, body)
+    if (!rec) return error(request, env, '需要 url 字段')
+    // 前端传 "enc:v1:..." 表示原样保留服务端密文（避免明文回传往返）；否则是新增密
+    rec.updated_at = Date.now()
+    await kv.put(MQTT_CFG_KEY, JSON.stringify(rec))
+    return json(request, env, { ok: true })
+  }
+
+  return error(request, env, 'method not allowed', 405)
+}
+
 /* ---------------- 入口 ---------------- */
 
 export default {
@@ -405,7 +505,8 @@ export default {
 
     const mCodes = url.pathname.match(/^\/api\/codes(?:\/([^/]+))?$/)
     const isLogout = url.pathname === '/api/logout' && request.method === 'POST'
-    if (!mCodes && !isLogout) return error(request, env, 'not found', 404)
+    const isMqttCfg = url.pathname === '/api/mqtt-config' && (request.method === 'GET' || request.method === 'PUT')
+    if (!mCodes && !isLogout && !isMqttCfg) return error(request, env, 'not found', 404)
 
     if (!env.AUTH_SECRET) return error(request, env, 'AUTH_SECRET not configured', 500)
     const auth = await checkAuth(request, env)
@@ -416,6 +517,8 @@ export default {
       await revokeAllTokens(env)
       return json(request, env, { ok: true })
     }
+
+    if (isMqttCfg) return handleMqttConfig(request, env)
 
     return handleCodes(request, env, url, mCodes[1])
   },

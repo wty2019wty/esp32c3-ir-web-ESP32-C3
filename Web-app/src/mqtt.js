@@ -28,6 +28,32 @@ function topicFor(role, topic) {
   return topic && topic.trim() ? topic.trim() : DEFAULT_TOPICS[role]
 }
 
+// Broker 地址规范化：缺协议按页面协议补 ws(s)://、mqtt(s):// 转 ws(s)://、
+// 无路径补默认 WS 端点 /mqtt（EMQX/Mosquitto 惯例）。
+// HTTPS 页面下明文 ws:// 直接抛错，由调用方展示提示。
+export function normalizeBrokerUrl(raw) {
+  let url = String(raw || '').trim()
+  if (!url) return ''
+  if (!/^(ws|wss|mqtt|mqtts):\/\//.test(url)) {
+    url = (location.protocol === 'https:' ? 'wss://' : 'ws://') + url
+  }
+  // mqtt/mqtts scheme 转 ws/wss（浏览器只能走 WebSocket）
+  url = url.replace(/^mqtt:\/\//, 'wss://').replace(/^mqtts:\/\//, 'wss://')
+  // HTTPS 页面必须 wss：浏览器本就拦截混合内容，这里提前拦截并给出明确提示
+  if (location.protocol === 'https:' && url.startsWith('ws://')) {
+    throw new Error('HTTPS 页面必须使用 wss:// 连接 broker（明文 ws:// 会被浏览器拦截）')
+  }
+  // 无路径时自动补默认 WS 端点 /mqtt（EMQX/Mosquitto 惯例）
+  try {
+    const u = new URL(url)
+    if (!u.pathname || u.pathname === '/') {
+      u.pathname = '/mqtt'
+      url = u.toString()
+    }
+  } catch { /* 保持原样，让 mqtt.js 报错 */ }
+  return url.replace(/\/$/, (m, off) => (off > url.indexOf('/mqtt') ? '' : m))
+}
+
 function emit(name, payload) {
   for (const fn of listeners[name]) {
     try {

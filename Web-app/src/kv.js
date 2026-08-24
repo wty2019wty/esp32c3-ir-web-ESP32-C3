@@ -137,6 +137,20 @@ export async function removeCode(id) {
   return request('DELETE', `/codes/${encodeURIComponent(id)}`)
 }
 
+/* ---------------- MQTT 连接配置 API ---------------- */
+// 服务端把整个配置（含 broker 密码）AES-GCM 加密后存 KV；
+// password 字段返回的是解密后的明文（浏览器发起 MQTT 连接必须持有明文）。
+
+export async function getMqttConfig() {
+  const r = await request('GET', '/mqtt-config')
+  return r.config
+}
+
+// password 传 '' 表示清除已存密码；不传该字段表示保持服务端原值不变
+export async function saveMqttConfig(cfg) {
+  return request('PUT', '/mqtt-config', cfg)
+}
+
 // 生成唯一 id（与 worker 端保持一致：时间戳 + 随机）
 export function genId() {
   return `c${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`

@@ -5,19 +5,19 @@
     <div class="form-field">
       <label>Broker 地址（ws:// 或 wss://）</label>
       <input v-model="form.url" type="text" inputmode="url"
-        placeholder="ws://192.168.1.100:8083/mqtt" :disabled="busy"
+        placeholder="192.168.1.100:8083 或 wss://broker.example.com" :disabled="busy || loading"
         autocapitalize="off" autocorrect="off" spellcheck="false" />
     </div>
 
     <div class="row">
       <div class="form-field" style="flex: 1; margin-bottom: 0">
         <label>用户名</label>
-        <input v-model="form.username" type="text" placeholder="可选" :disabled="busy"
+        <input v-model="form.username" type="text" placeholder="可选" :disabled="busy || loading"
           autocapitalize="off" autocomplete="off" spellcheck="false" />
       </div>
       <div class="form-field" style="flex: 1; margin-bottom: 0">
         <label>密码</label>
-        <input v-model="form.password" type="password" placeholder="可选" :disabled="busy" />
+        <input v-model="form.password" type="password" placeholder="可选" :disabled="busy || loading" />
       </div>
     </div>
 
@@ -25,22 +25,22 @@
       <summary>主题配置（默认 ir-web/*，与设备侧保持一致）</summary>
       <div class="form-field">
         <label>命令主题 (cmd)</label>
-        <input v-model="form.topicCmd" type="text" :disabled="busy"
+        <input v-model="form.topicCmd" type="text" :disabled="busy || loading"
           autocapitalize="off" spellcheck="false" />
       </div>
       <div class="form-field">
         <label>响应主题 (rsp)</label>
-        <input v-model="form.topicRsp" type="text" :disabled="busy"
+        <input v-model="form.topicRsp" type="text" :disabled="busy || loading"
           autocapitalize="off" spellcheck="false" />
       </div>
       <div class="form-field">
         <label>状态主题 (status)</label>
-        <input v-model="form.topicStatus" type="text" :disabled="busy"
+        <input v-model="form.topicStatus" type="text" :disabled="busy || loading"
           autocapitalize="off" spellcheck="false" />
       </div>
       <div class="form-field">
         <label>红外帧主题 (frame)</label>
-        <input v-model="form.topicFrame" type="text" :disabled="busy"
+        <input v-model="form.topicFrame" type="text" :disabled="busy || loading"
           autocapitalize="off" spellcheck="false" />
       </div>
     </details>
@@ -49,7 +49,7 @@
       style="width: 100%; margin-top: 10px"
       :class="{ danger: connected }"
       @click="toggle"
-      :disabled="busy"
+      :disabled="busy || loading"
     >
       {{ busy ? '连接中…' : connected ? '断开连接' : '连接' }}
     </button>
@@ -58,64 +58,53 @@
       设备本身是 MQTT 客户端，前端需连接到<b>同一个 broker</b> 的 WebSocket 端口
       （如 EMQX 8083、Mosquitto 9001）。HTTPS 页面必须用 <span class="mono">wss://</span>。
       <b style="color: var(--red-text)">broker 必须启用账号认证</b>：匿名 broker 上任何客户端都能订阅红外码、回放按键操控设备。
-      密码仅保存在本标签页会话（sessionStorage），刷新后需重填。
+      连接配置（含密码）会<b>AES-GCM 加密</b>存到云端 KV，登录后所有设备自动回填并尝试连接。
     </div>
   </div>
 </template>
 
 <script setup>
-import { reactive, ref, computed, watch } from 'vue'
-import { connect, disconnect } from '../mqtt'
+import { reactive, ref, computed, watch, onMounted } from 'vue'
+import { connect, disconnect, normalizeBrokerUrl } from '../mqtt'
 import { state } from '../store'
+import { getMqttConfig, saveMqttConfig } from '../kv'
 
 const emit = defineEmits(['toast'])
 
-const STORE_KEY = 'ir-web-remote-mqtt'
-const PASS_KEY = 'ir-web-remote-mqtt-pass'
+// 云端配置加载中：表单禁用，避免覆盖即将回填的值
+const loading = ref(false)
 
-// broker 密码只存 sessionStorage（标签页关闭即清除），不落 localStorage：
-// localStorage 永久驻留且被同源任意脚本可读，明文密码长期暴露面过大
-function loadStoredPass() {
+const form = reactive({
+  url: '',
+  username: '',
+  password: '',
+  topicCmd: 'ir-web/cmd',
+  topicRsp: 'ir-web/rsp',
+  topicStatus: 'ir-web/status',
+  topicFrame: 'ir-web/frame',
+})
+
+async function loadConfig() {
+  loading.value = true
   try {
-    return sessionStorage.getItem(PASS_KEY) || ''
-  } catch {
-    return ''
+    const cfg = await getMqttConfig()
+    if (cfg) {
+      form.url = cfg.url || ''
+      form.username = cfg.username || ''
+      form.password = cfg.password || ''
+      form.topicCmd = cfg.topics?.cmd || form.topicCmd
+      form.topicRsp = cfg.topics?.rsp || form.topicRsp
+      form.topicStatus = cfg.topics?.status || form.topicStatus
+      form.topicFrame = cfg.topics?.frame || form.topicFrame
+    }
+  } catch { /* 拉取失败保持默认空表单，保存时再提示 */ }
+  finally {
+    loading.value = false
   }
 }
 
-const form = reactive(
-  Object.assign(
-    {
-      url: '',
-      username: '',
-      password: loadStoredPass(),
-      topicCmd: 'ir-web/cmd',
-      topicRsp: 'ir-web/rsp',
-      topicStatus: 'ir-web/status',
-      topicFrame: 'ir-web/frame',
-    },
-    loadStored()
-  )
-)
-const busy = ref(false)
-
-function loadStored() {
-  try {
-    const stored = JSON.parse(localStorage.getItem(STORE_KEY)) || {}
-    delete stored.password // 历史版本曾把密码写进 localStorage，读取时剔除并顺手清除
-    return stored
-  } catch {
-    return {}
-  }
-}
-function persist() {
-  try {
-    const { password, ...rest } = form
-    localStorage.setItem(STORE_KEY, JSON.stringify(rest))
-    if (password) sessionStorage.setItem(PASS_KEY, password)
-    else sessionStorage.removeItem(PASS_KEY)
-  } catch { /* ignore */ }
-}
+onMounted(loadConfig)
+defineExpose({ reload: loadConfig })
 
 // state.conn 由 App.vue 统一维护（onConn 只注册一次），这里 watch 引用变化即可：
 // 连接成功/失败/断开都会替换 conn 对象，借此复位按钮 busy 态，避免重复注册回调
@@ -126,32 +115,33 @@ watch(
   }
 )
 
+const busy = ref(false)
 const connected = computed(() => state.conn.connected)
 
-function normalizeBrokerUrl(raw) {
-  let url = raw.trim()
-  if (!url) return ''
-  if (!/^(ws|wss|mqtt|mqtts):\/\//.test(url)) {
-    url = (location.protocol === 'https:' ? 'wss://' : 'ws://') + url
+function buildPayload() {
+  return {
+    url: form.url.trim(),
+    username: form.username.trim(),
+    // 密码留空表示清除云端已存密码
+    password: form.password,
+    topics: {
+      cmd: form.topicCmd.trim(),
+      rsp: form.topicRsp.trim(),
+      status: form.topicStatus.trim(),
+      frame: form.topicFrame.trim(),
+    },
   }
-  // mqtt/mqtts scheme 转 ws/wss（浏览器只能走 WebSocket）
-  url = url.replace(/^mqtt:\/\//, 'wss://').replace(/^mqtts:\/\//, 'wss://')
-  // HTTPS 页面必须 wss：浏览器本就拦截混合内容，这里提前拦截并给出明确提示
-  if (location.protocol === 'https:' && url.startsWith('ws://')) {
-    throw new Error('HTTPS 页面必须使用 wss:// 连接 broker（明文 ws:// 会被浏览器拦截）')
-  }
-  // 无路径时自动补默认 WS 端点 /mqtt（EMQX/Mosquitto 惯例）
-  try {
-    const u = new URL(url)
-    if (!u.pathname || u.pathname === '/') {
-      u.pathname = '/mqtt'
-      url = u.toString()
-    }
-  } catch { /* 保持原样，让 mqtt.js 报错 */ }
-  return url.replace(/\/$/, (m, off) => (off > url.indexOf('/mqtt') ? '' : m))
 }
 
-function toggle() {
+async function persist() {
+  try {
+    await saveMqttConfig(buildPayload())
+  } catch (e) {
+    emit('toast', `配置保存到云端失败: ${e.message}`, 'fail')
+  }
+}
+
+async function toggle() {
   if (connected.value) {
     disconnect()
     state.conn = { connected: false, state: 'closed', error: '' }
@@ -172,7 +162,6 @@ function toggle() {
     emit('toast', 'broker 未配置账号认证，任何能连上 broker 的人都能操控设备', 'fail')
     return
   }
-  persist()
   busy.value = true
   connect({
     url,
@@ -183,5 +172,7 @@ function toggle() {
     topicStatus: form.topicStatus,
     topicFrame: form.topicFrame,
   })
+  // 异步同步到云端 KV；失败不阻断本次连接
+  await persist()
 }
 </script>
