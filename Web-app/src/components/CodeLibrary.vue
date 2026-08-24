@@ -50,7 +50,7 @@
           >
             {{ sendingId === c.id ? '…' : '发送' }}
           </button>
-          <button class="sm ghost" style="color: var(--red-text); border-color: var(--red)" @click="remove(c)">删</button>
+          <button class="sm ghost" style="color: var(--red-text); border-color: var(--red)" @click="remove(c)">X</button>
         </div>
       </div>
     </template>

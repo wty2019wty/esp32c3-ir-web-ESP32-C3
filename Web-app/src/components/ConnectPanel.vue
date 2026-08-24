@@ -109,19 +109,35 @@ watch(
 
 const connected = computed(() => state.conn.connected)
 
+function normalizeBrokerUrl(raw) {
+  let url = raw.trim()
+  if (!url) return ''
+  if (!/^(ws|wss|mqtt|mqtts):\/\//.test(url)) {
+    url = (location.protocol === 'https:' ? 'wss://' : 'ws://') + url
+  }
+  // mqtt/mqtts scheme 转 ws/wss（浏览器只能走 WebSocket）
+  url = url.replace(/^mqtt:\/\//, 'ws://').replace(/^mqtts:\/\//, 'wss://')
+  // 无路径时自动补默认 WS 端点 /mqtt（EMQX/Mosquitto 惯例）
+  try {
+    const u = new URL(url)
+    if (!u.pathname || u.pathname === '/') {
+      u.pathname = '/mqtt'
+      url = u.toString()
+    }
+  } catch { /* 保持原样，让 mqtt.js 报错 */ }
+  return url.replace(/\/$/, (m, off) => (off > url.indexOf('/mqtt') ? '' : m))
+}
+
 function toggle() {
   if (connected.value) {
     disconnect()
     state.conn = { connected: false, state: 'closed', error: '' }
     return
   }
-  let url = form.url.trim()
+  const url = normalizeBrokerUrl(form.url)
   if (!url) {
     emit('toast', '请填写 Broker 地址', 'fail')
     return
-  }
-  if (!/^(ws|wss):\/\//.test(url)) {
-    url = (location.protocol === 'https:' ? 'wss://' : 'ws://') + url
   }
   persist()
   busy.value = true
