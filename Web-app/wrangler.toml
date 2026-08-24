@@ -1,0 +1,23 @@
+name = "ir-web-remote"
+main = "worker/index.js"
+compatibility_date = "2024-09-01"
+
+# 红外码库 KV 命名空间（部署前在 CF 控制台创建或运行 wrangler kv namespace create CODE_LIB，填入 id）
+[[kv_namespaces]]
+binding = "CODE_LIB"
+id = "REPLACE_WITH_YOUR_KV_NAMESPACE_ID"
+
+# 初始账号（仅首次部署无账号记录时用于初始化，之后以 KV 为准）
+[vars]
+ADMIN_USER = "admin"
+# ADMIN_PASS 首次初始化用：wrangler secret put ADMIN_PASS
+
+# 前端静态资源（npm run build 生成的 dist），与 Worker 同域部署
+[assets]
+directory = "./dist"
+binding = "ASSETS"
+not_found_handling = "single-page-application"
+
+# 部署后必须设置签名密钥：
+#   npx wrangler secret put AUTH_SECRET
+#   npx wrangler secret put ADMIN_PASS
