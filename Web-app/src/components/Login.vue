@@ -18,6 +18,7 @@
       </div>
 
       <div v-if="err" class="err" style="margin-top: 8px">{{ err }}</div>
+      <div v-if="notice" class="muted" style="margin-top: 8px">{{ notice }}</div>
 
       <button
         style="width: 100%; margin-top: 14px"
@@ -39,6 +40,7 @@ const emit = defineEmits(['ok'])
 const user = ref('')
 const pass = ref('')
 const err = ref('')
+const notice = ref('')
 const busy = ref(false)
 
 async function doLogin() {
@@ -49,7 +51,8 @@ async function doLogin() {
   err.value = ''
   busy.value = true
   try {
-    await login(user.value.trim(), pass.value)
+    const res = await login(user.value.trim(), pass.value)
+    if (res && res.notice) notice.value = res.notice
     user.value = ''
     pass.value = ''
     emit('ok')

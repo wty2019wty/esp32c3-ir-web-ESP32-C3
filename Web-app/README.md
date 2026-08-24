@@ -115,6 +115,8 @@ npx wrangler deploy
 
 `ADMIN_USER` 默认 `admin`（见 `wrangler.toml` 的 `[vars]`）。首次登录时 Worker 用 `ADMIN_USER`/`ADMIN_PASS` 初始化账号（PBKDF2 哈希入库），之后以 KV 记录为准。
 
+> **注意**：Cloudflare Workers 的 PBKDF2 迭代次数上限为 **100000**，代码中 `PBKDF2_ITER` 已设为该值。若使用更高迭代次数的旧版部署过，升级后首次登录会自动检测并重建账号（**密码将重置为 `ADMIN_PASS` 初始值**，旧 token 一并吊销），详见下方"忘记密码"。
+
 ## 登录与安全
 
 - 密码：KV 只存 **PBKDF2-SHA256 哈希 + 随机盐**，不存明文
@@ -140,11 +142,13 @@ npx wrangler deploy
 
 - **本地 dev**：删除本地 KV 认证记录后重启（`Remove-Item -Recurse .wrangler`），用当前 `ADMIN_PASS` 重新登录
 - **生产**：`npx wrangler kv key delete --binding=CODE_LIB "auth:user"` 和 `"auth:pass"`，必要时先 `npx wrangler secret put ADMIN_PASS`；下一次登录请求会用新初始密码重新初始化账号（码库 `code:*` 不受影响）
+- **从旧版升级**：若旧版本用了超过 **100000** 次的 PBKDF2 迭代，Worker 无法验证旧哈希，会在首次登录时自动删除旧认证记录并按 `ADMIN_PASS` 重建账号（**密码会被重置为 `ADMIN_PASS` 初始值**，旧 token 全部失效）；请改用 `ADMIN_PASS` 登录。若未配置 `ADMIN_PASS`，登录会返回明确的 500 错误提示，配置后重试即可
 
 ## 常见问题
 
 | 现象 | 排查 |
 |---|---|
+| 登录 500 错误 | 检查 `AUTH_SECRET` 和 `ADMIN_PASS` 是否已设置；从旧版本升级（PBKDF2 迭代次数 >100000）会自动重建账号，确保 `ADMIN_PASS` 已配置 |
 | 连不上 broker | 设备是否 STA 模式、MQTT 是否启用、broker WS 端口；地址可只填 host，前端自动补 `wss://` 与 `/mqtt`；未填账号密码会被拒绝 |
 | 自动连接没生效 | 云端配置需完整（地址 + 账号密码）；到设置页手动连一次即可保存并触发；HTTPS 页面下 `ws://` 地址会被拦截 |
 | 学习模式无帧显示 | 用「拉取历史帧」（`frames` 命令）绕过推送帧/主题错配；或点「推送帧: 开」执行 `fpub` |
