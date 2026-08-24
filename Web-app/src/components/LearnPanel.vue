@@ -243,8 +243,14 @@ async function pullHistory() {
       const r = await sendCmd('frames', { since })
       const res = r.result || {}
       const list = res.frames || []
-      for (const f of list) pushFrame(f)
-      total += list.length
+      // 按 seq 去重后再插入：since 取的是「比本地最旧帧还小」，设备会回传已有帧，
+      // 直接入列会导致 v-for 的 :key="f.seq" 重复、计数虚高
+      for (const f of list) {
+        if (!state.frames.some((x) => x.seq === f.seq)) {
+          pushFrame(f)
+          total++
+        }
+      }
       const lastSeq = res.last_seq
       since = typeof lastSeq === 'number' ? lastSeq : since
       if (!res.truncated || list.length === 0) break

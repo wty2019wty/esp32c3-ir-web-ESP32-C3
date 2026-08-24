@@ -62,8 +62,8 @@
 </template>
 
 <script setup>
-import { reactive, ref, computed, onMounted, onBeforeUnmount } from 'vue'
-import { connect, disconnect, onConn } from '../mqtt'
+import { reactive, ref, computed, watch } from 'vue'
+import { connect, disconnect } from '../mqtt'
 import { state } from '../store'
 
 const emit = defineEmits(['toast'])
@@ -98,13 +98,14 @@ function persist() {
   } catch { /* ignore */ }
 }
 
-function onConnState(s) {
-  state.conn = s
-  busy.value = false
-}
-
-onMounted(() => onConn(onConnState))
-onBeforeUnmount(() => {}) // onConn 回调由 App.vue 统一管理生命周期
+// state.conn 由 App.vue 统一维护（onConn 只注册一次），这里 watch 引用变化即可：
+// 连接成功/失败/断开都会替换 conn 对象，借此复位按钮 busy 态，避免重复注册回调
+watch(
+  () => state.conn,
+  () => {
+    busy.value = false
+  }
+)
 
 const connected = computed(() => state.conn.connected)
 
