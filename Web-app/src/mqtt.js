@@ -13,6 +13,9 @@ export const DEFAULT_TOPICS = {
 let client = null
 let seq = 0
 let cfg = null
+// 每次连接生成随机前缀，避免多个客户端（多标签页/多人）共用 rsp 主题时
+// 命令 id 相互冲突、响应被错误的 pending 认领
+const idPrefix = Math.random().toString(36).slice(2, 8)
 const pending = new Map() // id -> { resolve, reject, timer }
 const listeners = {
   status: [],
@@ -142,7 +145,7 @@ export function sendCmd(cmd, body, timeout = 8000) {
       reject(new Error('MQTT 未连接'))
       return
     }
-    const id = `c${++seq}`
+    const id = `${idPrefix}-c${++seq}`
     const payload = JSON.stringify({ id, cmd, body: body ?? {} })
     const t = setTimeout(() => {
       pending.delete(id)

@@ -36,7 +36,8 @@
 Web-app/
 ├── package.json / vite.config.js / index.html
 ├── wrangler.toml          # KV 绑定 + [assets] 静态托管 + 初始账号 vars
-├── worker/index.js        # Cloudflare Worker：登录认证 + 码库 CRUD API
+├── public/_headers        # 静态资源安全响应头（CSP / X-Frame-Options 等）
+├── worker/index.js        # Cloudflare Worker：登录认证（限流/吊销）+ 码库 CRUD API
 ├── src/
 │   ├── main.js / App.vue  # 入口 + 三 Tab 布局 + 登录门控 + 设备在线轮询
 │   ├── mqtt.js            # MQTT over WS 封装（命令 RPC / 状态 / 帧订阅）
@@ -114,9 +115,22 @@ npx wrangler deploy
 
 - 密码：KV 只存 **PBKDF2-SHA256 哈希 + 随机盐**，不存明文
 - Token：**HMAC-SHA256 无状态签名**，有效期 24 小时；密钥 `AUTH_SECRET` 通过 `wrangler secret` 注入
-- 传输：CF 自动 HTTPS；token 存浏览器 localStorage
-- 静态页面本体公开（浏览器需加载它才能显示登录框），**所有数据 API 均需 `Authorization: Bearer`**，token 无效/过期返回 401 并强制回登录页
+- Token 吊销：payload 内含版本号，`POST /api/logout`（退出登录）会递增版本号，**所有端的现有 token 立即失效**
+- 登录限流：同一 IP 15 分钟内失败满 **10 次**即锁定到窗口结束（429），计数存 KV；成功登录自动清零
+- CORS：默认**仅同源**（前端与 Worker 同域部署，无需跨域头）；确有跨域需求时在 `wrangler.toml` 配 `[vars] ALLOWED_ORIGINS = "https://a.example.com,https://b.example.com"`
+- 安全响应头：API 全部返回 `no-store / nosniff / Referrer-Policy`；静态资源由 `public/_headers` 注入 CSP、`X-Frame-Options: DENY` 等
+- 静态页面本体公开（浏览器需加载它才能显示登录框），**所有数据 API 均需 `Authorization: Bearer`**，token 无效/过期/已吊销返回 401 并强制回登录页
 - 登录失败统一回 `bad credentials`，不泄露账号是否存在
+
+### MQTT 通道安全（重要）
+
+码库 API 有认证，但**设备遥控走的是 MQTT broker**——broker 若匿名开放，任何客户端都能窃取红外码、回放按键操控设备：
+
+- broker **必须启用用户名/密码认证**，并配置 ACL（前端账号只允许读写 `ir-web/#`，设备账号同理收窄）
+- HTTPS 页面下前端**强制 `wss://`**（明文 `ws://` 会被拦截并提示）
+- 前端连接时若未填 broker 账号密码会拒绝连接并提示
+- broker 密码仅存浏览器 **sessionStorage**（标签页关闭即清除），不再写入 localStorage
+- 公网部署建议：broker 仅监听内网/VPN，或经 Cloudflare Tunnel 接入；多用户共用一个页面时注意命令响应按 id 匹配（已带随机前缀防串扰）
 
 ### 忘记密码
 

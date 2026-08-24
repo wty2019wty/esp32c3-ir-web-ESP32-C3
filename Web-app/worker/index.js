@@ -2,7 +2,8 @@
 // 依赖 wrangler.toml 的 kv_namespaces 绑定 CODE_LIB，以及 secret AUTH_SECRET
 //
 // 路由：
-//   POST   /api/login               登录，返回签名 token（唯一公开接口）
+//   POST   /api/login               登录，返回签名 token（唯一公开接口，带 IP 限流）
+//   POST   /api/logout              登出，递增 token 版本号吊销全部现有 token（需 Bearer token）
 //   GET    /api/codes               列出全部码（需 Bearer token）
 //   GET    /api/codes/:id           取单个
 //   PUT    /api/codes/:id           保存/更新
@@ -10,47 +11,62 @@
 //
 // 安全：
 //   - 密码只存 PBKDF2-SHA256 哈希 + 随机盐，绝不存明文
-//   - token 为 HMAC-SHA256 无状态签名（payload.signature），有效期 24h
+//   - token 为 HMAC-SHA256 无状态签名（payload.signature），有效期 24h；
+//     payload 内含版本号 ver，与 KV 中 auth:ver 不一致即视为已吊销（登出/账号重建生效）
 //   - 签名密钥 AUTH_SECRET 走 wrangler secret 注入，不进代码与 KV
 //   - 登录失败统一 "bad credentials"，不泄露用户是否存在
-//   - 首次使用：无账号记录时用 vars ADMIN_USER/ADMIN_PASS 初始化
+//   - 登录限流：同一 IP 在 15 分钟窗口内失败满 10 次即锁定至窗口结束（KV 计数）
+//   - CORS 默认仅放行同源；确需跨域时在 [vars] 配置 ALLOWED_ORIGINS（逗号分隔白名单）
+//   - 所有响应附带 no-store / nosniff / Referrer-Policy 安全头
+//   - 首次使用：无账号记录时用 vars ADMIN_USER/ADMIN_PASS 初始化（并吊销历史 token）
 
 const KV_PREFIX = 'code:'
 const AUTH_PASS_KEY = 'auth:pass'   // {"salt","iter","hash"}
 const AUTH_USER_KEY = 'auth:user'
+const AUTH_VER_KEY = 'auth:ver'     // token 版本号，变更即吊销全部旧 token
+const RL_KEY_PREFIX = 'rl:login:'   // 登录限流计数（按 IP）
 const TOKEN_TTL_MS = 24 * 3600 * 1000
 const PBKDF2_ITER = 150000
 const MAX_BODY = 64 * 1024
+const RL_WINDOW_MS = 15 * 60 * 1000 // 限流窗口：15 分钟
+const RL_MAX_FAILS = 10             // 窗口内允许的最大失败次数
 
 /* ---------------- 基础工具 ---------------- */
 
-function json(res, body, status = 200) {
-  return new Response(JSON.stringify(body), {
-    status,
-    headers: {
-      'Content-Type': 'application/json; charset=utf-8',
-      'Access-Control-Allow-Origin': '*',
-      'Access-Control-Allow-Methods': 'GET, PUT, DELETE, POST, OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type, Authorization',
-      'Cache-Control': 'no-store',
-    },
+// 安全响应头 + 按白名单回显 CORS：
+// 默认前后端同域部署，不需要跨域头；只有请求 Origin 与站点同源、
+// 或命中 env.ALLOWED_ORIGINS 白名单时才回显 Access-Control-Allow-*。
+// 非白名单来源不带 CORS 头，浏览器会直接拦截跨域读取。
+function securityHeaders(request, env) {
+  const headers = new Headers({
+    'Cache-Control': 'no-store',
+    'X-Content-Type-Options': 'nosniff',
+    'Referrer-Policy': 'no-referrer',
   })
+  const origin = request.headers.get('Origin') || ''
+  if (!origin) return headers
+  const selfOrigin = new URL(request.url).origin
+  const extra = String(env.ALLOWED_ORIGINS || '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean)
+  if (origin !== selfOrigin && !extra.includes(origin)) return headers
+  headers.set('Access-Control-Allow-Origin', origin)
+  headers.set('Vary', 'Origin')
+  headers.set('Access-Control-Allow-Methods', 'GET, PUT, DELETE, POST, OPTIONS')
+  headers.set('Access-Control-Allow-Headers', 'Content-Type, Authorization')
+  headers.set('Access-Control-Max-Age', '86400')
+  return headers
 }
 
-function error(res, message, status = 400) {
-  return json(res, { error: message }, status)
+function json(request, env, body, status = 200) {
+  const headers = securityHeaders(request, env)
+  headers.set('Content-Type', 'application/json; charset=utf-8')
+  return new Response(JSON.stringify(body), { status, headers })
 }
 
-function cors() {
-  return new Response(null, {
-    status: 204,
-    headers: {
-      'Access-Control-Allow-Origin': '*',
-      'Access-Control-Allow-Methods': 'GET, PUT, DELETE, POST, OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type, Authorization',
-      'Access-Control-Max-Age': '86400',
-    },
-  })
+function error(request, env, message, status = 400) {
+  return json(request, env, { error: message }, status)
 }
 
 const enc = new TextEncoder()
@@ -83,7 +99,7 @@ async function hashPass(pass, saltHex, iter) {
   return hex(bits)
 }
 
-/* ---------------- token（HMAC-SHA256 无状态签名） ---------------- */
+/* ---------------- token（HMAC-SHA256 无状态签名 + 版本吊销） ---------------- */
 
 async function signToken(secret, payloadObj) {
   const payload = b64url(enc.encode(JSON.stringify(payloadObj)))
@@ -113,6 +129,72 @@ async function verifyToken(secret, token) {
   }
 }
 
+// 读取（必要时初始化）token 版本号。单用户模型下全局一个版本即可：
+// 版本一变，所有携带旧 ver 的 token 全部失效。
+async function getTokenVer(env) {
+  let ver = await env.CODE_LIB.get(AUTH_VER_KEY)
+  if (!ver) {
+    ver = hex(crypto.getRandomValues(new Uint8Array(16)))
+    try {
+      await env.CODE_LIB.put(AUTH_VER_KEY, ver)
+    } catch { /* 写冲突时下次再初始化 */ }
+  }
+  return ver
+}
+
+// 吊销全部现有 token：覆盖为新的随机版本号
+async function revokeAllTokens(env) {
+  const ver = hex(crypto.getRandomValues(new Uint8Array(16)))
+  await env.CODE_LIB.put(AUTH_VER_KEY, ver)
+  return ver
+}
+
+/* ---------------- 登录限流（KV 固定窗口计数，按 IP） ---------------- */
+
+function clientIp(request) {
+  return (
+    request.headers.get('CF-Connecting-IP') ||
+    (request.headers.get('X-Forwarded-For') || '').split(',')[0].trim() ||
+    'unknown'
+  )
+}
+
+// 返回 { blocked, key, rec }：blocked=true 表示当前窗口内失败次数已达上限
+async function loginGate(env, ip) {
+  const key = RL_KEY_PREFIX + ip
+  try {
+    const raw = await env.CODE_LIB.get(key)
+    if (raw) {
+      const rec = JSON.parse(raw)
+      if (rec.until > Date.now()) {
+        return { blocked: rec.n >= RL_MAX_FAILS, key, rec }
+      }
+    }
+  } catch { /* 记录损坏视为无记录 */ }
+  return { blocked: false, key, rec: null }
+}
+
+// 记录一次失败：首次失败起算窗口，之后在同一窗口内累加；
+// KV 有 1 写/秒/键限制，写失败不阻塞主流程（限流是尽力而为的减速带）
+async function loginFail(env, key, rec) {
+  const now = Date.now()
+  const active = rec && rec.until > now
+  const n = active ? rec.n + 1 : 1
+  const until = active ? rec.until : now + RL_WINDOW_MS
+  try {
+    await env.CODE_LIB.put(key, JSON.stringify({ n, until }), {
+      expirationTtl: Math.ceil((until - now) / 1000) + 60,
+    })
+  } catch { /* ignore */ }
+}
+
+// 登录成功清空该 IP 的失败计数
+async function loginClear(env, key) {
+  try {
+    await env.CODE_LIB.delete(key)
+  } catch { /* ignore */ }
+}
+
 /* ---------------- 登录 ---------------- */
 
 async function ensureAuthRecord(env) {
@@ -128,39 +210,60 @@ async function ensureAuthRecord(env) {
   const rec = { salt: hex(salt), iter: PBKDF2_ITER, hash: await hashPass(initialPass, hex(salt), PBKDF2_ITER) }
   await env.CODE_LIB.put(AUTH_PASS_KEY, JSON.stringify(rec))
   await env.CODE_LIB.put(AUTH_USER_KEY, initialUser)
+  // 账号（重新）初始化意味着旧凭证作废：同步吊销全部历史 token
+  await revokeAllTokens(env)
   return { user: initialUser, passRec: rec }
 }
 
 async function handleLogin(request, env) {
-  if (!env.AUTH_SECRET) return error(request, 'AUTH_SECRET not configured', 500)
+  if (!env.AUTH_SECRET) return error(request, env, 'AUTH_SECRET not configured', 500)
   let body
   try {
     body = await request.json()
   } catch {
-    return error(request, 'invalid json')
+    return error(request, env, 'invalid json')
   }
   const user = String(body.user || '')
   const pass = String(body.pass || '')
-  if (!user || !pass) return error(request, 'need user and pass')
+  if (!user || !pass) return error(request, env, 'need user and pass')
+
+  // 先过限流闸门再执行 PBKDF2，防止攻击者借登录接口烧 CPU 配额
+  const gate = await loginGate(env, clientIp(request))
+  if (gate.blocked) {
+    return json(request, env, { error: '失败次数过多，请 15 分钟后再试' }, 429)
+  }
 
   const auth = await ensureAuthRecord(env)
   if (auth.missing) {
-    return error(request, '账号未初始化：请配置 ADMIN_PASS 后重试', 500)
+    return error(request, env, '账号未初始化：请配置 ADMIN_PASS 后重试', 500)
   }
-  if (user !== auth.user) return error(request, 'bad credentials', 401)
-  const h = await hashPass(pass, auth.passRec.salt, auth.passRec.iter)
-  if (h !== auth.passRec.hash) return error(request, 'bad credentials', 401)
+
+  let ok = false
+  if (user === auth.user) {
+    const h = await hashPass(pass, auth.passRec.salt, auth.passRec.iter)
+    ok = h === auth.passRec.hash
+  }
+  if (!ok) {
+    await loginFail(env, gate.key, gate.rec)
+    return error(request, env, 'bad credentials', 401)
+  }
+  await loginClear(env, gate.key)
 
   const exp = Date.now() + TOKEN_TTL_MS
-  const token = await signToken(env.AUTH_SECRET, { sub: user, iat: Date.now(), exp })
-  return json(request, { token, expires_in: TOKEN_TTL_MS / 1000, user })
+  const ver = await getTokenVer(env)
+  const token = await signToken(env.AUTH_SECRET, { sub: user, iat: Date.now(), exp, ver })
+  return json(request, env, { token, expires_in: TOKEN_TTL_MS / 1000, user })
 }
 
 async function checkAuth(request, env) {
   const h = request.headers.get('Authorization') || ''
   const token = h.startsWith('Bearer ') ? h.slice(7).trim() : ''
   if (!token) return null
-  return await verifyToken(env.AUTH_SECRET, token)
+  const data = await verifyToken(env.AUTH_SECRET, token)
+  if (!data) return null
+  // 吊销校验：ver 与 KV 当前值不一致（已登出/账号重建）一律拒绝
+  if (data.ver !== (await getTokenVer(env))) return null
+  return data
 }
 
 /* ---------------- 码库 CRUD ---------------- */
@@ -202,8 +305,8 @@ function normalize(rec) {
   return out
 }
 
-function notFound(res, message = 'not found') {
-  return json(res, { error: message }, 404)
+function notFound(request, env, message = 'not found') {
+  return json(request, env, { error: message }, 404)
 }
 
 async function handleCodes(request, env, url, id) {
@@ -229,36 +332,36 @@ async function handleCodes(request, env, url, id) {
       } catch { /* skip corrupt */ }
     }
     codes.sort((a, b) => (a.device === b.device ? a.name.localeCompare(b.name) : a.device.localeCompare(b.device)))
-    return json(request, { codes })
+    return json(request, env, { codes })
   }
 
-  if (!validId(id)) return error(request, 'invalid id')
+  if (!validId(id)) return error(request, env, 'invalid id')
   const key = KV_PREFIX + id
 
   // GET /api/codes/:id
   if (request.method === 'GET') {
     const raw = await kv.get(key)
-    if (!raw) return notFound(request)
+    if (!raw) return notFound(request, env)
     try {
-      return json(request, JSON.parse(raw))
+      return json(request, env, JSON.parse(raw))
     } catch {
-      return error(request, 'corrupt record', 500)
+      return error(request, env, 'corrupt record', 500)
     }
   }
 
   // PUT /api/codes/:id
   if (request.method === 'PUT') {
     const cl = request.headers.get('content-length')
-    if (cl && Number(cl) > MAX_BODY) return error(request, 'body too large', 413)
+    if (cl && Number(cl) > MAX_BODY) return error(request, env, 'body too large', 413)
     let body
     try {
       body = await request.json()
     } catch {
-      return error(request, 'invalid json')
+      return error(request, env, 'invalid json')
     }
     const rec = normalize(body)
     if (!rec) {
-      return error(request, '需要 device/name，且 type 为 hxd（含 value）或 raw（含 durs）')
+      return error(request, env, '需要 device/name，且 type 为 hxd（含 value）或 raw（含 durs）')
     }
     const now = Date.now()
     const existing = await kv.get(key)
@@ -272,16 +375,16 @@ async function handleCodes(request, env, url, id) {
     rec.created_at = created
     rec.updated_at = now
     await kv.put(key, JSON.stringify(rec))
-    return json(request, rec, 200)
+    return json(request, env, rec, 200)
   }
 
   // DELETE /api/codes/:id
   if (request.method === 'DELETE') {
     await kv.delete(key)
-    return json(request, { ok: true })
+    return json(request, env, { ok: true })
   }
 
-  return error(request, 'method not allowed', 405)
+  return error(request, env, 'method not allowed', 405)
 }
 
 /* ---------------- 入口 ---------------- */
@@ -290,20 +393,30 @@ export default {
   async fetch(request, env) {
     const url = new URL(request.url)
 
-    if (request.method === 'OPTIONS') return cors()
+    if (request.method === 'OPTIONS') {
+      // 预检：是否回显 CORS 头由 securityHeaders 按白名单决定
+      return new Response(null, { status: 204, headers: securityHeaders(request, env) })
+    }
 
     // 登录是唯一公开接口
     if (url.pathname === '/api/login' && request.method === 'POST') {
       return handleLogin(request, env)
     }
 
-    const m = url.pathname.match(/^\/api\/codes(?:\/([^/]+))?$/)
-    if (!m) return error(request, 'not found', 404)
+    const mCodes = url.pathname.match(/^\/api\/codes(?:\/([^/]+))?$/)
+    const isLogout = url.pathname === '/api/logout' && request.method === 'POST'
+    if (!mCodes && !isLogout) return error(request, env, 'not found', 404)
 
-    if (!env.AUTH_SECRET) return error(request, 'AUTH_SECRET not configured', 500)
+    if (!env.AUTH_SECRET) return error(request, env, 'AUTH_SECRET not configured', 500)
     const auth = await checkAuth(request, env)
-    if (!auth) return json(request, { error: 'unauthorized' }, 401)
+    if (!auth) return json(request, env, { error: 'unauthorized' }, 401)
 
-    return handleCodes(request, env, url, m[1])
+    // 登出：递增 token 版本号，吊销当前所有 token（含本机与其他端）
+    if (isLogout) {
+      await revokeAllTokens(env)
+      return json(request, env, { ok: true })
+    }
+
+    return handleCodes(request, env, url, mCodes[1])
   },
 }

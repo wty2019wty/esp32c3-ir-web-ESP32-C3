@@ -57,6 +57,8 @@
     <div class="muted" style="margin-top: 10px">
       设备本身是 MQTT 客户端，前端需连接到<b>同一个 broker</b> 的 WebSocket 端口
       （如 EMQX 8083、Mosquitto 9001）。HTTPS 页面必须用 <span class="mono">wss://</span>。
+      <b style="color: var(--red-text)">broker 必须启用账号认证</b>：匿名 broker 上任何客户端都能订阅红外码、回放按键操控设备。
+      密码仅保存在本标签页会话（sessionStorage），刷新后需重填。
     </div>
   </div>
 </template>
@@ -69,12 +71,24 @@ import { state } from '../store'
 const emit = defineEmits(['toast'])
 
 const STORE_KEY = 'ir-web-remote-mqtt'
+const PASS_KEY = 'ir-web-remote-mqtt-pass'
+
+// broker 密码只存 sessionStorage（标签页关闭即清除），不落 localStorage：
+// localStorage 永久驻留且被同源任意脚本可读，明文密码长期暴露面过大
+function loadStoredPass() {
+  try {
+    return sessionStorage.getItem(PASS_KEY) || ''
+  } catch {
+    return ''
+  }
+}
+
 const form = reactive(
   Object.assign(
     {
       url: '',
       username: '',
-      password: '',
+      password: loadStoredPass(),
       topicCmd: 'ir-web/cmd',
       topicRsp: 'ir-web/rsp',
       topicStatus: 'ir-web/status',
@@ -87,14 +101,19 @@ const busy = ref(false)
 
 function loadStored() {
   try {
-    return JSON.parse(localStorage.getItem(STORE_KEY)) || {}
+    const stored = JSON.parse(localStorage.getItem(STORE_KEY)) || {}
+    delete stored.password // 历史版本曾把密码写进 localStorage，读取时剔除并顺手清除
+    return stored
   } catch {
     return {}
   }
 }
 function persist() {
   try {
-    localStorage.setItem(STORE_KEY, JSON.stringify(form))
+    const { password, ...rest } = form
+    localStorage.setItem(STORE_KEY, JSON.stringify(rest))
+    if (password) sessionStorage.setItem(PASS_KEY, password)
+    else sessionStorage.removeItem(PASS_KEY)
   } catch { /* ignore */ }
 }
 
@@ -116,7 +135,11 @@ function normalizeBrokerUrl(raw) {
     url = (location.protocol === 'https:' ? 'wss://' : 'ws://') + url
   }
   // mqtt/mqtts scheme 转 ws/wss（浏览器只能走 WebSocket）
-  url = url.replace(/^mqtt:\/\//, 'ws://').replace(/^mqtts:\/\//, 'wss://')
+  url = url.replace(/^mqtt:\/\//, 'wss://').replace(/^mqtts:\/\//, 'wss://')
+  // HTTPS 页面必须 wss：浏览器本就拦截混合内容，这里提前拦截并给出明确提示
+  if (location.protocol === 'https:' && url.startsWith('ws://')) {
+    throw new Error('HTTPS 页面必须使用 wss:// 连接 broker（明文 ws:// 会被浏览器拦截）')
+  }
   // 无路径时自动补默认 WS 端点 /mqtt（EMQX/Mosquitto 惯例）
   try {
     const u = new URL(url)
@@ -134,9 +157,19 @@ function toggle() {
     state.conn = { connected: false, state: 'closed', error: '' }
     return
   }
-  const url = normalizeBrokerUrl(form.url)
+  let url
+  try {
+    url = normalizeBrokerUrl(form.url)
+  } catch (e) {
+    emit('toast', e.message, 'fail')
+    return
+  }
   if (!url) {
     emit('toast', '请填写 Broker 地址', 'fail')
+    return
+  }
+  if (!form.username || !form.password) {
+    emit('toast', 'broker 未配置账号认证，任何能连上 broker 的人都能操控设备', 'fail')
     return
   }
   persist()

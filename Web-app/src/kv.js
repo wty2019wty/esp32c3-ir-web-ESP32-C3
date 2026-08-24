@@ -108,6 +108,15 @@ export async function login(user, pass) {
   return data
 }
 
+// 登出：先通知服务端吊销 token（递增版本号，所有端一起失效），再清本地登录态。
+// 网络失败也要继续清理本地，避免"看起来退出了、token 其实还有效"。
+export async function logout() {
+  try {
+    await request('POST', '/logout')
+  } catch { /* 服务端不可达也照常清本地 */ }
+  clearAuth()
+}
+
 /* ---------------- 码库 API ---------------- */
 
 export async function listCodes(device) {

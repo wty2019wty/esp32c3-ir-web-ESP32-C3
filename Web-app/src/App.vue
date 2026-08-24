@@ -63,7 +63,7 @@ import RemotePad from './components/RemotePad.vue'
 import Login from './components/Login.vue'
 import { onStatus, onFrame, onConn, disconnect, sendCmd } from './mqtt'
 import { state } from './store'
-import { getAuthToken, clearAuth, onUnauthorized } from './kv'
+import { getAuthToken, logout as kvLogout, onUnauthorized } from './kv'
 
 const lib = ref(null)
 const toasts = ref([])
@@ -103,11 +103,12 @@ function onAuthRequired() {
   authed.value = false
 }
 
-function logout() {
-  clearAuth()
-  disconnect()
+async function logout() {
   stopPolling()
+  disconnect()
   state.deviceOnline = null
+  // 先请求服务端吊销 token（递增版本号，所有端一起失效），再清本地登录态
+  await kvLogout()
   authed.value = false
 }
 
