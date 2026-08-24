@@ -29,7 +29,8 @@ const AUTH_VER_KEY = 'auth:ver'     // token 版本号，变更即吊销全部�
 const MQTT_CFG_KEY = 'mqtt:config'  // MQTT 连接配置（敏感字段 AES-GCM 加密）
 const RL_KEY_PREFIX = 'rl:login:'   // 登录限流计数（按 IP）
 const TOKEN_TTL_MS = 24 * 3600 * 1000
-const PBKDF2_ITER = 150000
+const PBKDF2_MAX_ITER = 100000 // workerd 对 PBKDF2 迭代次数的硬上限，超出即抛异常
+const PBKDF2_ITER = PBKDF2_MAX_ITER
 const MAX_BODY = 64 * 1024
 const RL_WINDOW_MS = 15 * 60 * 1000 // 限流窗口：15 分钟
 const RL_MAX_FAILS = 10             // 窗口内允许的最大失败次数
@@ -201,13 +202,27 @@ async function loginClear(env, key) {
 /* ---------------- 登录 ---------------- */
 
 async function ensureAuthRecord(env) {
+  let migrated = false
   let passRec = await env.CODE_LIB.get(AUTH_PASS_KEY)
-  if (passRec) return { user: await env.CODE_LIB.get(AUTH_USER_KEY) || 'admin', passRec: JSON.parse(passRec) }
-  // 首次部署初始化：从 vars 读取初始账号
+  if (passRec) {
+    const rec = JSON.parse(passRec)
+    if (rec.iter > PBKDF2_MAX_ITER) {
+      // 旧版迭代次数超平台上限，Workerd 无法用旧参数验证密码，
+      // 只能丢弃旧认证记录并按 ADMIN_PASS 重建账号（密码会被重置为初始值）。
+      // 注意：auth:ver 不删除，由下方 revokeAllTokens 覆盖为新版本号即可。
+      console.error('[auth] 检测到旧版认证记录（PBKDF2 迭代次数超平台上限），已删除，将按 ADMIN_PASS 重建账号')
+      migrated = true
+      await env.CODE_LIB.delete(AUTH_PASS_KEY)
+      await env.CODE_LIB.delete(AUTH_USER_KEY)
+    } else {
+      return { user: (await env.CODE_LIB.get(AUTH_USER_KEY)) || 'admin', passRec: rec }
+    }
+  }
+  // 首次部署 / 旧版迁移重建：从 vars 读取初始账号
   const initialUser = env.ADMIN_USER || 'admin'
   const initialPass = env.ADMIN_PASS
   if (!initialPass) {
-    return { missing: true }
+    return { missing: true, migrated }
   }
   const salt = crypto.getRandomValues(new Uint8Array(16))
   const rec = { salt: hex(salt), iter: PBKDF2_ITER, hash: await hashPass(initialPass, hex(salt), PBKDF2_ITER) }
@@ -215,7 +230,7 @@ async function ensureAuthRecord(env) {
   await env.CODE_LIB.put(AUTH_USER_KEY, initialUser)
   // 账号（重新）初始化意味着旧凭证作废：同步吊销全部历史 token
   await revokeAllTokens(env)
-  return { user: initialUser, passRec: rec }
+  return { user: initialUser, passRec: rec, migrated }
 }
 
 async function handleLogin(request, env) {
@@ -238,7 +253,10 @@ async function handleLogin(request, env) {
 
   const auth = await ensureAuthRecord(env)
   if (auth.missing) {
-    return error(request, env, '账号未初始化：请配置 ADMIN_PASS 后重试', 500)
+    const msg = auth.migrated
+      ? '检测到旧版认证记录（PBKDF2 迭代次数超限）需重建账号，请配置 ADMIN_PASS secret 后重试'
+      : '账号未初始化：请配置 ADMIN_PASS 后重试'
+    return error(request, env, msg, 500)
   }
 
   let ok = false
@@ -255,7 +273,12 @@ async function handleLogin(request, env) {
   const exp = Date.now() + TOKEN_TTL_MS
   const ver = await getTokenVer(env)
   const token = await signToken(env.AUTH_SECRET, { sub: user, iat: Date.now(), exp, ver })
-  return json(request, env, { token, expires_in: TOKEN_TTL_MS / 1000, user })
+  const payload = { token, expires_in: TOKEN_TTL_MS / 1000, user }
+  if (auth.migrated) {
+    // 本次登录刚完成旧版记录重建，明确告知密码已重置，避免用户误以为凭证异常
+    payload.notice = '检测到旧版认证记录，账号已重建，密码已重置为 ADMIN_PASS 初始值'
+  }
+  return json(request, env, payload)
 }
 
 async function checkAuth(request, env) {
@@ -491,35 +514,37 @@ async function handleMqttConfig(request, env) {
 
 export default {
   async fetch(request, env) {
-    const url = new URL(request.url)
+    try {
+      const url = new URL(request.url)
 
-    if (request.method === 'OPTIONS') {
-      // 预检：是否回显 CORS 头由 securityHeaders 按白名单决定
-      return new Response(null, { status: 204, headers: securityHeaders(request, env) })
+      if (request.method === 'OPTIONS') {
+        return new Response(null, { status: 204, headers: securityHeaders(request, env) })
+      }
+
+      if (url.pathname === '/api/login' && request.method === 'POST') {
+        return await handleLogin(request, env)
+      }
+
+      const mCodes = url.pathname.match(/^\/api\/codes(?:\/([^/]+))?$/)
+      const isLogout = url.pathname === '/api/logout' && request.method === 'POST'
+      const isMqttCfg = url.pathname === '/api/mqtt-config' && (request.method === 'GET' || request.method === 'PUT')
+      if (!mCodes && !isLogout && !isMqttCfg) return error(request, env, 'not found', 404)
+
+      if (!env.AUTH_SECRET) return error(request, env, 'AUTH_SECRET not configured', 500)
+      const auth = await checkAuth(request, env)
+      if (!auth) return json(request, env, { error: 'unauthorized' }, 401)
+
+      if (isLogout) {
+        await revokeAllTokens(env)
+        return json(request, env, { ok: true })
+      }
+
+      if (isMqttCfg) return handleMqttConfig(request, env)
+
+      return handleCodes(request, env, url, mCodes[1])
+    } catch (e) {
+      console.error('[api] unhandled error:', e)
+      return json(request, env, { error: 'server error' }, 500)
     }
-
-    // 登录是唯一公开接口
-    if (url.pathname === '/api/login' && request.method === 'POST') {
-      return handleLogin(request, env)
-    }
-
-    const mCodes = url.pathname.match(/^\/api\/codes(?:\/([^/]+))?$/)
-    const isLogout = url.pathname === '/api/logout' && request.method === 'POST'
-    const isMqttCfg = url.pathname === '/api/mqtt-config' && (request.method === 'GET' || request.method === 'PUT')
-    if (!mCodes && !isLogout && !isMqttCfg) return error(request, env, 'not found', 404)
-
-    if (!env.AUTH_SECRET) return error(request, env, 'AUTH_SECRET not configured', 500)
-    const auth = await checkAuth(request, env)
-    if (!auth) return json(request, env, { error: 'unauthorized' }, 401)
-
-    // 登出：递增 token 版本号，吊销当前所有 token（含本机与其他端）
-    if (isLogout) {
-      await revokeAllTokens(env)
-      return json(request, env, { ok: true })
-    }
-
-    if (isMqttCfg) return handleMqttConfig(request, env)
-
-    return handleCodes(request, env, url, mCodes[1])
   },
 }
