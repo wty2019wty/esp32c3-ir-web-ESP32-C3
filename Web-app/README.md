@@ -2,16 +2,18 @@
 
 基于 [esp32c3-ir-web-ESP32-C3](https://github.com/wty2019wty/esp32c3-ir-web-ESP32-C3) 设备的**独立前端**：通过 **MQTT over WebSocket** 控制/监视设备，用 **Cloudflare Workers KV** 做云端红外码库（学习、存储、一键回放）。
 
-技术栈：Vue 3 + Vite + mqtt.js，前端与 Worker 同域部署在 Cloudflare。
+技术栈：Vue 3 + Vite 7 + mqtt.js，前端与 Worker 同域部署在 Cloudflare。
 
 ## 功能
 
-- **遥控面板**：选择遥控器 → 按键网格一键回放（NEC hxd / 原始波形），发送记录实时反馈
-- **学习模式**：捕获红外信号（监听帧主题推送 + 主动拉取设备 RAM 历史 `frames`），命名保存到云端码库
-- **码库管理**：按遥控器分组浏览/删除，KV 持久化，跨设备共享
+- **遥控面板**：选择遥控器 → 按键网格一键回放（NEC hxd / 原始波形），发送记录可折叠查看
+- **学习模式**：捕获红外信号（监听帧主题推送 + 主动拉取设备 RAM 历史 `frames` 并按序号去重），会话内捕获列表可回看选中，命名保存到云端码库
+- **码库管理**：按遥控器分组的卡片式列表（移动端友好，无横向表格），点卡片即回放，KV 持久化，跨设备共享
+- **连接配置**：Broker 地址自动规范化——缺协议时按页面协议补 `ws://`/`wss://`，`mqtt(s)://` 自动转 WebSocket scheme，无路径自动补 `/mqtt` 端点；未填账号密码拒绝连接
 - **设备状态**：实时状态（模式/IP/载波/回放中）、载波设置、回放暂停接收开关
 - **在线判定**：`status` 命令轮询 + 状态主题 + LWT 三路信号综合判断设备在线/离线
-- **登录认证**：PBKDF2 哈希密码 + HMAC 签名 token，保护码库 API
+- **登录认证**：PBKDF2 哈希密码 + HMAC 签名 token（可吊销、登录限流），保护码库 API
+- **界面体验**：移动端响应式布局、toast 操作反馈、空状态引导与学习提示
 
 ## 架构
 
@@ -39,16 +41,16 @@ Web-app/
 ├── public/_headers        # 静态资源安全响应头（CSP / X-Frame-Options 等）
 ├── worker/index.js        # Cloudflare Worker：登录认证（限流/吊销）+ 码库 CRUD API
 ├── src/
-│   ├── main.js / App.vue  # 入口 + 三 Tab 布局 + 登录门控 + 设备在线轮询
+│   ├── main.js / App.vue  # 入口 + 三 Tab 布局 + 登录门控（退出先吊销服务端 token）+ 设备在线轮询
 │   ├── mqtt.js            # MQTT over WS 封装（命令 RPC / 状态 / 帧订阅）
 │   ├── kv.js              # Worker API 客户端 + 登录态管理
 │   ├── store.js           # 全局状态
 │   ├── style.css
 │   └── components/
 │       ├── Login.vue          # 登录框
-│       ├── ConnectPanel.vue   # broker/账号/主题配置（localStorage）
+│       ├── ConnectPanel.vue   # broker/账号/主题配置（地址自动规范化，localStorage + 密码 sessionStorage）
 │       ├── DeviceStatus.vue   # 设备状态 + 载波/rxpause 设置
-│       ├── LearnPanel.vue     # 学习模式（监听/拉取历史/保存入库/fpub 开关）
+│       ├── LearnPanel.vue     # 学习模式（监听/拉取历史去重/捕获列表/保存入库/fpub 开关）
 │       ├── CodeLibrary.vue    # 码库管理
 │       └── RemotePad.vue      # 遥控面板（按键回放 + 发送记录）
 ```
@@ -62,13 +64,14 @@ Web-app/
 | 主题 | 前端方向 | 用途 |
 |---|---|---|
 | `ir-web/cmd` | 发布 | 命令 RPC（`status/play/carrier/rxpause/frames/fpub`） |
-| `ir-web/rsp` | 订阅 | 命令响应（按 `id` 关联） |
+| `ir-web/rsp` | 订阅 | 命令响应（按 `id` 关联，id 带连接级随机前缀防多客户端串扰） |
 | `ir-web/status` | 订阅 | 设备状态 + LWT `offline` |
 | `ir-web/frame` | 订阅 | 红外帧推送 |
 
 注意：
 - 若设备开启"主题自动带设备标识"，实际主题变成 `ir-web/<client-id>/<cmd|rsp|status|frame>`，前端主题也要对应修改
 - 命令信封 `{"id":"c1","cmd":"play","body":{...}}`，响应 `{"ok":true,"id":"c1","result":{...}}`
+- Broker 地址只需填 host（或任意常见写法），前端会自动补全协议与 `/mqtt` 路径；HTTPS 页面下填明文 `ws://` 会被直接拦截提示
 - MQTT 通道仅开放 `status/frames/play/carrier/rxpause/fpub`，配置/会话类命令被设备拒绝
 
 ## 本地开发
@@ -141,7 +144,7 @@ npx wrangler deploy
 
 | 现象 | 排查 |
 |---|---|
-| 连不上 broker | 设备是否 STA 模式、MQTT 是否启用、broker WS 端口、HTTPS 页面必须 `wss://` |
+| 连不上 broker | 设备是否 STA 模式、MQTT 是否启用、broker WS 端口；地址可只填 host，前端自动补 `wss://` 与 `/mqtt`；未填账号密码会被拒绝 |
 | 学习模式无帧显示 | 用「拉取历史帧」（`frames` 命令）绕过推送帧/主题错配；或点「推送帧: 开」执行 `fpub` |
 | 设备状态"已连接 · 探测中" | 等下一次 12s 轮询；确认 `status` 命令在 cmd 主题有响应 |
 | 设备掉线但 badge 仍在线 | 正常断开不触发 LWT，靠 `status` 命令轮询最多 12s 判定离线 |
