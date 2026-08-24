@@ -57,7 +57,14 @@ const AUTH_KEY = 'ir-web-remote-auth'
 
 export function getAuthToken() {
   try {
-    return localStorage.getItem(AUTH_KEY) || ''
+    const s = localStorage.getItem(AUTH_KEY) || ''
+    if (!s) return ''
+    // 存储格式为 JSON（saveAuth 写入 {"token","user"}），取出其中的 token 字段
+    try {
+      return JSON.parse(s).token || ''
+    } catch {
+      return s // 兼容历史明文 token
+    }
   } catch {
     return ''
   }

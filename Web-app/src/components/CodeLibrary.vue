@@ -1,50 +1,63 @@
 <template>
   <div class="card">
-    <div class="row" style="justify-content: space-between">
-      <h2 style="margin:0">码库 (KV)</h2>
-      <div class="row" style="margin:0">
-        <button class="sm ghost" @click="load" :disabled="state.codesLoading">刷新</button>
+    <div class="row" style="justify-content: space-between; margin-top: 0">
+      <h2>码库</h2>
+      <div class="row" style="margin: 0">
         <span class="muted">{{ state.codes.length }} 条</span>
+        <button class="sm ghost" @click="load" :disabled="state.codesLoading">
+          {{ state.codesLoading ? '加载中…' : '刷新' }}
+        </button>
       </div>
     </div>
 
-    <div v-if="state.codesLoading" class="muted">加载中…</div>
-    <div v-else-if="state.codes.length === 0" class="muted">码库为空。先用「学习模式」捕获并保存按键码。</div>
+    <div v-if="state.codesLoading && !state.codes.length" class="empty-state">加载中…</div>
+    <div v-else-if="state.codes.length === 0" class="empty-state">
+      <span class="empty-icon">📚</span>
+      码库为空<br />先到「学习」模式捕获并保存按键码
+    </div>
 
+    <!-- 按遥控器分组的卡片列表（移动端友好，无横向表格） -->
     <template v-for="group in groups" :key="group.device">
-      <div class="row" style="margin-top:10px; margin-bottom:4px">
-        <b style="color:#8ab4ff">{{ group.device }}</b>
+      <div class="code-group-title">
+        <span>{{ group.device }}</span>
         <span class="badge gray">{{ group.items.length }} 键</span>
         <button
           class="sm ghost"
           :class="{ active: state.device === group.device }"
           @click="selectDevice(group.device)"
+          style="margin-left: auto"
         >
-          {{ state.device === group.device ? '当前遥控器' : '设为当前' }}
+          {{ state.device === group.device ? '✓ 当前遥控器' : '设为当前' }}
         </button>
       </div>
-      <table>
-        <thead>
-          <tr><th>按键</th><th>类型</th><th>频率</th><th>备注</th><th style="width:70px"></th></tr>
-        </thead>
-        <tbody>
-          <tr v-for="c in group.items" :key="c.id">
-            <td>
-              <span class="mono">{{ c.name }}</span>
-              <span v-if="c.type === 'hxd'" class="muted mono" style="display:block;font-size:11px">{{ c.value }}</span>
-            </td>
-            <td>
+
+      <div class="code-list">
+        <div v-for="c in group.items" :key="c.id" class="code-card">
+          <div class="code-main" @click="play(c)" role="button">
+            <div class="code-name">{{ c.name }}</div>
+            <div class="code-meta">
               <span :class="c.type === 'hxd' ? 'badge green' : 'badge blue'">{{ c.type === 'hxd' ? 'NEC' : 'RAW' }}</span>
-            </td>
-            <td class="muted">{{ c.freq ? c.freq + ' Hz' : '-' }}</td>
-            <td class="muted">{{ c.note || '-' }}</td>
-            <td>
-              <button class="sm danger" @click="remove(c)">删除</button>
-            </td>
-          </tr>
-        </tbody>
-      </table>
+              <span v-if="c.freq">{{ c.freq }} Hz</span>
+              <span v-if="c.note">{{ c.note }}</span>
+            </div>
+            <div v-if="c.type === 'hxd'" class="code-value">{{ c.value }}</div>
+          </div>
+          <button
+            class="sm"
+            :class="{ sending: sendingId === c.id }"
+            :disabled="!connected || sendingId === c.id"
+            @click="play(c)"
+          >
+            {{ sendingId === c.id ? '…' : '发送' }}
+          </button>
+          <button class="sm ghost" style="color: var(--red-text); border-color: var(--red)" @click="remove(c)">删</button>
+        </div>
+      </div>
     </template>
+
+    <div v-if="!connected && state.codes.length" class="muted" style="margin-top: 10px; text-align: center">
+      连接 broker 后可点「发送」直接回放
+    </div>
   </div>
 </template>
 
@@ -52,8 +65,12 @@
 import { ref, computed, onMounted } from 'vue'
 import { state } from '../store'
 import { listCodes, removeCode } from '../kv'
+import { playHxd, playRaw } from '../mqtt'
 
 const emit = defineEmits(['toast'])
+const sendingId = ref(null)
+
+const connected = computed(() => state.conn.connected)
 
 const groups = computed(() => {
   const map = new Map()
@@ -70,7 +87,7 @@ async function load() {
     const r = await listCodes()
     state.codes = r.codes || []
   } catch (e) {
-    emit('toast', `加载码库失败: ${e.message}`)
+    emit('toast', `加载码库失败: ${e.message}`, 'fail')
   } finally {
     state.codesLoading = false
   }
@@ -78,7 +95,30 @@ async function load() {
 
 function selectDevice(d) {
   state.device = d
-  emit('toast', `当前遥控器: ${d}`)
+  emit('toast', `当前遥控器: ${d}`, 'ok')
+}
+
+// 卡片点击 / 发送按钮均可回放
+async function play(c) {
+  if (!connected.value) {
+    emit('toast', '请先在「设置」页连接 broker', 'fail')
+    return
+  }
+  if (sendingId.value) return
+  sendingId.value = c.id
+  const freq = c.freq || state.carrier || 38000
+  try {
+    if (c.type === 'raw') {
+      await playRaw(c.durs, freq)
+    } else {
+      await playHxd(c.value, freq)
+    }
+    emit('toast', `已发送 ${c.device} / ${c.name}`, 'ok')
+  } catch (e) {
+    emit('toast', `发送 ${c.name} 失败: ${e.message}`, 'fail')
+  } finally {
+    setTimeout(() => (sendingId.value = null), 400)
+  }
 }
 
 async function remove(c) {
@@ -86,12 +126,13 @@ async function remove(c) {
   try {
     await removeCode(c.id)
     state.codes = state.codes.filter((x) => x.id !== c.id)
-    emit('toast', '已删除')
+    emit('toast', '已删除', 'ok')
   } catch (e) {
-    emit('toast', `删除失败: ${e.message}`)
+    emit('toast', `删除失败: ${e.message}`, 'fail')
   }
 }
 
+// 登录门控切换后（Login -> 主界面）CodeLibrary 才挂载，此时自动加载一次
 onMounted(load)
 defineExpose({ load })
 </script>

@@ -2,33 +2,53 @@
   <div>
     <Login v-if="!authed" @ok="onLoginOk" />
 
-    <template v-else>
+    <div v-else class="app-shell">
       <header class="app-header">
-        <h1>📡 IR 万能遥控器</h1>
-        <nav class="tabs">
+        <h1>IR 遥控器</h1>
+
+        <!-- 桌面端顶栏导航 -->
+        <nav class="desktop-tabs">
           <button :class="{ active: tab === 'remote' }" @click="tab = 'remote'">遥控面板</button>
           <button :class="{ active: tab === 'learn' }" @click="tab = 'learn'">学习模式</button>
           <button :class="{ active: tab === 'settings' }" @click="tab = 'settings'">设置</button>
         </nav>
-        <span :class="badgeClass">{{ badgeText }}</span>
-        <button class="sm ghost" title="退出登录" @click="logout">退出</button>
+
+        <div class="header-right">
+          <span :class="badgeClass">{{ badgeText }}</span>
+          <button class="sm ghost" @click="logout">退出</button>
+        </div>
       </header>
 
-      <div v-show="tab === 'remote'">
-        <RemotePad @toast="toast" />
-        <CodeLibrary ref="lib" @toast="toast" />
-      </div>
+      <main class="app-main">
+        <template v-if="tab === 'remote'">
+          <RemotePad @toast="toast" />
+          <CodeLibrary ref="lib" @toast="toast" />
+        </template>
 
-      <LearnPanel v-show="tab === 'learn'" @saved="onSaved" @toast="toast" />
+        <LearnPanel v-show="tab === 'learn'" @saved="onSaved" @toast="toast" />
 
-      <div v-show="tab === 'settings'">
-        <ConnectPanel />
-        <DeviceStatus />
-      </div>
-    </template>
+        <template v-if="tab === 'settings'">
+          <DeviceStatus />
+          <ConnectPanel @toast="toast" />
+        </template>
+      </main>
 
-    <div v-if="toasts.length" class="toast" style="right:14px; bottom:14px; top:auto; display:block">
-      <div v-for="(t, i) in toasts" :key="i">{{ t.text }}</div>
+      <!-- 移动端底部 Tab 栏 -->
+      <nav class="tab-bar">
+        <button :class="{ active: tab === 'remote' }" @click="tab = 'remote'">
+          <span class="tab-icon">🎮</span>遥控
+        </button>
+        <button :class="{ active: tab === 'learn' }" @click="tab = 'learn'">
+          <span class="tab-icon">📡</span>学习
+        </button>
+        <button :class="{ active: tab === 'settings' }" @click="tab = 'settings'">
+          <span class="tab-icon">⚙️</span>设置
+        </button>
+      </nav>
+    </div>
+
+    <div v-if="toasts.length" class="toast-wrap">
+      <div v-for="t in toasts" :key="t.id" class="toast-item" :class="t.kind">{{ t.text }}</div>
     </div>
   </div>
 </template>
@@ -62,20 +82,17 @@ const badgeClass = computed(() => {
   return state.deviceOnline === true ? 'badge green' : 'badge blue'
 })
 const badgeText = computed(() => {
-  if (!state.conn.connected) return state.conn.state === 'error' ? `错误: ${state.conn.error}` : '未连接'
-  if (state.deviceOnline === false) return '已连接 · 设备离线'
-  return state.deviceOnline === true ? '已连接 · 设备在线' : '已连接 · 探测中'
+  if (!state.conn.connected) return state.conn.state === 'error' ? `错误` : '未连接'
+  if (state.deviceOnline === false) return '设备离线'
+  return state.deviceOnline === true ? '设备在线' : '探测中'
 })
 
-function toast(text) {
-  toasts.value.push({ text, id: Date.now() })
-  if (toasts.value.length > 4) toasts.value.shift()
-  if (!toastTimer) {
-    toastTimer = setTimeout(() => {
-      toasts.value = []
-      toastTimer = null
-    }, 3000)
-  }
+function toast(text, kind = '') {
+  const id = Date.now() + Math.random()
+  toasts.value.push({ text, kind, id })
+  setTimeout(() => {
+    toasts.value = toasts.value.filter((t) => t.id !== id)
+  }, 3000)
 }
 
 function onLoginOk() {

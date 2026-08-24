@@ -1,64 +1,76 @@
 <template>
   <div class="card">
-    <div class="row" style="justify-content: space-between">
-      <h2 style="margin:0">遥控面板</h2>
+    <div class="row" style="justify-content: space-between; margin-top: 0">
+      <h2>遥控面板</h2>
       <span v-if="state.device" class="badge blue">{{ state.device }}</span>
       <span v-else class="badge gray">未选择遥控器</span>
     </div>
 
-    <div v-if="state.status" class="row muted" style="font-size:12.5px">
-      <span>模式 {{ state.status.mode || '-' }}</span>
-      <span>IP {{ ipText }}</span>
-      <span>载波 {{ state.status.carrier_hz || state.carrier }} Hz</span>
-      <span v-if="state.status.playing" class="badge yellow">回放中</span>
+    <!-- 设备状态摘要条 -->
+    <div v-if="state.status" class="frame-summary" style="margin: 8px 0">
+      <span><b>模式</b>{{ state.status.mode || '-' }}</span>
+      <span><b>IP</b>{{ ipText }}</span>
+      <span><b>载波</b>{{ state.status.carrier_hz || state.carrier }} Hz</span>
+      <span v-if="state.status.playing"><b class="badge yellow">回放中…</b></span>
     </div>
 
-    <div class="row">
-      <label class="lbl">遥控器</label>
-      <select v-model="state.device" style="flex:1">
+    <!-- 遥控器选择：移动端全宽下拉 -->
+    <div class="form-field">
+      <label>遥控器</label>
+      <select v-model="state.device">
         <option value="" disabled>选择遥控器…</option>
         <option v-for="d in devices" :key="d" :value="d">{{ d }}</option>
       </select>
     </div>
 
-    <div v-if="activeCodes.length" class="btn-grid" style="margin-top:10px">
+    <!-- 按键网格 -->
+    <div v-if="activeCodes.length" class="btn-grid" style="margin-top: 12px">
       <button
         v-for="c in activeCodes"
         :key="c.id"
         :class="{ sending: sendingId === c.id }"
+        :disabled="!connected"
         @click="send(c)"
         :title="`${c.note || ''}${c.freq ? ' · ' + c.freq + ' Hz' : ''}`"
       >
-        {{ c.name }}
+        {{ sendingId === c.id ? '发送中…' : c.name }}
       </button>
     </div>
-    <div v-else class="muted" style="margin-top:8px">
-      当前遥控器没有按键。用「学习模式」捕获信号并保存，或在上方码库中设置。
+    <div v-else-if="devices.length" class="empty-state">
+      当前遥控器没有按键，试试其他遥控器或到「学习」页捕获新按键。
+    </div>
+    <div v-else class="empty-state">
+      <span class="empty-icon">📚</span>
+      码库还是空的<br />先到「学习」模式捕获红外信号并保存
     </div>
 
-    <div style="margin-top:12px">
-      <div class="row" style="justify-content: space-between">
-        <b style="color:var(--muted);font-size:13px">发送记录</b>
-        <button class="sm ghost" @click="state.playLog = []">清空</button>
-      </div>
-      <div v-if="state.playLog.length === 0" class="muted">暂无</div>
-      <div v-for="(log, i) in state.playLog" :key="i" class="log-line">
-        <span class="muted">{{ fmtTime(log.ts) }}</span>
-        <span :class="log.ok ? 'ok' : 'fail'">{{ log.ok ? '✓' : '✗' }}</span>
-        <span>{{ log.text }}</span>
-      </div>
-    </div>
+    <!-- 发送记录（可折叠，减少滚动长度） -->
+    <details class="collapse" style="margin-top: 14px" :open="false">
+      <summary>发送记录{{ state.playLog.length ? ` (${state.playLog.length})` : '' }}</summary>
+      <div v-if="state.playLog.length === 0" class="muted" style="padding: 4px 0">暂无</div>
+      <template v-else>
+        <div class="row" style="justify-content: flex-end; margin: 0">
+          <button class="sm ghost" @click="state.playLog = []">清空记录</button>
+        </div>
+        <div v-for="(log, i) in state.playLog" :key="i" class="log-line">
+          <span class="muted mono">{{ fmtTime(log.ts) }}</span>
+          <span :class="log.ok ? 'ok' : 'fail'">{{ log.ok ? '✓' : '✗' }}</span>
+          <span>{{ log.text }}</span>
+        </div>
+      </template>
+    </details>
   </div>
 </template>
 
 <script setup>
 import { ref, computed } from 'vue'
 import { state, pushPlayLog, fmtTime } from '../store'
-import { playHxd, playRaw, sendCmd } from '../mqtt'
+import { playHxd, playRaw } from '../mqtt'
 
 const emit = defineEmits(['toast'])
 const sendingId = ref(null)
 
+const connected = computed(() => state.conn.connected)
 const devices = computed(() => [...new Set(state.codes.map((c) => c.device))])
 const activeCodes = computed(() => state.codes.filter((c) => c.device === state.device))
 const ipText = computed(() => {
@@ -68,8 +80,8 @@ const ipText = computed(() => {
 })
 
 async function send(c) {
-  if (!state.conn.connected) {
-    emit('toast', '请先连接 broker')
+  if (!connected.value) {
+    emit('toast', '请先在「设置」页连接 broker', 'fail')
     return
   }
   sendingId.value = c.id

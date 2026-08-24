@@ -1,31 +1,36 @@
 <template>
   <div class="card">
-    <div class="row" style="justify-content: space-between">
-      <h2 style="margin:0">设备状态</h2>
+    <div class="row" style="justify-content: space-between; margin-top: 0">
+      <h2>设备状态</h2>
       <span v-if="offline" class="badge red">离线 (LWT)</span>
       <span v-else class="badge blue">{{ modeBadge }}</span>
     </div>
 
-    <div v-if="!state.status && !offline" class="muted">连接 broker 并订阅状态主题后显示…</div>
+    <div v-if="!state.status && !offline" class="empty-state">
+      连接 broker 并订阅状态主题后显示…
+    </div>
 
     <template v-if="state.status && !offline">
-      <div class="frame-summary" style="margin-bottom:6px">
-        <span><b>模式</b> {{ state.status.mode }}</span>
-        <span><b>IP</b> {{ ipText }}</span>
-        <span v-if="state.status.sta_ssid"><b>WiFi</b> {{ state.status.sta_ssid }}</span>
-        <span v-else-if="state.status.ap_ssid"><b>热点</b> {{ state.status.ap_ssid }}</span>
-        <span><b>载波</b> {{ state.status.carrier_hz }} Hz</span>
-        <span v-if="state.status.playing"><b>回放中…</b></span>
+      <div class="frame-summary" style="margin-bottom: 10px">
+        <span><b>模式</b>{{ state.status.mode }}</span>
+        <span><b>IP</b>{{ ipText }}</span>
+        <span v-if="state.status.sta_ssid"><b>WiFi</b>{{ state.status.sta_ssid }}</span>
+        <span v-else-if="state.status.ap_ssid"><b>热点</b>{{ state.status.ap_ssid }}</span>
+        <span><b>载波</b>{{ state.status.carrier_hz }} Hz</span>
+        <span v-if="state.status.playing"><b class="badge yellow">回放中…</b></span>
       </div>
     </template>
 
-    <div class="row">
-      <label class="lbl">载波频率 (Hz)</label>
-      <input v-model="carrierInput" type="number" style="width:120px" placeholder="38000" />
-      <button class="sm" @click="applyCarrier" :disabled="!connected">设置载波</button>
+    <div class="form-field" style="margin-top: 8px">
+      <label>载波频率 (Hz)</label>
+      <div class="row" style="margin: 0">
+        <input v-model="carrierInput" type="number" inputmode="numeric" placeholder="38000" style="flex: 1" />
+        <button class="sm" @click="applyCarrier" :disabled="!connected">设置</button>
+      </div>
+    </div>
 
-      <span style="flex:1"></span>
-      <label class="lbl">回放暂停接收</label>
+    <div class="row" style="justify-content: space-between; margin-bottom: 0">
+      <label class="lbl">回放时暂停接收</label>
       <button
         class="sm ghost"
         :class="{ flash: flashRxPause }"
@@ -33,7 +38,7 @@
         :disabled="!connected"
         :title="'当前: ' + (state.status?.rx_pause_on_play ? '开' : '关')"
       >
-        {{ state.status?.rx_pause_on_play ? '开' : '关' }}
+        {{ state.status?.rx_pause_on_play ? '开 ✓' : '关' }}
       </button>
     </div>
   </div>

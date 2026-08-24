@@ -1,18 +1,31 @@
 <template>
   <div class="login-overlay">
     <div class="login-card">
-      <h2>📡 IR 万能遥控器</h2>
-      <div class="muted" style="margin-bottom:12px">请登录后使用码库</div>
-      <div class="grid2">
-        <label>用户名</label>
-        <input v-model="user" type="text" autocomplete="username" placeholder="admin" @keyup.enter="doLogin" />
-        <label>密码</label>
-        <input v-model="pass" type="password" autocomplete="current-password" placeholder="••••••" @keyup.enter="doLogin" />
+      <div class="login-logo">📡</div>
+      <h2>IR 万能遥控器</h2>
+      <div class="muted" style="margin-bottom: 16px">登录后使用云端红外码库</div>
+
+      <div class="form-field">
+        <label for="login-user">用户名</label>
+        <input id="login-user" v-model="user" type="text" autocomplete="username"
+          placeholder="admin" autocapitalize="off" autocorrect="off"
+          spellcheck="false" @keyup.enter="doLogin" />
       </div>
-      <div v-if="err" class="err" style="margin-top:8px">{{ err }}</div>
-      <div class="row" style="justify-content:flex-end; margin-top:12px">
-        <button @click="doLogin" :disabled="busy">{{ busy ? '登录中…' : '登录' }}</button>
+      <div class="form-field">
+        <label for="login-pass">密码</label>
+        <input id="login-pass" v-model="pass" type="password" autocomplete="current-password"
+          placeholder="••••••" @keyup.enter="doLogin" />
       </div>
+
+      <div v-if="err" class="err" style="margin-top: 8px">{{ err }}</div>
+
+      <button
+        style="width: 100%; margin-top: 14px"
+        :disabled="busy"
+        @click="doLogin"
+      >
+        {{ busy ? '登录中…' : '登 录' }}
+      </button>
     </div>
   </div>
 </template>
@@ -47,16 +60,3 @@ async function doLogin() {
   }
 }
 </script>
-
-<style scoped>
-.login-overlay {
-  position: fixed; inset: 0; background: rgba(10, 12, 16, .92);
-  display: flex; align-items: center; justify-content: center; z-index: 100; padding: 16px;
-}
-.login-card {
-  width: 380px; max-width: 100%;
-  background: var(--card); border: 1px solid var(--border); border-radius: 12px;
-  padding: 24px;
-}
-.login-card h2 { margin: 0 0 4px; color: #fff; }
-</style>
