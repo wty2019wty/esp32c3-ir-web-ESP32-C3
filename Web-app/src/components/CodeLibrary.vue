@@ -33,7 +33,7 @@
 
       <div class="code-list">
         <div v-for="c in group.items" :key="c.id" class="code-card">
-          <div class="code-main" @click="play(c)" role="button">
+          <div class="code-main">
             <div class="code-name">{{ c.name }}</div>
             <div class="code-meta">
               <span :class="c.type === 'hxd' ? 'badge green' : 'badge blue'">{{ c.type === 'hxd' ? 'NEC' : 'RAW' }}</span>
@@ -98,7 +98,7 @@ function selectDevice(d) {
   emit('toast', `当前遥控器: ${d}`, 'ok')
 }
 
-// 卡片点击 / 发送按钮均可回放
+// 仅「发送」按钮触发回放
 async function play(c) {
   if (!connected.value) {
     emit('toast', '请先在「设置」页连接 broker', 'fail')
