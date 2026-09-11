@@ -188,6 +188,9 @@ onMounted(() => {
     }
   })
   onFrame((frame) => {
+    if (!frame || frame.seq == null) return
+    // 推送路径与历史拉取可能重叠：按 seq 去重，避免重复计数/重复 key
+    if (state.frames.some((x) => x.seq === frame.seq)) return
     state.frames.unshift(frame)
     if (state.frames.length > 30) state.frames.length = 30
     if (state.learning) state.lastFrame = frame

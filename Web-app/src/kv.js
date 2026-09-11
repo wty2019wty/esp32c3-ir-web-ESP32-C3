@@ -146,7 +146,8 @@ export async function getMqttConfig() {
   return r.config
 }
 
-// password 传 '' 表示清除已存密码；不传该字段表示保持服务端原值不变
+// password 传 '' 表示清除已存密码；不传 / 传 undefined 表示保持服务端原值不变
+// （不要用空字符串「占位」表示保持，那是清除语义）
 export async function saveMqttConfig(cfg) {
   return request('PUT', '/mqtt-config', cfg)
 }

@@ -32,7 +32,9 @@
 #define IR_RX_TIMEOUT_NS    50000000U  /* idle gap > 50 ms ends the frame */
 
 #define IR_CARRIER_DUTY     CONFIG_IR_TOOL_CARRIER_DUTY
-#define IR_PLAY_QUEUE_LEN   4
+/* 8 slots absorbs short bursts of remote macros without dropping frames;
+ * still small enough that a stalled queue is bounded memory. */
+#define IR_PLAY_QUEUE_LEN   8
 
 #define IR_NVS_NS           "ir_tool"
 #define IR_NVS_KEY_FREQ     "carrier_hz"
@@ -50,6 +52,10 @@ static rmt_channel_handle_t s_rx_ch = NULL;
 static rmt_receive_config_t s_rx_cfg;
 static rmt_symbol_word_t s_rx_buf[IR_RX_BUF_SYMBOLS];
 static ir_seg_t s_segs[IR_RAW_MAX_SEGS];   /* analysis scratch (RMT ticks -> us) */
+/* ir_frame_t embeds raw_durs[IR_RAW_MAX_SEGS] (~4.2KB at 1024). Keep it off the
+ * ir_task stack — only that single task writes it, so a static buffer is safe
+ * and the task stack stays a fixed 4KB regardless of MAX_RX_SEGS. */
+static ir_frame_t s_task_frame;
 
 /* TX variables */
 static rmt_channel_handle_t s_tx_ch = NULL;
@@ -192,8 +198,8 @@ static void ir_task(void *arg)
         s_rx_done = false;
         s_rx_overflow = false;
 
-        ir_frame_t fr;
-        memset(&fr, 0, sizeof(fr));
+        ir_frame_t *fr = &s_task_frame;
+        memset(fr, 0, sizeof(*fr));
         size_t num = ev.num_symbols;
         /* Two ways a frame can exceed IR_RAW_MAX_SEGS:
          * - the driver fired a partial event (user buffer filled), so this
@@ -210,14 +216,14 @@ static void ir_task(void *arg)
             }
             continue;
         }
-        ir_analyze(ev.received_symbols, num, &fr);
-        fr.valid = true;
-        fr.timestamp_ms = (uint32_t)(esp_timer_get_time() / 1000);
-        fr.capture_freq_hz = ir_get_carrier_freq();
+        ir_analyze(ev.received_symbols, num, fr);
+        fr->valid = true;
+        fr->timestamp_ms = (uint32_t)(esp_timer_get_time() / 1000);
+        fr->capture_freq_hz = ir_get_carrier_freq();
 
         /* store into latest + history ring and notify listeners (e.g.
          * WebSocket push) about the new frame (assigns seq) */
-        ir_store_push(&fr);
+        ir_store_push(fr);
 
         /* While the TX task is transmitting, RX stays paused (avoids
          * self-loop frames). The playback task resumes the receive loop. */
@@ -324,10 +330,10 @@ esp_err_t ir_init(void)
 
     ESP_RETURN_ON_ERROR(rmt_enable(s_tx_ch), TAG, "enable RMT TX");
 
-    /* create IR receive task: stack must fit one ir_frame_t (raw_durs scales
-     * with IR_RAW_MAX_SEGS, up to ~8.2KB at 2048) plus the analysis/callback
-     * chain, so derive it from the frame size instead of hardcoding it */
-    if (xTaskCreate(ir_task, "ir_task", sizeof(ir_frame_t) + 4096, NULL, 6, NULL) != pdPASS) {
+    /* IR receive task: the large frame buffer is static (s_task_frame), so a
+     * fixed 4KB stack covers analysis + callbacks without scaling with
+     * IR_RAW_MAX_SEGS. */
+    if (xTaskCreate(ir_task, "ir_task", 4096, NULL, 6, NULL) != pdPASS) {
         return ESP_ERR_NO_MEM;
     }
     /* create playback task */

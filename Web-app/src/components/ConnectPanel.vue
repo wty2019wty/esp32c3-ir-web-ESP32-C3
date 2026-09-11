@@ -122,7 +122,7 @@ function buildPayload() {
   return {
     url: form.url.trim(),
     username: form.username.trim(),
-    // 密码留空表示清除云端已存密码
+    // 密码留空字符串表示清除云端已存密码；要保持原密码请勿发空串（API 层省略字段即可）
     password: form.password,
     topics: {
       cmd: form.topicCmd.trim(),

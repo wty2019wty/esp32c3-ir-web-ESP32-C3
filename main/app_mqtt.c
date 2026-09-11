@@ -14,6 +14,7 @@
 #include "esp_log.h"
 #include "esp_mac.h"
 #include "esp_system.h"
+#include "esp_random.h"
 #include "esp_timer.h"
 #include "nvs_flash.h"
 #include "nvs.h"
@@ -24,6 +25,8 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
+#include "mbedtls/base64.h"
+#include "psa/crypto.h"
 
 #define TAG "mqtt"
 
@@ -91,6 +94,167 @@ static char s_broker_host[256] = { 0 };
  * unresolved, so the client starts as soon as the network path is up. */
 static esp_timer_handle_t s_dns_timer = NULL;
 
+/* ---------------- password AES-GCM (defense in depth) ----------------
+ * NVS partition encryption (eFuse HMAC key) already protects flash dumps.
+ * The password field is additionally AES-GCM encrypted so a raw NVS blob or
+ * an accidental plaintext dump of KEY_PWD is useless without the device MAC.
+ * Stored format: "enc:v1:" + base64url(iv[12] || tag[16] || ciphertext).
+ * Legacy plaintext values are still accepted on load and re-encrypted on save.
+ * Uses PSA Crypto (mbedtls 4 / IDF v6). */
+
+#define MQTT_PWD_ENC_PREFIX "enc:v1:"
+#define MQTT_PWD_IV_LEN     12
+#define MQTT_PWD_TAG_LEN    16
+#define MQTT_PWD_ENC_MAX    192 /* base64(iv||tag||ct) + prefix */
+
+static bool s_psa_ready = false;
+
+static bool mqtt_psa_ensure(void)
+{
+    if (s_psa_ready) {
+        return true;
+    }
+    if (psa_crypto_init() != PSA_SUCCESS) {
+        return false;
+    }
+    s_psa_ready = true;
+    return true;
+}
+
+static bool mqtt_pwd_derive_key(unsigned char key[32])
+{
+    uint8_t mac[6] = {0};
+    esp_read_mac(mac, ESP_MAC_WIFI_STA);
+    unsigned char msg[sizeof(mac) + 18];
+    static const char salt[] = "ir-web-mqtt-pwd-v1";
+    memcpy(msg, salt, sizeof(salt) - 1);
+    memcpy(msg + sizeof(salt) - 1, mac, sizeof(mac));
+    size_t olen = 0;
+    psa_status_t st = psa_hash_compute(PSA_ALG_SHA_256, msg, sizeof(msg),
+                                       key, 32, &olen);
+    memset(msg, 0, sizeof(msg));
+    return st == PSA_SUCCESS && olen == 32;
+}
+
+/* Import a transient AES-256 key for AEAD; caller must destroy it. */
+static bool mqtt_pwd_import_key(const unsigned char key[32], psa_key_id_t *key_id)
+{
+    psa_key_attributes_t attrs = PSA_KEY_ATTRIBUTES_INIT;
+    psa_set_key_type(&attrs, PSA_KEY_TYPE_AES);
+    psa_set_key_bits(&attrs, 256);
+    psa_set_key_algorithm(&attrs, PSA_ALG_GCM);
+    psa_set_key_usage_flags(&attrs, PSA_KEY_USAGE_ENCRYPT | PSA_KEY_USAGE_DECRYPT);
+    psa_status_t st = psa_import_key(&attrs, key, 32, key_id);
+    psa_reset_key_attributes(&attrs);
+    return st == PSA_SUCCESS;
+}
+
+/* Encrypt plain -> "enc:v1:<b64>". Returns false on any failure. */
+static bool mqtt_pwd_encrypt(const char *plain, char *out, size_t out_sz)
+{
+    size_t plen = strlen(plain);
+    if (plen == 0 || plen >= MQTT_CFG_STR_LEN) {
+        return false;
+    }
+    if (!mqtt_psa_ensure()) {
+        return false;
+    }
+    unsigned char key[32];
+    unsigned char iv[MQTT_PWD_IV_LEN];
+    /* PSA AEAD output layout: ciphertext || tag */
+    unsigned char ct_tag[MQTT_CFG_STR_LEN + MQTT_PWD_TAG_LEN];
+    if (!mqtt_pwd_derive_key(key)) {
+        return false;
+    }
+
+    esp_fill_random(iv, sizeof(iv));
+
+    psa_key_id_t kid;
+    if (!mqtt_pwd_import_key(key, &kid)) {
+        memset(key, 0, sizeof(key));
+        return false;
+    }
+    size_t olen = 0;
+    psa_status_t st = psa_aead_encrypt(kid, PSA_ALG_GCM,
+                                       iv, sizeof(iv), NULL, 0,
+                                       (const unsigned char *)plain, plen,
+                                       ct_tag, sizeof(ct_tag), &olen);
+    psa_destroy_key(kid);
+    memset(key, 0, sizeof(key));
+    if (st != PSA_SUCCESS || olen != plen + MQTT_PWD_TAG_LEN) {
+        memset(ct_tag, 0, sizeof(ct_tag));
+        return false;
+    }
+
+    unsigned char blob[MQTT_PWD_IV_LEN + MQTT_CFG_STR_LEN + MQTT_PWD_TAG_LEN];
+    memcpy(blob, iv, sizeof(iv));
+    memcpy(blob + sizeof(iv), ct_tag, olen);
+    memset(ct_tag, 0, sizeof(ct_tag));
+
+    size_t blen = 0;
+    psa_status_t unused = PSA_SUCCESS;
+    (void)unused;
+    int b64rc = mbedtls_base64_encode((unsigned char *)out, out_sz, &blen,
+                                      blob, sizeof(iv) + olen);
+    memset(blob, 0, sizeof(blob));
+    if (b64rc != 0 || blen + sizeof(MQTT_PWD_ENC_PREFIX) > out_sz) {
+        return false;
+    }
+    memmove(out + sizeof(MQTT_PWD_ENC_PREFIX) - 1, out, blen + 1);
+    memcpy(out, MQTT_PWD_ENC_PREFIX, sizeof(MQTT_PWD_ENC_PREFIX) - 1);
+    return true;
+}
+
+/* Decrypt "enc:v1:<b64>" body (without the prefix) into plain. */
+static bool mqtt_pwd_decrypt(const char *b64, char *plain, size_t plain_sz)
+{
+    unsigned char blob[MQTT_PWD_IV_LEN + MQTT_PWD_TAG_LEN + MQTT_CFG_STR_LEN];
+    size_t blen = 0;
+    if (mbedtls_base64_decode(blob, sizeof(blob), &blen,
+                              (const unsigned char *)b64, strlen(b64)) != 0) {
+        return false;
+    }
+    if (blen < MQTT_PWD_IV_LEN + MQTT_PWD_TAG_LEN + 1 ||
+        blen - MQTT_PWD_IV_LEN - MQTT_PWD_TAG_LEN >= plain_sz) {
+        memset(blob, 0, sizeof(blob));
+        return false;
+    }
+    if (!mqtt_psa_ensure()) {
+        memset(blob, 0, sizeof(blob));
+        return false;
+    }
+
+    unsigned char key[32];
+    if (!mqtt_pwd_derive_key(key)) {
+        memset(blob, 0, sizeof(blob));
+        return false;
+    }
+    psa_key_id_t kid;
+    if (!mqtt_pwd_import_key(key, &kid)) {
+        memset(key, 0, sizeof(key));
+        memset(blob, 0, sizeof(blob));
+        return false;
+    }
+    memset(key, 0, sizeof(key));
+
+    const unsigned char *iv = blob;
+    const unsigned char *ct_tag = blob + MQTT_PWD_IV_LEN;
+    size_t ct_tag_len = blen - MQTT_PWD_IV_LEN;
+    size_t olen = 0;
+    psa_status_t st = psa_aead_decrypt(kid, PSA_ALG_GCM,
+                                       iv, MQTT_PWD_IV_LEN, NULL, 0,
+                                       ct_tag, ct_tag_len,
+                                       (unsigned char *)plain, plain_sz, &olen);
+    psa_destroy_key(kid);
+    memset(blob, 0, sizeof(blob));
+    if (st != PSA_SUCCESS) {
+        memset(plain, 0, plain_sz);
+        return false;
+    }
+    plain[olen] = '\0';
+    return true;
+}
+
 /* ---------------- NVS config load / save ---------------- */
 
 esp_err_t mqtt_web_config_load(mqtt_web_config_t *cfg)
@@ -145,9 +309,23 @@ esp_err_t mqtt_web_config_load(mqtt_web_config_t *cfg)
     if (nvs_get_str(h, KEY_USER, cfg->username, &len) != ESP_OK) {
         strlcpy(cfg->username, CONFIG_IR_TOOL_MQTT_USERNAME, sizeof(cfg->username));
     }
-    len = sizeof(cfg->password);
-    if (nvs_get_str(h, KEY_PWD, cfg->password, &len) != ESP_OK) {
-        strlcpy(cfg->password, CONFIG_IR_TOOL_MQTT_PASSWORD, sizeof(cfg->password));
+    {
+        char pwd_store[MQTT_PWD_ENC_MAX];
+        len = sizeof(pwd_store);
+        if (nvs_get_str(h, KEY_PWD, pwd_store, &len) == ESP_OK) {
+            if (strncmp(pwd_store, MQTT_PWD_ENC_PREFIX, 7) == 0) {
+                if (!mqtt_pwd_decrypt(pwd_store + 7, cfg->password, sizeof(cfg->password))) {
+                    ESP_LOGW(TAG, "MQTT password decrypt failed, treating as unset");
+                    cfg->password[0] = '\0';
+                }
+            } else {
+                /* legacy plaintext: migrate on next save */
+                strlcpy(cfg->password, pwd_store, sizeof(cfg->password));
+            }
+            memset(pwd_store, 0, sizeof(pwd_store));
+        } else {
+            strlcpy(cfg->password, CONFIG_IR_TOOL_MQTT_PASSWORD, sizeof(cfg->password));
+        }
     }
     len = sizeof(cfg->client_id);
     if (nvs_get_str(h, KEY_CID, cfg->client_id, &len) != ESP_OK) {
@@ -197,7 +375,18 @@ esp_err_t mqtt_web_config_save(const mqtt_web_config_t *cfg)
     if (err == ESP_OK) err = nvs_set_u8(h, KEY_TSFX, cfg->topic_suffix ? 1 : 0);
     if (err == ESP_OK) err = nvs_set_str(h, KEY_BROKER, cfg->broker_uri);
     if (err == ESP_OK) err = nvs_set_str(h, KEY_USER, cfg->username);
-    if (err == ESP_OK) err = nvs_set_str(h, KEY_PWD, cfg->password);
+    if (err == ESP_OK) {
+        char pwd_store[MQTT_PWD_ENC_MAX] = {0};
+        if (cfg->password[0] != '\0') {
+            if (!mqtt_pwd_encrypt(cfg->password, pwd_store, sizeof(pwd_store))) {
+                err = ESP_FAIL;
+            }
+        }
+        if (err == ESP_OK) {
+            err = nvs_set_str(h, KEY_PWD, pwd_store);
+        }
+        memset(pwd_store, 0, sizeof(pwd_store));
+    }
     if (err == ESP_OK) err = nvs_set_str(h, KEY_CID, cfg->client_id);
     if (err == ESP_OK) err = nvs_set_str(h, KEY_T_CMD, cfg->topic_cmd);
     if (err == ESP_OK) err = nvs_set_str(h, KEY_T_RSP, cfg->topic_rsp);
@@ -980,6 +1169,8 @@ esp_err_t mqtt_init(void)
     };
 
     s_client = esp_mqtt_client_init(&mqtt_cfg);
+    /* esp-mqtt copies credentials during init; wipe our stack copy now */
+    memset(cfg.password, 0, sizeof(cfg.password));
     if (!s_client) {
         ESP_LOGE(TAG, "MQTT client init failed");
         return ESP_ERR_NO_MEM;
