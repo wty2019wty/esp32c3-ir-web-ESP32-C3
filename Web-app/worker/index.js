@@ -18,6 +18,7 @@
 //   - 签名密钥 AUTH_SECRET 走 wrangler secret 注入，不进代码与 KV
 //   - 登录失败统一 "bad credentials"，不泄露用户是否存在
 //   - 登录限流：同一 IP 在 15 分钟窗口内失败满 10 次即锁定至窗口结束（KV 计数）
+//     注意：KV 跨 PoP 最终一致（最长约 60s），限流/token 吊销是尽力而为的减速带
 //   - CORS 默认仅放行同源；确需跨域时在 [vars] 配置 ALLOWED_ORIGINS（逗号分隔白名单）
 //   - 所有响应附带 no-store / nosniff / Referrer-Policy 安全头
 //   - 首次使用：无账号记录时用 vars ADMIN_USER/ADMIN_PASS 初始化（并吊销历史 token）
@@ -29,7 +30,9 @@ const AUTH_VER_KEY = 'auth:ver'     // token 版本号，变更即吊销全部�
 const MQTT_CFG_KEY = 'mqtt:config'  // MQTT 连接配置（敏感字段 AES-GCM 加密）
 const RL_KEY_PREFIX = 'rl:login:'   // 登录限流计数（按 IP）
 const TOKEN_TTL_MS = 24 * 3600 * 1000
-const PBKDF2_MAX_ITER = 100000 // workerd 对 PBKDF2 迭代次数的硬上限，超出即抛异常
+// workerd 对 PBKDF2 迭代次数的硬上限为 100000（OWASP 建议 ≥600000）。
+// 平台限制无法提高；请配合足够长的随机 ADMIN_PASS（≥16 字符）补偿。
+const PBKDF2_MAX_ITER = 100000
 const PBKDF2_ITER = PBKDF2_MAX_ITER
 const MAX_BODY = 64 * 1024
 const RL_WINDOW_MS = 15 * 60 * 1000 // 限流窗口：15 分钟
@@ -259,11 +262,9 @@ async function handleLogin(request, env) {
     return error(request, env, msg, 500)
   }
 
-  let ok = false
-  if (user === auth.user) {
-    const h = await hashPass(pass, auth.passRec.salt, auth.passRec.iter)
-    ok = h === auth.passRec.hash
-  }
+  // 始终执行 PBKDF2（即使用户名不存在），避免用耗时差枚举有效账号
+  const h = await hashPass(pass, auth.passRec.salt, auth.passRec.iter)
+  const ok = (user === auth.user) && (h === auth.passRec.hash)
   if (!ok) {
     await loginFail(env, gate.key, gate.rec)
     return error(request, env, 'bad credentials', 401)
@@ -448,22 +449,27 @@ async function decryptField(env, value) {
 }
 
 // 校验并规范化 MQTT 配置。url/username 明文存储（非机密），password 加密存储。
-async function normalizeMqttConfig(env, body) {
+// existing: 当前 KV 中的配置（用于 password 省略时保持原值）
+async function normalizeMqttConfig(env, body, existing) {
   if (!body || typeof body !== 'object') return null
   const out = {}
   out.url = String(body.url || '').trim().slice(0, 256)
   if (!out.url) return null
   out.username = String(body.username || '').trim().slice(0, 64)
-  const password = String(body.password ?? '')
-  // password 为空字符串表示「清除已存密码」；undefined 表示保持原值不动
-  if (password === '') {
+  // 语义：
+  //   undefined/null → 保持服务端原密文不动（不能用 String() 转成 ''）
+  //   ''             → 显式清除密码
+  //   其他字符串     → 新明文，加密后覆盖；已加密的 enc:v1: 原样保留
+  if (body.password === undefined || body.password === null) {
+    out.password = existing && existing.password != null ? existing.password : ''
+  } else if (typeof body.password !== 'string') {
+    return null
+  } else if (body.password === '') {
     out.password = ''
+  } else if (!/^enc:v1:/.test(body.password)) {
+    out.password = await encryptField(env, body.password)
   } else {
-    let plain = password
-    if (!/^enc:v1:/.test(password)) {
-      plain = await encryptField(env, password)
-    }
-    out.password = plain
+    out.password = body.password
   }
   const topics = body.topics && typeof body.topics === 'object' ? body.topics : {}
   out.topics = {}
@@ -476,7 +482,9 @@ async function normalizeMqttConfig(env, body) {
 async function handleMqttConfig(request, env) {
   const kv = env.CODE_LIB
 
-  // GET /api/mqtt-config：返回配置；password 解密后原样下发（浏览器发起 MQTT 连接必须持有明文）
+  // GET /api/mqtt-config：返回配置；password 解密后原样下发
+  // （浏览器经 MQTT over WebSocket 直连 broker 必须持有明文；架构上更优的是
+  //  Worker 后端代理 MQTT，避免明文出网 — 见 TODO 中危#9，属中期改造）
   if (request.method === 'GET') {
     const raw = await kv.get(MQTT_CFG_KEY)
     if (!raw) return json(request, env, { config: null })
@@ -499,7 +507,12 @@ async function handleMqttConfig(request, env) {
     } catch {
       return error(request, env, 'invalid json')
     }
-    const rec = await normalizeMqttConfig(env, body)
+    let existing = null
+    try {
+      const raw = await kv.get(MQTT_CFG_KEY)
+      if (raw) existing = JSON.parse(raw)
+    } catch { existing = null }
+    const rec = await normalizeMqttConfig(env, body, existing)
     if (!rec) return error(request, env, '需要 url 字段')
     // 前端传 "enc:v1:..." 表示原样保留服务端密文（避免明文回传往返）；否则是新增密
     rec.updated_at = Date.now()

@@ -7,6 +7,8 @@
 #include "app_mqtt.h"
 #include "esp_log.h"
 #include "cJSON.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 
 #define TAG "web"
 
@@ -17,6 +19,21 @@
 
 /* single frame JSON buffer, sized for IR_RAW_MAX_SEGS durations */
 #define FRAME_JSON_CAP 16384
+
+/* MQTT and HTTPD tasks both call web_rpc_exec; several commands mutate NVS
+ * or shared auth/config state. Serialize the whole dispatcher so concurrent
+ * channels cannot interleave partial updates. */
+static SemaphoreHandle_t s_rpc_lock;
+
+static void rpc_lock_init(void)
+{
+    if (s_rpc_lock) {
+        return;
+    }
+    s_rpc_lock = xSemaphoreCreateRecursiveMutex();
+}
+
+static char *web_rpc_exec_locked(const char *cmd, cJSON *body, const char **err);
 
 /* Serialize one frame to a heap JSON string (caller frees). */
 static char *frame_json(const ir_frame_t *f)
@@ -145,6 +162,19 @@ char *web_rpc_exec(const char *cmd, cJSON *body, const char **err)
         return NULL;
     }
 
+    rpc_lock_init();
+    if (s_rpc_lock) {
+        xSemaphoreTakeRecursive(s_rpc_lock, portMAX_DELAY);
+    }
+    char *result = web_rpc_exec_locked(cmd, body, err);
+    if (s_rpc_lock) {
+        xSemaphoreGiveRecursive(s_rpc_lock);
+    }
+    return result;
+}
+
+static char *web_rpc_exec_locked(const char *cmd, cJSON *body, const char **err)
+{
     if (strcmp(cmd, "status") == 0) {
         return web_status_json();
     }
@@ -153,7 +183,11 @@ char *web_rpc_exec(const char *cmd, cJSON *body, const char **err)
         uint32_t since = 0;
         cJSON *s = cJSON_GetObjectItem(body, "since");
         if (cJSON_IsNumber(s)) {
-            since = (uint32_t)s->valuedouble;
+            double v = s->valuedouble;
+            /* reject NaN/inf/negative/out-of-range before the uint32 cast */
+            if (v >= 0.0 && v <= 4294967295.0) {
+                since = (uint32_t)v;
+            }
         }
         return web_rpc_frames(since);
     }

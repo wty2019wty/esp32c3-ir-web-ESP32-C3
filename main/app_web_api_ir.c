@@ -29,8 +29,10 @@ esp_err_t web_ir_play_exec(cJSON *root)
     uint32_t freq = 0;
     if (cJSON_IsNumber(freq_item)) {
         double fv = freq_item->valuedouble;
-        /* 0 = use global carrier; otherwise must be in the valid range */
-        if (fv != 0.0 && (fv < IR_CARRIER_FREQ_MIN || fv > IR_CARRIER_FREQ_MAX)) {
+        /* 0 = use global carrier; otherwise must be in the valid range.
+         * !(a && b) form rejects NaN (NaN comparisons are all false). */
+        if (!(fv == 0.0 ||
+              (fv >= (double)IR_CARRIER_FREQ_MIN && fv <= (double)IR_CARRIER_FREQ_MAX))) {
             return ESP_ERR_INVALID_ARG;
         }
         freq = (uint32_t)fv;
@@ -75,7 +77,12 @@ esp_err_t web_ir_play_exec(cJSON *root)
     } else if (cJSON_IsString(type) && strcmp(type->valuestring, "frame") == 0) {
         cJSON *s = cJSON_GetObjectItem(root, "seq");
         if (cJSON_IsNumber(s)) {
-            ret = play_by_seq((uint32_t)s->valuedouble, freq);
+            double sv = s->valuedouble;
+            if (sv >= 0.0 && sv <= 4294967295.0) {
+                ret = play_by_seq((uint32_t)sv, freq);
+            } else {
+                ret = ESP_ERR_INVALID_ARG;
+            }
         }
     }
     return ret;
@@ -89,7 +96,7 @@ esp_err_t web_ir_carrier_exec(cJSON *root, uint32_t *freq_out)
         return ESP_ERR_NOT_FOUND;
     }
     double fv = freq_item->valuedouble;
-    if (fv < IR_CARRIER_FREQ_MIN || fv > IR_CARRIER_FREQ_MAX) {
+    if (!(fv >= (double)IR_CARRIER_FREQ_MIN && fv <= (double)IR_CARRIER_FREQ_MAX)) {
         return ESP_ERR_INVALID_ARG;
     }
     uint32_t freq = (uint32_t)fv;

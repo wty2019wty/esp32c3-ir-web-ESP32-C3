@@ -65,6 +65,7 @@ function emit(name, payload) {
 }
 
 function onMessage(topic, payloadBuf) {
+  if (!cfg) return
   const text = payloadBuf.toString()
   if (topic === cfg.topicStatus) {
     // 设备 LWT 遗嘱是裸字符串 "offline"；正常状态是 JSON 对象
@@ -157,6 +158,11 @@ export function disconnect() {
       client.end(true)
     } catch { /* ignore */ }
     client = null
+  }
+  // 断开后立刻清掉模块级配置（含明文 password），避免凭证驻留内存
+  if (cfg) {
+    if (cfg.password) cfg.password = undefined
+    cfg = null
   }
 }
 

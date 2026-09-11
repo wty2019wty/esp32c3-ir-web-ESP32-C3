@@ -22,6 +22,9 @@
 static wifi_mode_t s_actual_mode;
 static esp_netif_t *s_ap_netif = NULL;
 static esp_netif_t *s_sta_netif = NULL;
+/* Written only from the default event-loop task; read from init/other tasks.
+ * volatile keeps the compiler from caching the flag across the STA-timeout
+ * poll loop. A single bool store is atomic on ESP32-C3, so no lock is needed. */
 static volatile bool s_sta_connected = false;
 static bool s_fell_back = false;
 static char s_sta_ip[16] = "";
@@ -83,6 +86,9 @@ esp_err_t wifi_web_config_save(const wifi_web_config_t *cfg)
 {
     nvs_handle_t h;
     ESP_RETURN_ON_ERROR(nvs_open(NVS_NS, NVS_READWRITE, &h), TAG, "open nvs");
+    /* All keys are staged first; nvs_commit is the single atomic publish.
+     * On any set failure we skip commit and close — NVS discards the staged
+     * writes, so a partial save can never become visible. */
     esp_err_t err = nvs_set_str(h, "ap_ssid", cfg->ap_ssid);
     if (err == ESP_OK) err = nvs_set_str(h, "ap_pwd", cfg->ap_password);
     if (err == ESP_OK) err = nvs_set_str(h, "sta_ssid", cfg->sta_ssid);
@@ -93,7 +99,9 @@ esp_err_t wifi_web_config_save(const wifi_web_config_t *cfg)
     if (err == ESP_OK) err = nvs_set_u32(h, "sta_mask", cfg->sta_mask);
     if (err == ESP_OK) err = nvs_set_u32(h, "sta_dns", cfg->sta_dns);
     if (err == ESP_OK) err = nvs_set_u32(h, "sta_dns2", cfg->sta_dns2);
-    if (err == ESP_OK) err = nvs_commit(h);
+    if (err == ESP_OK) {
+        err = nvs_commit(h);
+    }
     nvs_close(h);
     return err;
 }
